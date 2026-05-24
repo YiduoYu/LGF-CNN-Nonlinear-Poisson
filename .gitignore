@@ -9,5 +9,6 @@ outputs/
 *.pt
 *.pth
 
-# Reference PDFs are kept locally and are not committed.
+# Reference papers are kept locally and are not committed.
+Paper/
 *.pdf

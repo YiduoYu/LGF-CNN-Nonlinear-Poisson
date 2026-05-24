@@ -1,0 +1,13 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local experiment outputs
+checkpoints/
+runs/
+outputs/
+*.pt
+*.pth
+
+# Reference PDFs are kept locally and are not committed.
+*.pdf

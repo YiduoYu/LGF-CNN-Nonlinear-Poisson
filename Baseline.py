@@ -10,7 +10,7 @@ enforced exactly by an output projection.
 
 Example:
     python Baseline.py --check-residual
-    python Baseline.py --epochs 200 --N 32 --rhs-mode continuous
+    python Baseline.py --N 32 --train-samples 2048 --epochs 40
 """
 
 from __future__ import annotations
@@ -18,12 +18,17 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+SHARP_SOFTPLUS_BETA = 20.0
 
 
 def set_seed(seed: int) -> None:
@@ -136,26 +141,40 @@ def _k_to_broadcast(k: torch.Tensor | float, u: torch.Tensor) -> torch.Tensor:
     return k
 
 
+def _coefficient_base_and_derivative(
+    u: torch.Tensor,
+    mode: str,
+    eps: float,
+    softplus_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if mode == "pow":
+        return torch.clamp(u, min=eps), (u > eps).to(dtype=u.dtype)
+    if mode == "abs_pow":
+        abs_u = u.abs()
+        return torch.clamp(abs_u, min=eps), (abs_u > eps).to(dtype=u.dtype) * u.sign()
+    if mode == "softplus_pow":
+        beta = torch.as_tensor(softplus_beta, device=u.device, dtype=u.dtype)
+        return eps + F.softplus(beta * u) / beta, torch.sigmoid(beta * u)
+    raise ValueError(f"Unknown coeff_mode: {mode}")
+
+
 def power_coefficient(
     u: torch.Tensor,
     k: torch.Tensor | float,
     mode: str = "pow",
     eps: float = 1e-6,
+    softplus_beta: float = SHARP_SOFTPLUS_BETA,
 ) -> torch.Tensor:
     """Compute a(u).
 
-    mode="pow" clamps only as a numerical guard. For non-integer k, keep the
-    generated solution family positive if you want the mathematical PDE u**k.
+    mode="pow" clamps only as a numerical guard. mode="softplus_pow" uses a
+    sharp softplus base, which is a smooth clamp approximation rather than the
+    broad F.softplus(u) smoothing.
     """
 
     k = _k_to_broadcast(k, u)
-    if mode == "pow":
-        return torch.pow(torch.clamp(u, min=eps), k)
-    if mode == "abs_pow":
-        return torch.pow(torch.clamp(u.abs(), min=eps), k)
-    if mode == "softplus_pow":
-        return torch.pow(F.softplus(u) + eps, k)
-    raise ValueError(f"Unknown coeff_mode: {mode}")
+    base, _ = _coefficient_base_and_derivative(u, mode, eps, softplus_beta)
+    return torch.pow(base, k)
 
 
 def nonlinear_poisson_residual(
@@ -231,6 +250,130 @@ def relative_l2_error(
 
 def boundary_max_error(pred: torch.Tensor, g_map: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return ((pred - g_map).abs() * mask).amax()
+
+
+def interior_linf_error(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return ((pred - target).abs() * mask).amax()
+
+
+def gradient_relative_l2_error(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    h: float,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Centered-gradient relative L2 on stencils covered by the full grid."""
+
+    pred_dx = (pred[:, :, 1:-1, 2:] - pred[:, :, 1:-1, :-2]) / (2.0 * h)
+    pred_dy = (pred[:, :, 2:, 1:-1] - pred[:, :, :-2, 1:-1]) / (2.0 * h)
+    target_dx = (target[:, :, 1:-1, 2:] - target[:, :, 1:-1, :-2]) / (2.0 * h)
+    target_dy = (target[:, :, 2:, 1:-1] - target[:, :, :-2, 1:-1]) / (2.0 * h)
+
+    diff = torch.cat([pred_dx - target_dx, pred_dy - target_dy], dim=1)
+    ref = torch.cat([target_dx, target_dy], dim=1)
+    num = torch.linalg.vector_norm(diff.reshape(diff.shape[0], -1), dim=1)
+    den = torch.linalg.vector_norm(ref.reshape(ref.shape[0], -1), dim=1).clamp_min(eps)
+    return (num / den).mean()
+
+
+# ---------------------------------------------------------------------------
+# Transformed Poisson finite-difference baseline
+# ---------------------------------------------------------------------------
+
+
+def _k_plus_one_to_broadcast(k: torch.Tensor | float, u: torch.Tensor) -> torch.Tensor:
+    kp1 = _k_to_broadcast(k, u) + 1.0
+    if bool((kp1.abs() < 1e-8).any().item()):
+        raise ValueError("The transform w = u^(k+1)/(k+1) requires k != -1.")
+    return kp1
+
+
+def u_to_w(u: torch.Tensor, k: torch.Tensor | float) -> torch.Tensor:
+    """Map positive u to w where grad w = u^k grad u."""
+
+    if bool((u <= 0).any().item()):
+        raise ValueError("u_to_w requires strictly positive u values.")
+    kp1 = _k_plus_one_to_broadcast(k, u)
+    return torch.pow(u, kp1) / kp1
+
+
+def w_to_u(w: torch.Tensor, k: torch.Tensor | float, eps: float = 1e-8) -> torch.Tensor:
+    """Invert w = u^(k+1)/(k+1) with a small clamp against roundoff."""
+
+    kp1 = _k_plus_one_to_broadcast(k, w)
+    base = torch.clamp(kp1 * w, min=eps)
+    return torch.pow(base, 1.0 / kp1)
+
+
+def solve_poisson_dirichlet_dense(
+    f: torch.Tensor,
+    w_boundary: torch.Tensor,
+    h: float,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Dense 5-point solve for -Delta w = f with Dirichlet boundary data."""
+
+    if f.ndim != 4 or f.shape[1] != 1:
+        raise ValueError("f must have shape [B, 1, H, W].")
+    B, _, H, W = f.shape
+    if H != W:
+        raise ValueError("Only square grids are supported.")
+    N = H - 2
+    if N < 1:
+        raise ValueError("Interior grid size N must be positive.")
+
+    if w_boundary.shape[0] == 1 and B > 1:
+        w_boundary = w_boundary.expand(B, -1, -1, -1)
+    if mask.shape[0] == 1 and B > 1:
+        mask = mask.expand(B, -1, -1, -1)
+    w_boundary = w_boundary.to(device=f.device, dtype=f.dtype)
+    mask = mask.to(device=f.device, dtype=f.dtype)
+
+    n_unknowns = N * N
+    A = torch.zeros((n_unknowns, n_unknowns), device=f.device, dtype=f.dtype)
+    rhs = (h * h) * f[:, 0, 1:-1, 1:-1].reshape(B, n_unknowns)
+
+    for iy in range(N):
+        for ix in range(N):
+            row = iy * N + ix
+            A[row, row] = 4.0
+            for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                jy = iy + dy
+                jx = ix + dx
+                if 0 <= jy < N and 0 <= jx < N:
+                    A[row, jy * N + jx] = -1.0
+                else:
+                    by = iy + 1 + dy
+                    bx = ix + 1 + dx
+                    rhs[:, row] += w_boundary[:, 0, by, bx]
+
+    sol = torch.linalg.solve(A, rhs.T).T.reshape(B, 1, N, N)
+    w = mask * w_boundary
+    w[:, :, 1:-1, 1:-1] = sol
+    return w
+
+
+def solve_transformed_poisson(
+    f: torch.Tensor,
+    g_map: torch.Tensor,
+    k: torch.Tensor,
+    mask: torch.Tensor,
+    h: float,
+) -> torch.Tensor:
+    """Solve via w = u^(k+1)/(k+1), a strong continuous-PDE baseline.
+
+    This linearized Poisson solve targets -Delta w = f. It is not expected to
+    exactly match the conservative nonlinear flux discretization when
+    rhs_mode="discrete".
+    """
+
+    if mask.shape[0] == 1 and g_map.shape[0] > 1:
+        mask = mask.expand(g_map.shape[0], -1, -1, -1)
+    safe_g = torch.where(mask > 0, g_map, torch.ones_like(g_map))
+    w_boundary = mask * u_to_w(safe_g, k)
+    w = solve_poisson_dirichlet_dense(f, w_boundary, h, mask)
+    u = w_to_u(w, k)
+    return mask * g_map + (1.0 - mask) * u
 
 
 # ---------------------------------------------------------------------------
@@ -367,64 +510,101 @@ class UNet2d(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def manufactured_u(x: torch.Tensor, y: torch.Tensor, params: dict[str, torch.Tensor]) -> torch.Tensor:
+def manufactured_u(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    params: dict[str, torch.Tensor],
+    solution_mode: str = "base",
+) -> torch.Tensor:
     """A positive solution family with nontrivial boundary values."""
 
     phi = (1.0 - x * x) * (1.0 - y * y)
     boundary_part = (
         params["c0"] + params["c1"] * x + params["c2"] * y + params["c3"] * x * y
     )
-    interior_part = (
+    base_part = (
         params["a1"] * torch.sin(math.pi * x) * torch.sin(math.pi * y)
         + params["a2"] * torch.cos(2.0 * math.pi * x) * torch.cos(math.pi * y)
     )
+
+    if solution_mode == "base":
+        interior_part = base_part
+    elif solution_mode == "fourier":
+        interior_part = base_part + (
+            params["a3"] * torch.sin(2.0 * math.pi * x) * torch.sin(3.0 * math.pi * y)
+            + params["a4"] * torch.cos(3.0 * math.pi * x) * torch.sin(2.0 * math.pi * y)
+        )
+    elif solution_mode == "gaussian":
+        r1 = (x - params["gx1"]) ** 2 + (y - params["gy1"]) ** 2
+        r2 = (x - params["gx2"]) ** 2 + (y - params["gy2"]) ** 2
+        g1 = torch.exp(-r1 / (2.0 * params["gs1"] ** 2))
+        g2 = torch.exp(-r2 / (2.0 * params["gs2"] ** 2))
+        interior_part = params["ga1"] * g1 + params["ga2"] * g2
+    elif solution_mode == "mixed":
+        r1 = (x - params["gx1"]) ** 2 + (y - params["gy1"]) ** 2
+        g1 = torch.exp(-r1 / (2.0 * params["gs1"] ** 2))
+        interior_part = base_part + params["a3"] * torch.sin(
+            2.0 * math.pi * x
+        ) * torch.sin(3.0 * math.pi * y) + params["ga1"] * g1
+    else:
+        raise ValueError(f"Unknown solution_mode: {solution_mode}")
     return boundary_part + phi * interior_part
 
 
-def continuous_rhs_from_u(
-    u_exact: torch.Tensor,
+def continuous_rhs_from_params(
     x: torch.Tensor,
     y: torch.Tensor,
     k: torch.Tensor,
+    params: dict[str, torch.Tensor],
+    coeff_mode: str = "pow",
+    eps: float = 1e-6,
+    softplus_beta: float = SHARP_SOFTPLUS_BETA,
 ) -> torch.Tensor:
-    """Compute f = -div(u**k grad u) by differentiating the analytic family."""
+    """Compute f = -div(a(u) grad u) analytically for manufactured_u."""
 
-    k4 = k.view(1, 1, 1, 1)
-    a = torch.pow(u_exact, k4)
+    pi = math.pi
+    sin_px = torch.sin(pi * x)
+    cos_px = torch.cos(pi * x)
+    sin_py = torch.sin(pi * y)
+    cos_py = torch.cos(pi * y)
+    sin_2px = torch.sin(2.0 * pi * x)
+    cos_2px = torch.cos(2.0 * pi * x)
 
-    du_dx = torch.autograd.grad(
-        u_exact,
-        x,
-        grad_outputs=torch.ones_like(u_exact),
-        create_graph=True,
-        retain_graph=True,
-    )[0]
-    du_dy = torch.autograd.grad(
-        u_exact,
-        y,
-        grad_outputs=torch.ones_like(u_exact),
-        create_graph=True,
-        retain_graph=True,
-    )[0]
+    one_minus_x2 = 1.0 - x * x
+    one_minus_y2 = 1.0 - y * y
+    phi = one_minus_x2 * one_minus_y2
+    phi_x = -2.0 * x * one_minus_y2
+    phi_y = -2.0 * y * one_minus_x2
+    phi_xx = -2.0 * one_minus_y2
+    phi_yy = -2.0 * one_minus_x2
 
-    qx = a * du_dx
-    qy = a * du_dy
+    b = params["c0"] + params["c1"] * x + params["c2"] * y + params["c3"] * x * y
+    b_x = params["c1"] + params["c3"] * y
+    b_y = params["c2"] + params["c3"] * x
 
-    dqx_dx = torch.autograd.grad(
-        qx,
-        x,
-        grad_outputs=torch.ones_like(qx),
-        create_graph=False,
-        retain_graph=True,
-    )[0]
-    dqy_dy = torch.autograd.grad(
-        qy,
-        y,
-        grad_outputs=torch.ones_like(qy),
-        create_graph=False,
-        retain_graph=False,
-    )[0]
-    return -(dqx_dx + dqy_dy).detach()
+    s = params["a1"] * sin_px * sin_py + params["a2"] * cos_2px * cos_py
+    s_x = params["a1"] * pi * cos_px * sin_py - 2.0 * pi * params["a2"] * sin_2px * cos_py
+    s_y = params["a1"] * pi * sin_px * cos_py - pi * params["a2"] * cos_2px * sin_py
+    s_xx = -params["a1"] * pi * pi * sin_px * sin_py - 4.0 * pi * pi * params["a2"] * cos_2px * cos_py
+    s_yy = -params["a1"] * pi * pi * sin_px * sin_py - pi * pi * params["a2"] * cos_2px * cos_py
+
+    u = b + phi * s
+    u_x = b_x + phi_x * s + phi * s_x
+    u_y = b_y + phi_y * s + phi * s_y
+    u_xx = phi_xx * s + 2.0 * phi_x * s_x + phi * s_xx
+    u_yy = phi_yy * s + 2.0 * phi_y * s_y + phi * s_yy
+
+    grad_sq = u_x * u_x + u_y * u_y
+    k4 = _k_to_broadcast(k, u)
+    base, dbase_du = _coefficient_base_and_derivative(
+        u,
+        coeff_mode,
+        eps,
+        softplus_beta,
+    )
+    a = torch.pow(base, k4)
+    da_du = k4 * torch.pow(base, k4 - 1.0) * dbase_du
+    return -(da_du * grad_sq + a * (u_xx + u_yy))
 
 
 def discrete_rhs_from_u(
@@ -470,6 +650,16 @@ def _sample_params(device: torch.device, dtype: torch.dtype) -> dict[str, torch.
         "c3": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.10, 0.10),
         "a1": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.20, 0.20),
         "a2": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.20, 0.20),
+        "a3": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.12, 0.12),
+        "a4": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.12, 0.12),
+        "gx1": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.55, 0.55),
+        "gy1": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.55, 0.55),
+        "gx2": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.55, 0.55),
+        "gy2": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.55, 0.55),
+        "gs1": torch.empty(shape, device=device, dtype=dtype).uniform_(0.18, 0.45),
+        "gs2": torch.empty(shape, device=device, dtype=dtype).uniform_(0.18, 0.45),
+        "ga1": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.35, 0.35),
+        "ga2": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.35, 0.35),
     }
 
 
@@ -480,26 +670,32 @@ def sample_manufactured_problem(
     rhs_mode: str = "continuous",
     positive_only: bool = True,
     coeff_mode: str = "pow",
+    solution_mode: str = "base",
     dtype: torch.dtype = torch.float32,
 ) -> dict[str, torch.Tensor | float]:
     """Return one manufactured problem instance."""
 
+    if rhs_mode == "continuous" and solution_mode != "base":
+        raise ValueError(
+            "rhs_mode='continuous' currently supports only solution_mode='base'; "
+            "use rhs_mode='discrete' for richer manufactured modes."
+        )
+
     x0, y0, boundary_mask, interior_mask, h = make_grid(N, device=device, dtype=dtype)
-    needs_grad = rhs_mode == "continuous"
-    x = x0.clone().detach().requires_grad_(needs_grad)
-    y = y0.clone().detach().requires_grad_(needs_grad)
+    x = x0.clone().detach()
+    y = y0.clone().detach()
 
     params = _sample_params(device, dtype)
-    u_exact = manufactured_u(x, y, params)
+    u_exact = manufactured_u(x, y, params, solution_mode=solution_mode)
     if positive_only:
         margin = 0.2 - u_exact.detach().min()
         if margin.item() > 0:
             params["c0"] = params["c0"] + margin
-            u_exact = manufactured_u(x, y, params)
+            u_exact = manufactured_u(x, y, params, solution_mode=solution_mode)
 
     k = torch.empty((1,), device=device, dtype=dtype).uniform_(k_range[0], k_range[1])
     if rhs_mode == "continuous":
-        f = continuous_rhs_from_u(u_exact, x, y, k)
+        f = continuous_rhs_from_params(x, y, k, params, coeff_mode=coeff_mode)
     elif rhs_mode == "discrete":
         f = discrete_rhs_from_u(u_exact.detach(), k, h, coeff_mode=coeff_mode)
     else:
@@ -537,6 +733,7 @@ def make_batch(
     k_range: tuple[float, float],
     rhs_mode: str,
     coeff_mode: str,
+    solution_mode: str = "base",
 ) -> dict[str, torch.Tensor | float]:
     problems = [
         sample_manufactured_problem(
@@ -546,6 +743,7 @@ def make_batch(
             rhs_mode=rhs_mode,
             positive_only=True,
             coeff_mode=coeff_mode,
+            solution_mode=solution_mode,
         )
         for _ in range(batch_size)
     ]
@@ -558,33 +756,85 @@ def make_batch(
 
 
 @dataclass
-class TrainStats:
-    loss: float
-    loss_sup: float
-    loss_pde: float
-    rel_l2: float
-    res_rmse: float
-    boundary_max: float
+class InputStats:
+    f_mean: float
+    f_std: float
+    k_mean: float
+    k_std: float
 
 
-def forward_with_projection(
+def build_dataset(
+    N: int,
+    num_samples: int,
+    device: torch.device,
+    k_range: tuple[float, float],
+    rhs_mode: str,
+    coeff_mode: str,
+    solution_mode: str = "base",
+) -> dict[str, torch.Tensor | float]:
+    problems = [
+        sample_manufactured_problem(
+            N=N,
+            device=device,
+            k_range=k_range,
+            rhs_mode=rhs_mode,
+            positive_only=True,
+            coeff_mode=coeff_mode,
+            solution_mode=solution_mode,
+        )
+        for _ in range(num_samples)
+    ]
+    return collate_problem_list(problems)
+
+
+def slice_batch(
+    data: dict[str, torch.Tensor | float],
+    idx: torch.Tensor,
+) -> dict[str, torch.Tensor | float]:
+    f = data["f"]
+    if torch.is_tensor(f) and idx.device != f.device:
+        idx = idx.to(f.device)
+
+    batch: dict[str, torch.Tensor | float] = {}
+    for key in ["f", "g", "u_exact", "k"]:
+        batch[key] = data[key][idx]  # type: ignore[index]
+    for key in ["mask", "interior_mask", "x", "y"]:
+        batch[key] = data[key][:1]  # type: ignore[index]
+    batch["h"] = data["h"]
+    return batch
+
+
+def compute_input_stats(
+    data: dict[str, torch.Tensor | float],
+    k_range: tuple[float, float],
+) -> InputStats:
+    f = data["f"]  # type: ignore[assignment]
+    fi = f[:, :, 1:-1, 1:-1]
+    return InputStats(
+        f_mean=float(fi.mean()),
+        f_std=float(fi.std().clamp_min(1e-8)),
+        k_mean=0.5 * (k_range[0] + k_range[1]),
+        k_std=max((k_range[1] - k_range[0]) / math.sqrt(12.0), 1e-8),
+    )
+
+
+def forward_normalized(
     model: nn.Module,
     batch: dict[str, torch.Tensor | float],
+    stats: InputStats,
     normalize_k: bool,
-    k_range: tuple[float, float],
     positive_interior: bool,
 ) -> torch.Tensor:
-    k_mean = 0.5 * (k_range[0] + k_range[1]) if normalize_k else None
-    k_std = (k_range[1] - k_range[0]) / math.sqrt(12.0) if normalize_k else None
+    f_norm = (batch["f"] - stats.f_mean) / stats.f_std  # type: ignore[operator]
     inp = build_input_tensor(
-        batch["f"],  # type: ignore[arg-type]
+        f_norm,
         batch["g"],  # type: ignore[arg-type]
         batch["mask"],  # type: ignore[arg-type]
         batch["k"],  # type: ignore[arg-type]
         batch["x"],  # type: ignore[arg-type]
         batch["y"],  # type: ignore[arg-type]
-        k_mean=k_mean,
-        k_std=k_std,
+        k_mean=stats.k_mean if normalize_k else None,
+        k_std=stats.k_std if normalize_k else None,
     )
     u_raw = model(inp)
     return enforce_dirichlet(
@@ -595,171 +845,445 @@ def forward_with_projection(
     )
 
 
-def compute_stats(
+def relative_pde_loss(
+    u: torch.Tensor,
+    f: torch.Tensor,
+    k: torch.Tensor,
+    h: float,
+    coeff_mode: str = "pow",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return mean((R / rms(f))^2) and the raw residual R."""
+
+    res = nonlinear_poisson_residual(u, f, k, h, coeff_mode=coeff_mode)
+    fi = f[:, :, 1:-1, 1:-1]
+    denom = fi.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt().clamp_min(1e-3)
+    return (res / denom).pow(2).mean(), res
+
+
+@dataclass
+class EvalMetrics:
+    rel_l2: float
+    linf: float
+    res_rmse: float
+    res_linf: float
+    boundary_max: float
+    grad_rel_l2: float | None = None
+
+
+@dataclass
+class _MetricSums:
+    samples: int = 0
+    rel_l2_sum: float = 0.0
+    linf: float = 0.0
+    res_sq_sum: float = 0.0
+    res_count: int = 0
+    res_linf: float = 0.0
+    boundary_max: float = 0.0
+    grad_rel_l2_sum: float = 0.0
+    grad_samples: int = 0
+
+
+def _accumulate_metrics(
+    sums: _MetricSums,
     u_pred: torch.Tensor,
     batch: dict[str, torch.Tensor | float],
-    loss: torch.Tensor,
-    loss_sup: torch.Tensor,
-    loss_pde: torch.Tensor,
-    res: torch.Tensor,
-) -> TrainStats:
+    coeff_mode: str,
+    include_gradient: bool = True,
+) -> None:
+    n = u_pred.shape[0]
+    interior_mask = batch["interior_mask"].expand_as(u_pred)  # type: ignore[union-attr]
     rel_l2 = relative_l2_error(
         u_pred,
         batch["u_exact"],  # type: ignore[arg-type]
-        mask=batch["interior_mask"],  # type: ignore[arg-type]
+        mask=interior_mask,
     )
-    res_rmse = torch.sqrt((res * res).mean())
+    linf = interior_linf_error(
+        u_pred,
+        batch["u_exact"],  # type: ignore[arg-type]
+        interior_mask,
+    )
+    res = nonlinear_poisson_residual(
+        u_pred,
+        batch["f"],  # type: ignore[arg-type]
+        batch["k"],  # type: ignore[arg-type]
+        batch["h"],  # type: ignore[arg-type]
+        coeff_mode=coeff_mode,
+    )
     bmax = boundary_max_error(
         u_pred,
         batch["g"],  # type: ignore[arg-type]
         batch["mask"],  # type: ignore[arg-type]
     )
-    return TrainStats(
-        loss=float(loss.detach().cpu()),
-        loss_sup=float(loss_sup.detach().cpu()),
-        loss_pde=float(loss_pde.detach().cpu()),
-        rel_l2=float(rel_l2.detach().cpu()),
-        res_rmse=float(res_rmse.detach().cpu()),
-        boundary_max=float(bmax.detach().cpu()),
+
+    sums.samples += n
+    sums.rel_l2_sum += float(rel_l2) * n
+    sums.linf = max(sums.linf, float(linf))
+    sums.res_sq_sum += float(res.pow(2).sum())
+    sums.res_count += res.numel()
+    sums.res_linf = max(sums.res_linf, float(res.abs().max()))
+    sums.boundary_max = max(sums.boundary_max, float(bmax))
+
+    if include_gradient:
+        grad_rel = gradient_relative_l2_error(
+            u_pred,
+            batch["u_exact"],  # type: ignore[arg-type]
+            batch["h"],  # type: ignore[arg-type]
+        )
+        sums.grad_rel_l2_sum += float(grad_rel) * n
+        sums.grad_samples += n
+
+
+def _finalize_metrics(sums: _MetricSums) -> EvalMetrics:
+    if sums.samples < 1 or sums.res_count < 1:
+        raise ValueError("Cannot finalize empty metric sums.")
+    grad_rel_l2 = None
+    if sums.grad_samples > 0:
+        grad_rel_l2 = sums.grad_rel_l2_sum / sums.grad_samples
+    return EvalMetrics(
+        rel_l2=sums.rel_l2_sum / sums.samples,
+        linf=sums.linf,
+        res_rmse=math.sqrt(sums.res_sq_sum / sums.res_count),
+        res_linf=sums.res_linf,
+        boundary_max=sums.boundary_max,
+        grad_rel_l2=grad_rel_l2,
     )
 
 
-def evaluate(
+def format_eval_metrics(label: str, metrics: EvalMetrics) -> str:
+    grad = ""
+    if metrics.grad_rel_l2 is not None:
+        grad = f" gradRelL2={metrics.grad_rel_l2:.4e}"
+    return (
+        f"{label} relL2={metrics.rel_l2:.4e} linf={metrics.linf:.4e} "
+        f"resRMSE={metrics.res_rmse:.4f} resLinf={metrics.res_linf:.4e} "
+        f"bmax={metrics.boundary_max:.2e}{grad}"
+    )
+
+
+def evaluate_on(
     model: nn.Module,
-    N: int,
+    data: dict[str, torch.Tensor | float],
+    stats: InputStats,
     batch_size: int,
-    num_batches: int,
-    device: torch.device,
-    k_range: tuple[float, float],
-    rhs_mode: str,
     coeff_mode: str,
     normalize_k: bool,
     positive_interior: bool,
-) -> TrainStats:
-    model.eval()
-    totals = torch.zeros(6, dtype=torch.float64)
+    compare_transform_solver: bool = False,
+    include_gradient: bool = True,
+) -> dict[str, EvalMetrics]:
+    return _evaluate_on_impl(
+        model=model,
+        data=data,
+        stats=stats,
+        batch_size=batch_size,
+        coeff_mode=coeff_mode,
+        normalize_k=normalize_k,
+        positive_interior=positive_interior,
+        compare_transform_solver=compare_transform_solver,
+        include_gradient=include_gradient,
+    )
 
-    for _ in range(num_batches):
-        batch = make_batch(N, batch_size, device, k_range, rhs_mode, coeff_mode)
-        with torch.no_grad():
-            u_pred = forward_with_projection(
+
+def _evaluate_on_impl(
+    model: nn.Module,
+    data: dict[str, torch.Tensor | float],
+    stats: InputStats,
+    batch_size: int,
+    coeff_mode: str,
+    normalize_k: bool,
+    positive_interior: bool,
+    compare_transform_solver: bool = False,
+    include_gradient: bool = True,
+) -> dict[str, EvalMetrics]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if compare_transform_solver and coeff_mode != "pow":
+        raise ValueError("The transformed Poisson baseline is valid only for coeff_mode='pow'.")
+
+    model.eval()
+    n = data["f"].shape[0]  # type: ignore[union-attr]
+    device = data["f"].device  # type: ignore[union-attr]
+    totals = {"cnn": _MetricSums()}
+    if compare_transform_solver:
+        totals["transform"] = _MetricSums()
+
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            idx = torch.arange(start, min(start + batch_size, n), device=device)
+            batch = slice_batch(data, idx)
+            u_pred = forward_normalized(
                 model,
                 batch,
+                stats,
                 normalize_k=normalize_k,
-                k_range=k_range,
                 positive_interior=positive_interior,
             )
-            loss_pde, res = pde_loss(
-                u_pred,
-                batch["f"],  # type: ignore[arg-type]
-                batch["k"],  # type: ignore[arg-type]
-                batch["h"],  # type: ignore[arg-type]
-                scale_with_h=True,
-                coeff_mode=coeff_mode,
-            )
-            loss_sup = masked_mse(
-                u_pred,
-                batch["u_exact"],  # type: ignore[arg-type]
-                batch["interior_mask"],  # type: ignore[arg-type]
-            )
-            loss = 0.1 * loss_sup + loss_pde
-            stats = compute_stats(u_pred, batch, loss, loss_sup, loss_pde, res)
-        totals += torch.tensor(
-            [
-                stats.loss,
-                stats.loss_sup,
-                stats.loss_pde,
-                stats.rel_l2,
-                stats.res_rmse,
-                stats.boundary_max,
-            ],
-            dtype=torch.float64,
-        )
+            _accumulate_metrics(totals["cnn"], u_pred, batch, coeff_mode, include_gradient)
+            if compare_transform_solver:
+                u_transform = solve_transformed_poisson(
+                    batch["f"],  # type: ignore[arg-type]
+                    batch["g"],  # type: ignore[arg-type]
+                    batch["k"],  # type: ignore[arg-type]
+                    batch["mask"],  # type: ignore[arg-type]
+                    batch["h"],  # type: ignore[arg-type]
+                )
+                _accumulate_metrics(
+                    totals["transform"],
+                    u_transform,
+                    batch,
+                    coeff_mode,
+                    include_gradient,
+                )
 
-    avg = totals / max(num_batches, 1)
-    return TrainStats(*[float(x) for x in avg.tolist()])
+    return {name: _finalize_metrics(sums) for name, sums in totals.items()}
+
+
+def evaluate_predictions(
+    predictions: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor | float],
+    coeff_mode: str,
+    include_gradient: bool = True,
+) -> dict[str, EvalMetrics]:
+    metrics: dict[str, EvalMetrics] = {}
+    for name, u_pred in predictions.items():
+        sums = _MetricSums()
+        _accumulate_metrics(sums, u_pred, batch, coeff_mode, include_gradient)
+        metrics[name] = _finalize_metrics(sums)
+    return metrics
+
+
+def oracle_floor(data: dict[str, torch.Tensor | float], coeff_mode: str) -> float:
+    """Raw resRMSE of the exact solution on the validation set."""
+
+    with torch.no_grad():
+        res = nonlinear_poisson_residual(
+            data["u_exact"],  # type: ignore[arg-type]
+            data["f"],  # type: ignore[arg-type]
+            data["k"],  # type: ignore[arg-type]
+            data["h"],  # type: ignore[arg-type]
+            coeff_mode=coeff_mode,
+        )
+        return float(res.pow(2).mean().sqrt())
+
+
+def adamw_param_groups(
+    model: nn.Module,
+    weight_decay: float,
+) -> list[dict[str, object]]:
+    decay_params: list[nn.Parameter] = []
+    no_decay_params: list[nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.endswith(".bias") or param.ndim <= 1:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    return [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+
+
+def add_path_suffix(path: Path, suffix: str) -> Path:
+    if path.suffix:
+        return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+    return path.with_name(f"{path.name}_{suffix}")
+
+
+def apply_positive_interior_default(args: argparse.Namespace) -> None:
+    if getattr(args, "positive_interior", None) is None:
+        args.positive_interior = getattr(args, "coeff_mode", "pow") == "pow"
 
 
 def train(args: argparse.Namespace) -> nn.Module:
     set_seed(args.seed)
     device = select_device(args.device)
     k_range = (args.k_min, args.k_max)
+    eval_batch_size = args.eval_batch_size or args.batch_size
+    if args.eval_batches is not None:
+        args.val_samples = args.eval_batches * eval_batch_size
+    if args.train_samples < 1 or args.val_samples < 1:
+        raise ValueError("train_samples and val_samples must be positive")
+    if args.batch_size < 1 or eval_batch_size < 1:
+        raise ValueError("batch_size and eval_batch_size must be positive")
+    if args.eval_every < 1:
+        raise ValueError("eval_every must be positive")
+    if args.pde_scale_batches < 1:
+        raise ValueError("pde_scale_batches must be positive")
+    apply_positive_interior_default(args)
+
+    t0 = time.time()
+    print(
+        f"generating train set: {args.train_samples} samples "
+        f"(N={args.N}, rhs_mode={args.rhs_mode}, solution_mode={args.solution_mode})",
+        flush=True,
+    )
+    train_data = build_dataset(
+        args.N,
+        args.train_samples,
+        device,
+        k_range,
+        args.rhs_mode,
+        args.coeff_mode,
+        args.solution_mode,
+    )
+    print(f"generating val set: {args.val_samples} samples", flush=True)
+    val_data = build_dataset(
+        args.N,
+        args.val_samples,
+        device,
+        k_range,
+        args.rhs_mode,
+        args.coeff_mode,
+        args.solution_mode,
+    )
+    stats = compute_input_stats(train_data, k_range)
+    floor = oracle_floor(val_data, args.coeff_mode)
 
     model = UNet2d(in_ch=6, out_ch=1, base_ch=args.base_ch).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        adamw_param_groups(model, args.weight_decay),
+        lr=args.lr,
+    )
+    steps_per_epoch = math.ceil(args.train_samples / args.batch_size)
+    total_steps = steps_per_epoch * args.epochs
+    warmup_steps = max(1, int(0.05 * total_steps))
+
+    def lr_at(step: int) -> float:
+        if step < warmup_steps:
+            return step / warmup_steps
+        t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * t))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_at)
+    save_path = Path(args.save_path) if args.save_path else None
+    best_save_path = add_path_suffix(save_path, "best") if save_path is not None else None
+    best_val_rel_l2 = math.inf
 
     print(
         f"device={device} N={args.N} rhs_mode={args.rhs_mode} "
-        f"epochs={args.epochs} batch_size={args.batch_size} base_ch={args.base_ch}"
+        f"train={args.train_samples} val={args.val_samples} "
+        f"gen_time={time.time() - t0:.1f}s"
     )
+    print(f"f stats: mean={stats.f_mean:.3f} std={stats.f_std:.3f}")
+    print(f"oracle resRMSE floor: {floor:.4f}")
+    print(f"steps/epoch={steps_per_epoch} total_steps={total_steps}")
 
+    step = 0
+    pde_scale: float | None = None
+    pde_scale_samples: list[float] = []
     for epoch in range(args.epochs):
         model.train()
-        batch = make_batch(args.N, args.batch_size, device, k_range, args.rhs_mode, args.coeff_mode)
-        u_pred = forward_with_projection(
-            model,
-            batch,
-            normalize_k=args.normalize_k,
-            k_range=k_range,
-            positive_interior=args.positive_interior,
-        )
-
-        loss_pde, res = pde_loss(
-            u_pred,
-            batch["f"],  # type: ignore[arg-type]
-            batch["k"],  # type: ignore[arg-type]
-            batch["h"],  # type: ignore[arg-type]
-            scale_with_h=True,
-            coeff_mode=args.coeff_mode,
-        )
-        loss_sup = masked_mse(
-            u_pred,
-            batch["u_exact"],  # type: ignore[arg-type]
-            batch["interior_mask"],  # type: ignore[arg-type]
-        )
-
-        if args.pure_physics:
-            loss = loss_pde
-        elif epoch < args.pretrain_epochs:
-            loss = loss_sup
-        else:
-            loss = args.supervised_weight * loss_sup + args.pde_weight * loss_pde
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
-
-        if epoch % args.eval_every == 0 or epoch == args.epochs - 1:
-            with torch.no_grad():
-                train_stats = compute_stats(u_pred, batch, loss, loss_sup, loss_pde, res)
-            eval_stats = evaluate(
+        perm = torch.randperm(args.train_samples, device=device)
+        for start in range(0, args.train_samples, args.batch_size):
+            idx = perm[start : start + args.batch_size]
+            batch = slice_batch(train_data, idx)
+            u_pred = forward_normalized(
                 model,
-                N=args.N,
-                batch_size=args.eval_batch_size,
-                num_batches=args.eval_batches,
-                device=device,
-                k_range=k_range,
-                rhs_mode=args.rhs_mode,
-                coeff_mode=args.coeff_mode,
+                batch,
+                stats,
                 normalize_k=args.normalize_k,
                 positive_interior=args.positive_interior,
             )
-            print(
-                f"epoch={epoch:04d} "
-                f"train loss={train_stats.loss:.4e} sup={train_stats.loss_sup:.4e} "
-                f"pde={train_stats.loss_pde:.4e} relL2={train_stats.rel_l2:.4e} "
-                f"resRMSE={train_stats.res_rmse:.4e} bmax={train_stats.boundary_max:.2e} | "
-                f"eval relL2={eval_stats.rel_l2:.4e} resRMSE={eval_stats.res_rmse:.4e}"
+            loss_pde, res = relative_pde_loss(
+                u_pred,
+                batch["f"],  # type: ignore[arg-type]
+                batch["k"],  # type: ignore[arg-type]
+                batch["h"],  # type: ignore[arg-type]
+                coeff_mode=args.coeff_mode,
+            )
+            loss_sup = masked_mse(
+                u_pred,
+                batch["u_exact"],  # type: ignore[arg-type]
+                batch["interior_mask"].expand_as(u_pred),  # type: ignore[union-attr]
             )
 
-    if args.save_path:
-        save_path = Path(args.save_path)
+            if args.pure_physics:
+                loss = loss_pde
+            elif epoch < args.pretrain_epochs:
+                loss = loss_sup
+            else:
+                if pde_scale is None:
+                    pde_scale_samples.append(
+                        float(loss_sup.detach() / loss_pde.detach().clamp_min(1e-12))
+                    )
+                    current_pde_scale = float(median(pde_scale_samples))
+                    if len(pde_scale_samples) >= args.pde_scale_batches:
+                        pde_scale = current_pde_scale
+                        print(
+                            "[auto-balance] "
+                            f"pde_scale={pde_scale:.3e} "
+                            f"(median of {len(pde_scale_samples)} batches)"
+                        )
+                else:
+                    current_pde_scale = pde_scale
+                loss = (
+                    args.supervised_weight * loss_sup
+                    + args.pde_weight * current_pde_scale * loss_pde
+                )
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            scheduler.step()
+            step += 1
+
+        if epoch % args.eval_every == 0 or epoch == args.epochs - 1:
+            train_res_rmse = float(res.pow(2).mean().sqrt().detach())
+            train_boundary = float(
+                boundary_max_error(
+                    u_pred,
+                    batch["g"],  # type: ignore[arg-type]
+                    batch["mask"],  # type: ignore[arg-type]
+                ).detach()
+            )
+            val_metrics = evaluate_on(
+                model,
+                val_data,
+                stats,
+                eval_batch_size,
+                args.coeff_mode,
+                normalize_k=args.normalize_k,
+                positive_interior=args.positive_interior,
+                compare_transform_solver=args.compare_transform_solver,
+            )
+            val_cnn = val_metrics["cnn"]
+            if best_save_path is not None and val_cnn.rel_l2 < best_val_rel_l2:
+                best_val_rel_l2 = val_cnn.rel_l2
+                best_save_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "input_stats": vars(stats),
+                        "args": vars(args),
+                        "epoch": epoch,
+                        "step": step,
+                        "best_val_rel_l2": best_val_rel_l2,
+                        "checkpoint_type": "best_val_rel_l2",
+                    },
+                    best_save_path,
+                )
+                print(f"saved best checkpoint: {best_save_path}")
+            print(
+                f"epoch={epoch:03d} step={step:05d} lr={scheduler.get_last_lr()[0]:.2e} "
+                f"loss={float(loss.detach()):.3e} sup={float(loss_sup.detach()):.3e} "
+                f"pde={float(loss_pde.detach()):.3e} train_resRMSE={train_res_rmse:.4f} "
+                f"bmax={train_boundary:.2e} | {format_eval_metrics('val cnn', val_cnn)} "
+                f"(floor {floor:.4f})"
+            )
+            if "transform" in val_metrics:
+                print(f"  {format_eval_metrics('val transform', val_metrics['transform'])}")
+
+    if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
+                "input_stats": vars(stats),
                 "args": vars(args),
+                "checkpoint_type": "final",
             },
             save_path,
         )
@@ -768,11 +1292,277 @@ def train(args: argparse.Namespace) -> nn.Module:
     return model
 
 
+def load_model_from_checkpoint(
+    path: str | Path,
+    device: torch.device,
+) -> tuple[nn.Module, InputStats, argparse.Namespace]:
+    with torch.serialization.safe_globals([argparse.Namespace]):
+        checkpoint = torch.load(path, map_location=device)
+    raw_args = checkpoint.get("args", {})
+    if isinstance(raw_args, argparse.Namespace):
+        checkpoint_args = raw_args
+    elif isinstance(raw_args, dict):
+        checkpoint_args = argparse.Namespace(**raw_args)
+    else:
+        raise ValueError("Checkpoint args must be a dict or argparse.Namespace.")
+    base_ch = int(getattr(checkpoint_args, "base_ch", 32))
+
+    model = UNet2d(in_ch=6, out_ch=1, base_ch=base_ch).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    stats_dict = checkpoint.get("input_stats")
+    if isinstance(stats_dict, InputStats):
+        stats = stats_dict
+    elif isinstance(stats_dict, dict):
+        stats = InputStats(
+            f_mean=float(stats_dict["f_mean"]),
+            f_std=float(stats_dict["f_std"]),
+            k_mean=float(stats_dict["k_mean"]),
+            k_std=float(stats_dict["k_std"]),
+        )
+    else:
+        k_min = float(getattr(checkpoint_args, "k_min", 0.5))
+        k_max = float(getattr(checkpoint_args, "k_max", 2.5))
+        stats = InputStats(
+            f_mean=0.0,
+            f_std=1.0,
+            k_mean=0.5 * (k_min + k_max),
+            k_std=max((k_max - k_min) / math.sqrt(12.0), 1e-8),
+        )
+        print("checkpoint has no input_stats; using legacy identity f normalization")
+    apply_positive_interior_default(checkpoint_args)
+    return model, stats, checkpoint_args
+
+
+def predict_on_batch(
+    model: nn.Module,
+    batch: dict[str, torch.Tensor | float],
+    stats: InputStats,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    model.eval()
+    with torch.no_grad():
+        return forward_normalized(
+            model,
+            batch,
+            stats,
+            normalize_k=getattr(args, "normalize_k", True),
+            positive_interior=getattr(args, "positive_interior", False),
+        )
+
+
+def _prediction_args_from_checkpoint(
+    runtime_args: argparse.Namespace,
+    checkpoint_args: argparse.Namespace,
+) -> argparse.Namespace:
+    merged = argparse.Namespace(**vars(runtime_args))
+    runtime_only = {
+        "check_residual",
+        "train_after_check",
+        "grid_convergence",
+        "grid_Ns",
+        "load_path",
+        "predict_manufactured",
+        "predict_samples",
+        "predict_save",
+        "compare_transform_solver",
+        "device",
+        "seed",
+    }
+    for name, value in vars(checkpoint_args).items():
+        if name not in runtime_only:
+            setattr(merged, name, value)
+
+    for name, default in (
+        ("rhs_mode", runtime_args.rhs_mode),
+        ("coeff_mode", runtime_args.coeff_mode),
+        ("solution_mode", "base"),
+        ("normalize_k", True),
+        ("k_min", runtime_args.k_min),
+        ("k_max", runtime_args.k_max),
+        ("N", runtime_args.N),
+    ):
+        if not hasattr(merged, name):
+            setattr(merged, name, default)
+    apply_positive_interior_default(merged)
+    return merged
+
+
+def _save_prediction_payload(
+    path: str | Path,
+    batch: dict[str, torch.Tensor | float],
+    u_pred: torch.Tensor,
+    u_transform: torch.Tensor | None,
+    metrics: dict[str, EvalMetrics],
+    args: argparse.Namespace,
+) -> None:
+    save_path = Path(path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tensors = {
+        "f": batch["f"],
+        "g": batch["g"],
+        "k": batch["k"],
+        "u_exact": batch["u_exact"],
+        "u_pred": u_pred,
+        "u_transform": u_transform,
+    }
+    if save_path.suffix.lower() == ".npz":
+        import numpy as np
+
+        np_payload = {
+            name: tensor.detach().cpu().numpy()
+            for name, tensor in tensors.items()
+            if torch.is_tensor(tensor)
+        }
+        np_payload["h"] = np.array(float(batch["h"]))  # type: ignore[arg-type]
+        np.savez(save_path, **np_payload)
+    else:
+        torch_payload = {
+            name: tensor.detach().cpu() if torch.is_tensor(tensor) else tensor
+            for name, tensor in tensors.items()
+        }
+        torch_payload["h"] = float(batch["h"])  # type: ignore[arg-type]
+        torch_payload["metrics"] = {name: vars(value) for name, value in metrics.items()}
+        torch_payload["args"] = vars(args)
+        torch.save(torch_payload, save_path)
+    print(f"saved predictions: {save_path}")
+
+
+def run_prediction(args: argparse.Namespace) -> None:
+    if not args.load_path:
+        raise ValueError("--predict-manufactured requires --load-path")
+    if args.predict_samples < 1:
+        raise ValueError("--predict-samples must be positive")
+
+    set_seed(args.seed)
+    device = select_device(args.device)
+    model, stats, checkpoint_args = load_model_from_checkpoint(args.load_path, device)
+    pred_args = _prediction_args_from_checkpoint(args, checkpoint_args)
+    k_range = (pred_args.k_min, pred_args.k_max)
+
+    print(
+        f"predicting manufactured set: samples={args.predict_samples} "
+        f"N={pred_args.N} rhs_mode={pred_args.rhs_mode} "
+        f"solution_mode={pred_args.solution_mode}",
+        flush=True,
+    )
+    batch = build_dataset(
+        pred_args.N,
+        args.predict_samples,
+        device,
+        k_range,
+        pred_args.rhs_mode,
+        pred_args.coeff_mode,
+        pred_args.solution_mode,
+    )
+    u_pred = predict_on_batch(model, batch, stats, pred_args)
+
+    u_transform: torch.Tensor | None = None
+    need_transform = args.compare_transform_solver or bool(args.predict_save)
+    if need_transform:
+        if pred_args.coeff_mode != "pow":
+            if args.compare_transform_solver:
+                raise ValueError(
+                    "--compare-transform-solver is valid only for coeff_mode='pow'."
+                )
+        else:
+            with torch.no_grad():
+                u_transform = solve_transformed_poisson(
+                    batch["f"],  # type: ignore[arg-type]
+                    batch["g"],  # type: ignore[arg-type]
+                    batch["k"],  # type: ignore[arg-type]
+                    batch["mask"],  # type: ignore[arg-type]
+                    batch["h"],  # type: ignore[arg-type]
+                )
+
+    predictions = {"cnn": u_pred}
+    if args.compare_transform_solver and u_transform is not None:
+        predictions["transform"] = u_transform
+    metrics = evaluate_predictions(predictions, batch, pred_args.coeff_mode)
+    for name, metric in metrics.items():
+        print(format_eval_metrics(f"predict {name}", metric))
+
+    if args.predict_save:
+        _save_prediction_payload(args.predict_save, batch, u_pred, u_transform, metrics, pred_args)
+
+
+def run_grid_convergence(args: argparse.Namespace) -> None:
+    if args.predict_samples < 1:
+        raise ValueError("--predict-samples must be positive")
+    if args.coeff_mode != "pow":
+        raise ValueError("--grid-convergence uses the transformed solver and requires coeff_mode='pow'.")
+
+    set_seed(args.seed)
+    device = select_device(args.device)
+    k_range = (args.k_min, args.k_max)
+    previous_h: float | None = None
+    previous_rel_l2: float | None = None
+
+    print(
+        "transformed Poisson grid convergence "
+        f"(samples={args.predict_samples}, rhs_mode={args.rhs_mode}, "
+        f"solution_mode={args.solution_mode})"
+    )
+    if args.rhs_mode == "discrete":
+        print(
+            "note: rhs_mode='discrete' uses the nonlinear flux discretization, "
+            "so the transformed linear solve is not expected to be exact."
+        )
+
+    for N in args.grid_Ns:
+        # Reuse the same manufactured parameters at each N so rates compare grids.
+        set_seed(args.seed)
+        data = build_dataset(
+            N,
+            args.predict_samples,
+            device,
+            k_range,
+            args.rhs_mode,
+            args.coeff_mode,
+            args.solution_mode,
+        )
+        with torch.no_grad():
+            u_transform = solve_transformed_poisson(
+                data["f"],  # type: ignore[arg-type]
+                data["g"],  # type: ignore[arg-type]
+                data["k"],  # type: ignore[arg-type]
+                data["mask"],  # type: ignore[arg-type]
+                data["h"],  # type: ignore[arg-type]
+            )
+        metrics = evaluate_predictions(
+            {"transform": u_transform},
+            data,
+            args.coeff_mode,
+        )["transform"]
+        h = float(data["h"])  # type: ignore[arg-type]
+        rate = "-"
+        if previous_h is not None and previous_rel_l2 is not None and metrics.rel_l2 > 0:
+            rate_value = math.log(previous_rel_l2 / metrics.rel_l2) / math.log(previous_h / h)
+            rate = f"{rate_value:.2f}"
+        print(
+            f"N={N:4d} h={h:.4e} relL2={metrics.rel_l2:.4e} "
+            f"rate={rate:>5} linf={metrics.linf:.4e} "
+            f"resRMSE={metrics.res_rmse:.4f}"
+        )
+        previous_h = h
+        previous_rel_l2 = metrics.rel_l2
+
+
 def run_residual_check(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = select_device(args.device)
     k_range = (args.k_min, args.k_max)
-    batch = make_batch(args.N, args.batch_size, device, k_range, "discrete", args.coeff_mode)
+    batch = make_batch(
+        args.N,
+        args.batch_size,
+        device,
+        k_range,
+        "discrete",
+        args.coeff_mode,
+        args.solution_mode,
+    )
     with torch.no_grad():
         _, res = pde_loss(
             batch["u_exact"],  # type: ignore[arg-type]
@@ -796,28 +1586,48 @@ def run_residual_check(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--N", type=int, default=32, help="Interior grid size. Full grid is (N+2)^2.")
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--pretrain-epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--eval-batch-size", type=int, default=8)
-    parser.add_argument("--eval-batches", type=int, default=2)
-    parser.add_argument("--eval-every", type=int, default=10)
+    parser.add_argument("--train-samples", type=int, default=2048)
+    parser.add_argument("--val-samples", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=40, help="Real epochs over the fixed dataset.")
+    parser.add_argument("--pretrain-epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--eval-batch-size", type=int, default=0, help="Defaults to --batch-size.")
+    parser.add_argument("--eval-batches", type=int, default=None, help="Compatibility alias for val samples.")
+    parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--base-ch", type=int, default=32)
     parser.add_argument("--rhs-mode", choices=["continuous", "discrete"], default="continuous")
+    parser.add_argument(
+        "--solution-mode",
+        choices=["base", "fourier", "gaussian", "mixed"],
+        default="base",
+    )
     parser.add_argument("--coeff-mode", choices=["pow", "abs_pow", "softplus_pow"], default="pow")
     parser.add_argument("--k-min", type=float, default=0.5)
     parser.add_argument("--k-max", type=float, default=2.5)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--supervised-weight", type=float, default=0.1)
+    parser.add_argument("--supervised-weight", type=float, default=1.0)
     parser.add_argument("--pde-weight", type=float, default=1.0)
+    parser.add_argument("--pde-scale-batches", type=int, default=20)
     parser.add_argument("--pure-physics", action="store_true")
-    parser.add_argument("--positive-interior", action="store_true")
+    parser.add_argument(
+        "--positive-interior",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Defaults to on when --coeff-mode pow.",
+    )
     parser.add_argument("--normalize-k", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, mps, ...")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--save-path", default="")
+    parser.add_argument("--load-path", default="")
+    parser.add_argument("--predict-manufactured", action="store_true")
+    parser.add_argument("--predict-samples", type=int, default=8)
+    parser.add_argument("--predict-save", default="")
+    parser.add_argument("--compare-transform-solver", action="store_true")
+    parser.add_argument("--grid-convergence", action="store_true")
+    parser.add_argument("--grid-Ns", "--grid-ns", dest="grid_Ns", nargs="+", type=int, default=[8, 16, 32, 64])
     parser.add_argument("--check-residual", action="store_true")
     parser.add_argument("--train-after-check", action="store_true")
     return parser.parse_args()
@@ -825,10 +1635,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    apply_positive_interior_default(args)
     if args.check_residual:
         run_residual_check(args)
         if not args.train_after_check:
             return
+    if args.grid_convergence:
+        run_grid_convergence(args)
+        return
+    if args.predict_manufactured:
+        run_prediction(args)
+        return
+    if args.load_path:
+        raise ValueError("--load-path is only used with --predict-manufactured.")
     train(args)
 
 

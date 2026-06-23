@@ -21,6 +21,7 @@ import json
 import math
 import os
 import random
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -1807,6 +1808,18 @@ EVAL_CSV_FIELDS = [
     "exact_flux_resRMSE",
 ]
 
+PLOT_METRIC_FIELDS = [
+    "sample_id",
+    "k",
+    "relL2",
+    "rmse",
+    "mae",
+    "linf",
+    "boundary_max",
+    "flux_resRMSE",
+    "oracle_flux_resRMSE",
+]
+
 
 def _per_sample_rmse(values: torch.Tensor) -> torch.Tensor:
     return values.pow(2).mean(dim=1).sqrt()
@@ -1872,14 +1885,23 @@ def _write_prediction_eval_csv(rows: list[dict[str, float | int]], path: Path) -
         writer.writerows(rows)
 
 
-def _load_matplotlib_pyplot():
+def _write_prediction_plot_csv(rows: list[dict[str, float | int]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=PLOT_METRIC_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _load_matplotlib_pyplot(show_plots: bool = False):
     cache_dir = Path(tempfile.gettempdir())
     os.environ.setdefault("MPLCONFIGDIR", str(cache_dir / "matplotlib"))
     os.environ.setdefault("XDG_CACHE_HOME", str(cache_dir / "xdg-cache"))
 
     import matplotlib
 
-    matplotlib.use("Agg")
+    if not show_plots:
+        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     return plt
@@ -2024,6 +2046,7 @@ def save_prediction_evaluation_outputs(
     u_pred: torch.Tensor,
     prediction_config: PredictionConfig,
     coeff_mode: str,
+    show_plots: bool = False,
 ) -> None:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -2051,7 +2074,7 @@ def save_prediction_evaluation_outputs(
     csv_path = output_path / "eval_metrics_per_sample.csv"
     _write_prediction_eval_csv(rows, csv_path)
 
-    plt = _load_matplotlib_pyplot()
+    plt = _load_matplotlib_pyplot(show_plots=show_plots)
     h = float(batch["h"])  # type: ignore[arg-type]
     full_extent = [-1.0, 1.0, -1.0, 1.0]
     residual_extent = [-1.0 + h, 1.0 - h, -1.0 + h, 1.0 - h]
@@ -2149,6 +2172,147 @@ def save_prediction_evaluation_outputs(
     print(f"saved evaluation figures: {output_path}")
 
 
+def _prediction_plot_rows(
+    eval_rows: list[dict[str, float | int]],
+) -> list[dict[str, float | int]]:
+    rows: list[dict[str, float | int]] = []
+    for row in eval_rows:
+        rows.append(
+            {
+                "sample_id": row["sample_id"],
+                "k": row["k"],
+                "relL2": row["relL2_interior"],
+                "rmse": row["RMSE_interior"],
+                "mae": row["MAE_interior"],
+                "linf": row["Linf_interior"],
+                "boundary_max": row["boundary_max_error"],
+                "flux_resRMSE": row["pred_flux_resRMSE"],
+                "oracle_flux_resRMSE": row["exact_flux_resRMSE"],
+            }
+        )
+    return rows
+
+
+def _save_prediction_panel(
+    plt,
+    path: Path,
+    figure_title: str,
+    u_exact: torch.Tensor,
+    u_pred: torch.Tensor,
+    error: torch.Tensor,
+    abs_error: torch.Tensor,
+    flux_residual: torch.Tensor,
+    f_map: torch.Tensor,
+    full_extent: list[float],
+    residual_extent: list[float],
+    show_plots: bool,
+) -> None:
+    u_vmin = min(float(u_exact.min().cpu()), float(u_pred.min().cpu()))
+    u_vmax = max(float(u_exact.max().cpu()), float(u_pred.max().cpu()))
+    u_limits = _nondegenerate_limits(u_vmin, u_vmax)
+    error_limits = _symmetric_limits(error)
+    abs_error_max = max(float(abs_error.max().cpu()), 1e-12)
+    residual_limits = _symmetric_limits(flux_residual)
+    f_limits = _symmetric_limits(f_map)
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
+    fig.suptitle(figure_title)
+    panels = [
+        (axes[0][0], u_exact, "true solution u_exact", "viridis", full_extent, u_limits[0], u_limits[1]),
+        (axes[0][1], u_pred, "CNN prediction u_pred", "viridis", full_extent, u_limits[0], u_limits[1]),
+        (axes[0][2], error, "signed error u_pred - u_exact", "coolwarm", full_extent, error_limits[0], error_limits[1]),
+        (axes[1][0], abs_error, "absolute error |u_pred - u_exact|", "magma", full_extent, 0.0, abs_error_max),
+        (
+            axes[1][1],
+            flux_residual,
+            "flux PDE residual",
+            "coolwarm",
+            residual_extent,
+            residual_limits[0],
+            residual_limits[1],
+        ),
+        (axes[1][2], f_map, "forcing f", "coolwarm", full_extent, f_limits[0], f_limits[1]),
+    ]
+    for ax, values, title, cmap, extent, vmin, vmax in panels:
+        _add_panel_heatmap(fig, ax, values, title, cmap, extent, vmin, vmax)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+def _prediction_panel_title(row: dict[str, float | int]) -> str:
+    return (
+        f"sample {int(row['sample_id'])} | k={float(row['k']):.4g} "
+        f"relL2={float(row['relL2']):.3e} "
+        f"RMSE={float(row['rmse']):.3e} "
+        f"MAE={float(row['mae']):.3e} "
+        f"Linf={float(row['linf']):.3e} "
+        f"flux_resRMSE={float(row['flux_resRMSE']):.3e}"
+    )
+
+
+def save_prediction_plot_outputs(
+    plot_dir: str | Path,
+    batch: dict[str, torch.Tensor | float],
+    u_pred: torch.Tensor,
+    coeff_mode: str,
+    show_plots: bool = False,
+) -> None:
+    output_path = Path(plot_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    with torch.no_grad():
+        u_exact = batch["u_exact"]  # type: ignore[assignment]
+        pred_flux_residual = nonlinear_poisson_residual(
+            u_pred,
+            batch["f"],  # type: ignore[arg-type]
+            batch["k"],  # type: ignore[arg-type]
+            batch["h"],  # type: ignore[arg-type]
+            coeff_mode=coeff_mode,
+        )
+        exact_flux_residual = nonlinear_poisson_residual(
+            u_exact,
+            batch["f"],  # type: ignore[arg-type]
+            batch["k"],  # type: ignore[arg-type]
+            batch["h"],  # type: ignore[arg-type]
+            coeff_mode=coeff_mode,
+        )
+        error = u_pred - u_exact
+        abs_error = error.abs()
+        eval_rows = _prediction_eval_rows(batch, u_pred, pred_flux_residual, exact_flux_residual)
+        plot_rows = _prediction_plot_rows(eval_rows)
+
+    metrics_path = output_path / "metrics.csv"
+    _write_prediction_plot_csv(plot_rows, metrics_path)
+
+    plt = _load_matplotlib_pyplot(show_plots=show_plots)
+    h = float(batch["h"])  # type: ignore[arg-type]
+    full_extent = [-1.0, 1.0, -1.0, 1.0]
+    residual_extent = [-1.0 + h, 1.0 - h, -1.0 + h, 1.0 - h]
+    f = batch["f"]  # type: ignore[assignment]
+
+    for sample_id in range(u_pred.shape[0]):
+        figure_path = output_path / f"sample_{sample_id:03d}_panel.png"
+        _save_prediction_panel(
+            plt,
+            figure_path,
+            _prediction_panel_title(plot_rows[sample_id]),
+            u_exact[sample_id, 0].detach(),
+            u_pred[sample_id, 0].detach(),
+            error[sample_id, 0].detach(),
+            abs_error[sample_id, 0].detach(),
+            pred_flux_residual[sample_id, 0].detach(),
+            f[sample_id, 0].detach(),
+            full_extent,
+            residual_extent,
+            show_plots,
+        )
+
+    print(f"saved prediction plot metrics: {metrics_path}")
+    print(f"saved prediction panels: {output_path}")
+
+
 def run_prediction(args: argparse.Namespace) -> None:
     if not args.load_path:
         raise ValueError("--predict-manufactured requires --load-path")
@@ -2225,6 +2389,16 @@ def run_prediction(args: argparse.Namespace) -> None:
             u_pred,
             prediction_config,
             model_config.coeff_mode,
+            show_plots=getattr(args, "show_plots", False),
+        )
+
+    if getattr(args, "plot_predictions", False):
+        save_prediction_plot_outputs(
+            getattr(args, "plot_dir", "results/figures"),
+            batch,
+            u_pred,
+            model_config.coeff_mode,
+            show_plots=getattr(args, "show_plots", False),
         )
 
     if args.predict_save:
@@ -2237,6 +2411,58 @@ def run_prediction(args: argparse.Namespace) -> None:
             prediction_config,
             model_config,
         )
+
+
+def run_demo(args: argparse.Namespace) -> None:
+    checkpoint_path = Path("checkpoints/demo.pt")
+    best_checkpoint_path = add_path_suffix(checkpoint_path, "best")
+    figure_dir = Path("results/demo_figures")
+
+    print("running demo mode")
+    print(f"demo checkpoint path: {checkpoint_path}")
+    print(f"demo best checkpoint path: {best_checkpoint_path}")
+    print(f"demo figure directory: {figure_dir}")
+
+    train_args = argparse.Namespace(**vars(args))
+    train_args.N = 32
+    train_args.train_samples = 2048
+    train_args.val_samples = 128
+    train_args.epochs = 40
+    train_args.batch_size = 16
+    train_args.eval_batch_size = 0
+    train_args.eval_batches = None
+    train_args.eval_every = 1
+    train_args.save_path = str(checkpoint_path)
+    train_args.load_path = ""
+    train_args.predict_manufactured = False
+    train_args.predict_save = ""
+    train_args.plot_predictions = False
+    apply_positive_interior_default(train_args)
+    train(train_args)
+
+    prediction_checkpoint = best_checkpoint_path if best_checkpoint_path.exists() else checkpoint_path
+    print(f"demo prediction checkpoint: {prediction_checkpoint}")
+
+    predict_args = argparse.Namespace(**vars(args))
+    predict_args.load_path = str(prediction_checkpoint)
+    predict_args.predict_manufactured = True
+    predict_args.predict_samples = 4
+    predict_args.predict_save = ""
+    predict_args.predict_N = None
+    predict_args.predict_rhs_mode = None
+    predict_args.predict_solution_mode = None
+    predict_args.predict_k_min = None
+    predict_args.predict_k_max = None
+    predict_args.compare_transform_solver = False
+    predict_args.eval_output_dir = ""
+    predict_args.plot_predictions = True
+    predict_args.plot_dir = str(figure_dir)
+    run_prediction(predict_args)
+
+    print(f"demo checkpoint saved: {checkpoint_path}")
+    print(f"demo best checkpoint saved: {best_checkpoint_path}")
+    print(f"demo figures saved: {figure_dir}")
+    print(f"demo metrics saved: {figure_dir / 'metrics.csv'}")
 
 
 def run_grid_convergence(args: argparse.Namespace) -> None:
@@ -2353,6 +2579,7 @@ def run_residual_check(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--demo", action="store_true")
     parser.add_argument("--N", type=int, default=32, help="Interior grid size. Full grid is (N+2)^2.")
     parser.add_argument("--train-samples", type=int, default=2048)
     parser.add_argument("--val-samples", type=int, default=128)
@@ -2394,6 +2621,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predict-manufactured", action="store_true")
     parser.add_argument("--predict-samples", type=int, default=8)
     parser.add_argument("--predict-save", default="")
+    parser.add_argument("--plot-predictions", action="store_true")
+    parser.add_argument("--plot-dir", default="results/figures")
+    parser.add_argument("--show-plots", action="store_true")
     parser.add_argument("--predict-N", "--predict-n", dest="predict_N", type=int, default=None)
     parser.add_argument(
         "--predict-rhs-mode",
@@ -2425,7 +2655,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if len(sys.argv) == 1:
+        args.demo = True
     apply_positive_interior_default(args)
+    if args.demo:
+        run_demo(args)
+        return
     if args.check_residual:
         run_residual_check(args)
         if not args.train_after_check:

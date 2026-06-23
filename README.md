@@ -1,12 +1,18 @@
 # Nonlinear Poisson CNN Baseline
 
-This repository contains a PyTorch baseline for a nonlinear Poisson equation in flux form:
+This project trains a CNN baseline for the original flux-form nonlinear
+Poisson equation:
 
 ```text
--div(a(u) grad u) = f,  a(u) = u**k,  u = g on boundary
+-div(u^k grad u) = f,  u = g on boundary
 ```
 
-The baseline uses a grid-to-grid U-Net, exact Dirichlet boundary enforcement, and a conservative finite-difference flux residual on the interior nodes.
+The baseline uses a grid-to-grid U-Net, exact Dirichlet boundary enforcement,
+and one finite-difference PDE residual on the interior nodes:
+
+```text
+R_flux(u) = -div_h(u^k grad_h u) - f
+```
 
 ## Quick Start
 
@@ -58,8 +64,9 @@ It saves:
 - Demo panels: `results/demo_figures/sample_000_panel.png` through `sample_003_panel.png`
 
 Each panel contains true solution, CNN prediction, signed error, absolute
-error, flux PDE residual, and the forcing term `f`. Use `--show-plots` if you
-also want Matplotlib to display the figures interactively after saving them.
+error, the flux PDE residual, and the forcing term `f`. Use `--show-plots` if
+you also want Matplotlib to display the figures interactively after saving
+them.
 
 The committed demo results in this branch were generated with the demo code in
 this branch.
@@ -70,17 +77,18 @@ The model takes six input channels: `[f, boundary_g, boundary_mask, k, x, y]`.
 The U-Net predicts a full-grid solution and then applies an exact Dirichlet
 projection, so boundary values are copied from the manufactured boundary data.
 
-Training uses manufactured nonlinear Poisson problems. The PDE is
+Training uses manufactured nonlinear Poisson problems. The only PDE residual is
+the conservative flux-form finite-difference stencil with shared face fluxes:
 
 ```text
--div(u**k grad u) = f
+R_flux(u_pred) = -div_h(u_pred^k grad_h u_pred) - f
 ```
 
-and the residual is evaluated on interior nodes. The original flux-form
-residual is implemented with shared face fluxes:
+For `rhs_mode=discrete`, the manufactured RHS is generated with the same flux
+stencil:
 
 ```text
-R = -div_h(u_pred**k grad_h u_pred) - f
+f = -div_h(u_exact^k grad_h u_exact)
 ```
 
 Prediction and plotting reuse the same checkpoint loader and manufactured test
@@ -90,8 +98,8 @@ data path as normal prediction. For each sample, the code computes:
 - `abs_error = |u_pred - u_exact|`
 - interior `relL2`, `rmse`, `mae`, and `linf`
 - boundary maximum error
-- CNN flux residual RMSE
-- oracle flux residual RMSE from `u_exact`
+- CNN flux residual RMSE in `pred_flux_resRMSE`
+- oracle flux residual RMSE from `u_exact` in `exact_flux_resRMSE`
 
 Figures are saved with Matplotlib `imshow` panels and colorbars using
 `plt.savefig(..., dpi=200, bbox_inches="tight")`, followed by `plt.close(fig)`.

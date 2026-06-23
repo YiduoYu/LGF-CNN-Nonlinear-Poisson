@@ -219,91 +219,22 @@ def nonlinear_poisson_residual(
     return -div_h - f[:, :, 1:-1, 1:-1]
 
 
-def kirchhoff_transform(u: torch.Tensor, k: torch.Tensor | float) -> torch.Tensor:
-    """Map positive u to w = u^(k+1)/(k+1)."""
-
-    if bool((u <= 0).any().item()):
-        raise ValueError("kirchhoff_transform requires strictly positive u values.")
-    kp1 = _k_plus_one_to_broadcast(k, u)
-    return torch.pow(u, kp1) / kp1
-
-
-def inverse_kirchhoff_transform(
-    w: torch.Tensor,
-    k: torch.Tensor | float,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Invert w = u^(k+1)/(k+1) with a small clamp against roundoff."""
-
-    kp1 = _k_plus_one_to_broadcast(k, w)
-    base = torch.clamp(kp1 * w, min=eps)
-    return torch.pow(base, 1.0 / kp1)
-
-
-def poisson_residual_from_w(w: torch.Tensor, f: torch.Tensor, h: float) -> torch.Tensor:
-    wc = w[:, :, 1:-1, 1:-1]
-    lap_w = (
-        w[:, :, 1:-1, 2:]
-        + w[:, :, 1:-1, :-2]
-        + w[:, :, 2:, 1:-1]
-        + w[:, :, :-2, 1:-1]
-        - 4.0 * wc
-    ) / (h * h)
-    return -lap_w - f[:, :, 1:-1, 1:-1]
-
-
-def kirchhoff_residual_from_u(
-    u: torch.Tensor,
-    f: torch.Tensor,
-    k: torch.Tensor | float,
-    h: float,
-) -> torch.Tensor:
-    return poisson_residual_from_w(kirchhoff_transform(u, k), f, h)
-
-
-def validate_discretization(discretization: str, coeff_mode: str) -> None:
-    if discretization not in {"flux", "kirchhoff"}:
-        raise ValueError("discretization must be 'flux' or 'kirchhoff'.")
-    if discretization == "kirchhoff" and coeff_mode != "pow":
-        raise ValueError("discretization='kirchhoff' requires coeff_mode='pow'.")
-
-
 def compute_pde_residual(
     u: torch.Tensor,
     f: torch.Tensor,
     k: torch.Tensor | float,
     h: float,
-    discretization: str,
-    coeff_mode: str,
+    coeff_mode: str = "pow",
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    validate_discretization(discretization, coeff_mode)
-    if discretization == "flux":
-        return nonlinear_poisson_residual(u, f, k, h, coeff_mode=coeff_mode, eps=eps)
-    return kirchhoff_residual_from_u(u, f, k, h)
-
-
-def pde_loss(
-    u: torch.Tensor,
-    f: torch.Tensor,
-    k: torch.Tensor | float,
-    h: float,
-    scale_with_h: bool = True,
-    coeff_mode: str = "pow",
-    discretization: str = "kirchhoff",
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    res = compute_pde_residual(
+    return nonlinear_poisson_residual(
         u,
         f,
         k,
         h,
-        discretization=discretization,
         coeff_mode=coeff_mode,
         eps=eps,
     )
-    res_for_loss = (h * h) * res if scale_with_h else res
-    return (res_for_loss * res_for_loss).mean(), res
 
 
 def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -352,287 +283,6 @@ def gradient_relative_l2_error(
     num = torch.linalg.vector_norm(diff.reshape(diff.shape[0], -1), dim=1)
     den = torch.linalg.vector_norm(ref.reshape(ref.shape[0], -1), dim=1).clamp_min(eps)
     return (num / den).mean()
-
-
-# ---------------------------------------------------------------------------
-# Transformed Poisson finite-difference baseline
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class PoissonCGDiagnostics:
-    iterations: int
-    final_max_relative_residual: float
-    converged: bool
-
-
-def _k_plus_one_to_broadcast(k: torch.Tensor | float, u: torch.Tensor) -> torch.Tensor:
-    kp1 = _k_to_broadcast(k, u) + 1.0
-    if bool((kp1.abs() < 1e-8).any().item()):
-        raise ValueError("The transform w = u^(k+1)/(k+1) requires k != -1.")
-    return kp1
-
-
-def u_to_w(u: torch.Tensor, k: torch.Tensor | float) -> torch.Tensor:
-    return kirchhoff_transform(u, k)
-
-
-def w_to_u(w: torch.Tensor, k: torch.Tensor | float, eps: float = 1e-8) -> torch.Tensor:
-    return inverse_kirchhoff_transform(w, k, eps=eps)
-
-
-def _negative_laplacian_interior_matvec(v: torch.Tensor) -> torch.Tensor:
-    """Dimensionless interior operator A(v)=4v-v_e-v_w-v_n-v_s."""
-
-    if v.ndim != 4 or v.shape[1] != 1:
-        raise ValueError("v must have shape [B, 1, N, N].")
-    out = 4.0 * v
-    out[:, :, :, 1:] = out[:, :, :, 1:] - v[:, :, :, :-1]
-    out[:, :, :, :-1] = out[:, :, :, :-1] - v[:, :, :, 1:]
-    out[:, :, 1:, :] = out[:, :, 1:, :] - v[:, :, :-1, :]
-    out[:, :, :-1, :] = out[:, :, :-1, :] - v[:, :, 1:, :]
-    return out
-
-
-def _poisson_dirichlet_rhs(
-    f: torch.Tensor,
-    w_boundary: torch.Tensor,
-    h: float,
-) -> torch.Tensor:
-    if f.ndim != 4 or f.shape[1] != 1:
-        raise ValueError("f must have shape [B, 1, H, W].")
-    B, _, H, W = f.shape
-    if H != W:
-        raise ValueError("Only square grids are supported.")
-    N = H - 2
-    if N < 1:
-        raise ValueError("Interior grid size N must be positive.")
-    if w_boundary.shape[0] == 1 and B > 1:
-        w_boundary = w_boundary.expand(B, -1, -1, -1)
-    if w_boundary.shape != f.shape:
-        raise ValueError("w_boundary must have shape [B, 1, H, W] or batch size 1.")
-
-    w_boundary = w_boundary.to(device=f.device, dtype=f.dtype)
-    rhs = (h * h) * f[:, :, 1:-1, 1:-1].clone()
-    rhs[:, :, :, 0] = rhs[:, :, :, 0] + w_boundary[:, :, 1:-1, 0]
-    rhs[:, :, :, -1] = rhs[:, :, :, -1] + w_boundary[:, :, 1:-1, -1]
-    rhs[:, :, 0, :] = rhs[:, :, 0, :] + w_boundary[:, :, 0, 1:-1]
-    rhs[:, :, -1, :] = rhs[:, :, -1, :] + w_boundary[:, :, -1, 1:-1]
-    return rhs
-
-
-def _interior_dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return (a * b).flatten(start_dim=1).sum(dim=1)
-
-
-def _default_cg_tol(dtype: torch.dtype) -> float:
-    return 1e-10 if dtype == torch.float64 else 1e-6
-
-
-def _default_cg_max_iter(N: int, cg_max_iter: int | None) -> int:
-    if cg_max_iter is None or cg_max_iter <= 0:
-        return max(100, 10 * N)
-    return int(cg_max_iter)
-
-
-def solve_laplacian_interior_cg(
-    rhs: torch.Tensor,
-    cg_tol: float | None = None,
-    cg_max_iter: int | None = None,
-) -> tuple[torch.Tensor, PoissonCGDiagnostics]:
-    """Solve A(x)=rhs for batched interior arrays with matrix-free CG."""
-
-    if rhs.ndim != 4 or rhs.shape[1] != 1:
-        raise ValueError("rhs must have shape [B, 1, N, N].")
-    B, _, N, W = rhs.shape
-    if N != W:
-        raise ValueError("Only square interior grids are supported.")
-    if N < 1:
-        raise ValueError("Interior grid size N must be positive.")
-    if not torch.isfinite(rhs).all():
-        raise ValueError("Poisson CG inputs must be finite.")
-
-    tol = _default_cg_tol(rhs.dtype) if cg_tol is None or cg_tol <= 0 else float(cg_tol)
-    max_iter = _default_cg_max_iter(N, cg_max_iter)
-    x = torch.zeros_like(rhs)
-    r = rhs.clone()
-    p = r.clone()
-
-    b_norm = torch.linalg.vector_norm(rhs.flatten(start_dim=1), dim=1)
-    denom = torch.where(b_norm > 0, b_norm, torch.ones_like(b_norm))
-    rr = _interior_dot(r, r)
-    rel = rr.sqrt() / denom
-    if bool((rel <= tol).all().item()):
-        return x, PoissonCGDiagnostics(
-            iterations=0,
-            final_max_relative_residual=float(rel.max().detach().cpu()),
-            converged=True,
-        )
-
-    tiny = torch.finfo(rhs.dtype).tiny
-    for iteration in range(1, max_iter + 1):
-        active = rel > tol
-        active4 = active.view(B, 1, 1, 1)
-        Ap = _negative_laplacian_interior_matvec(p)
-        if not torch.isfinite(Ap).all():
-            raise ValueError("Poisson CG produced non-finite operator values.")
-        denom_alpha = _interior_dot(p, Ap)
-        if bool(((denom_alpha <= 0) & active).any().item()):
-            raise RuntimeError("Poisson CG encountered a non-positive search direction.")
-
-        alpha = torch.zeros_like(rr)
-        alpha[active] = rr[active] / denom_alpha[active]
-        alpha4 = alpha.view(B, 1, 1, 1)
-        x = torch.where(active4, x + alpha4 * p, x)
-        r_next = r - alpha4 * Ap
-        r = torch.where(active4, r_next, r)
-        if not torch.isfinite(x).all() or not torch.isfinite(r).all():
-            raise ValueError("Poisson CG produced non-finite iterates.")
-
-        rr_next = _interior_dot(r, r)
-        rel = rr_next.sqrt() / denom
-        if bool((rel <= tol).all().item()):
-            return x, PoissonCGDiagnostics(
-                iterations=iteration,
-                final_max_relative_residual=float(rel.max().detach().cpu()),
-                converged=True,
-            )
-
-        beta = torch.zeros_like(rr)
-        beta[active] = rr_next[active] / rr[active].clamp_min(tiny)
-        beta4 = beta.view(B, 1, 1, 1)
-        p_next = r + beta4 * p
-        p = torch.where(active4, p_next, p)
-        rr = rr_next
-
-    final_rel = float(rel.max().detach().cpu())
-    raise RuntimeError(
-        "Poisson CG failed to converge "
-        f"after {max_iter} iterations (max relative residual {final_rel:.3e}, tol {tol:.3e})."
-    )
-
-
-def solve_poisson_dirichlet_cg(
-    f: torch.Tensor,
-    w_boundary: torch.Tensor,
-    h: float,
-    mask: torch.Tensor,
-    cg_tol: float | None = None,
-    cg_max_iter: int | None = None,
-) -> tuple[torch.Tensor, PoissonCGDiagnostics]:
-    """Matrix-free batched CG solve for -Delta w = f with Dirichlet data."""
-
-    if f.ndim != 4 or f.shape[1] != 1:
-        raise ValueError("f must have shape [B, 1, H, W].")
-    B, _, H, W = f.shape
-    if H != W:
-        raise ValueError("Only square grids are supported.")
-    N = H - 2
-    if N < 1:
-        raise ValueError("Interior grid size N must be positive.")
-    if mask.shape[0] == 1 and B > 1:
-        mask = mask.expand(B, -1, -1, -1)
-    if w_boundary.shape[0] == 1 and B > 1:
-        w_boundary = w_boundary.expand(B, -1, -1, -1)
-    if mask.shape != f.shape or w_boundary.shape != f.shape:
-        raise ValueError("mask and w_boundary must match f shape or use batch size 1.")
-
-    w_boundary = w_boundary.to(device=f.device, dtype=f.dtype)
-    mask = mask.to(device=f.device, dtype=f.dtype)
-    b = _poisson_dirichlet_rhs(f, w_boundary, h)
-    if not torch.isfinite(w_boundary).all():
-        raise ValueError("Poisson CG inputs must be finite.")
-    x, diagnostics = solve_laplacian_interior_cg(b, cg_tol=cg_tol, cg_max_iter=cg_max_iter)
-    w = mask * w_boundary
-    w[:, :, 1:-1, 1:-1] = x
-    return w, diagnostics
-
-
-def format_cg_diagnostics(label: str, diagnostics: PoissonCGDiagnostics) -> str:
-    return (
-        f"{label} cg_iters={diagnostics.iterations} "
-        f"cg_relres={diagnostics.final_max_relative_residual:.3e} "
-        f"cg_converged={diagnostics.converged}"
-    )
-
-
-def _solve_poisson_dirichlet_dense_reference(
-    f: torch.Tensor,
-    w_boundary: torch.Tensor,
-    h: float,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    """Test-only dense reference; unsuitable for production-size grids."""
-
-    if f.ndim != 4 or f.shape[1] != 1:
-        raise ValueError("f must have shape [B, 1, H, W].")
-    B, _, H, W = f.shape
-    if H != W:
-        raise ValueError("Only square grids are supported.")
-    N = H - 2
-    if N < 1:
-        raise ValueError("Interior grid size N must be positive.")
-
-    if w_boundary.shape[0] == 1 and B > 1:
-        w_boundary = w_boundary.expand(B, -1, -1, -1)
-    if mask.shape[0] == 1 and B > 1:
-        mask = mask.expand(B, -1, -1, -1)
-    w_boundary = w_boundary.to(device=f.device, dtype=f.dtype)
-    mask = mask.to(device=f.device, dtype=f.dtype)
-
-    n_unknowns = N * N
-    A = torch.zeros((n_unknowns, n_unknowns), device=f.device, dtype=f.dtype)
-    rhs = (h * h) * f[:, 0, 1:-1, 1:-1].reshape(B, n_unknowns)
-
-    for iy in range(N):
-        for ix in range(N):
-            row = iy * N + ix
-            A[row, row] = 4.0
-            for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-                jy = iy + dy
-                jx = ix + dx
-                if 0 <= jy < N and 0 <= jx < N:
-                    A[row, jy * N + jx] = -1.0
-                else:
-                    by = iy + 1 + dy
-                    bx = ix + 1 + dx
-                    rhs[:, row] += w_boundary[:, 0, by, bx]
-
-    sol = torch.linalg.solve(A, rhs.T).T.reshape(B, 1, N, N)
-    w = mask * w_boundary
-    w[:, :, 1:-1, 1:-1] = sol
-    return w
-
-
-def solve_transformed_poisson(
-    f: torch.Tensor,
-    g_map: torch.Tensor,
-    k: torch.Tensor,
-    mask: torch.Tensor,
-    h: float,
-    cg_tol: float | None = None,
-    cg_max_iter: int | None = None,
-    return_diagnostics: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, PoissonCGDiagnostics]:
-    """Solve via w = u^(k+1)/(k+1) using matrix-free Poisson CG."""
-
-    if mask.shape[0] == 1 and g_map.shape[0] > 1:
-        mask = mask.expand(g_map.shape[0], -1, -1, -1)
-    safe_g = torch.where(mask > 0, g_map, torch.ones_like(g_map))
-    w_boundary = mask * kirchhoff_transform(safe_g, k)
-    w, diagnostics = solve_poisson_dirichlet_cg(
-        f,
-        w_boundary,
-        h,
-        mask,
-        cg_tol=cg_tol,
-        cg_max_iter=cg_max_iter,
-    )
-    u = inverse_kirchhoff_transform(w, k)
-    u_full = mask * g_map + (1.0 - mask) * u
-    if return_diagnostics:
-        return u_full, diagnostics
-    return u_full
 
 
 # ---------------------------------------------------------------------------
@@ -871,26 +521,11 @@ def discrete_rhs_from_u(
     k: torch.Tensor,
     h: float,
     coeff_mode: str = "pow",
-    discretization: str = "kirchhoff",
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Build f so u_exact satisfies the same discrete residual to roundoff."""
+    """Build flux-form f so u_exact satisfies the discrete residual to roundoff."""
 
     f = torch.zeros_like(u_exact)
-    validate_discretization(discretization, coeff_mode)
-    if discretization == "kirchhoff":
-        w = kirchhoff_transform(u_exact, k)
-        wc = w[:, :, 1:-1, 1:-1]
-        lap_w = (
-            w[:, :, 1:-1, 2:]
-            + w[:, :, 1:-1, :-2]
-            + w[:, :, 2:, 1:-1]
-            + w[:, :, :-2, 1:-1]
-            - 4.0 * wc
-        ) / (h * h)
-        f[:, :, 1:-1, 1:-1] = -lap_w
-        return f
-
     a = power_coefficient(u_exact, k, mode=coeff_mode, eps=eps)
 
     uc = u_exact[:, :, 1:-1, 1:-1]
@@ -944,13 +579,11 @@ def sample_manufactured_problem(
     rhs_mode: str = "continuous",
     positive_only: bool = True,
     coeff_mode: str = "pow",
-    discretization: str = "kirchhoff",
     solution_mode: str = "base",
     dtype: torch.dtype = torch.float32,
 ) -> dict[str, torch.Tensor | float]:
     """Return one manufactured problem instance."""
 
-    validate_discretization(discretization, coeff_mode)
     if rhs_mode == "continuous" and solution_mode != "base":
         raise ValueError(
             "rhs_mode='continuous' currently supports only solution_mode='base'; "
@@ -978,7 +611,6 @@ def sample_manufactured_problem(
             k,
             h,
             coeff_mode=coeff_mode,
-            discretization=discretization,
         )
     else:
         raise ValueError("rhs_mode must be 'continuous' or 'discrete'")
@@ -1008,32 +640,6 @@ def collate_problem_list(problem_list: list[dict[str, torch.Tensor | float]]) ->
     return batch
 
 
-def make_batch(
-    N: int,
-    batch_size: int,
-    device: torch.device,
-    k_range: tuple[float, float],
-    rhs_mode: str,
-    coeff_mode: str,
-    discretization: str,
-    solution_mode: str = "base",
-) -> dict[str, torch.Tensor | float]:
-    problems = [
-        sample_manufactured_problem(
-            N=N,
-            device=device,
-            k_range=k_range,
-            rhs_mode=rhs_mode,
-            positive_only=True,
-            coeff_mode=coeff_mode,
-            discretization=discretization,
-            solution_mode=solution_mode,
-        )
-        for _ in range(batch_size)
-    ]
-    return collate_problem_list(problems)
-
-
 # ---------------------------------------------------------------------------
 # Training and evaluation
 # ---------------------------------------------------------------------------
@@ -1054,7 +660,6 @@ def build_dataset(
     k_range: tuple[float, float],
     rhs_mode: str,
     coeff_mode: str,
-    discretization: str,
     solution_mode: str = "base",
 ) -> dict[str, torch.Tensor | float]:
     problems = [
@@ -1065,7 +670,6 @@ def build_dataset(
             rhs_mode=rhs_mode,
             positive_only=True,
             coeff_mode=coeff_mode,
-            discretization=discretization,
             solution_mode=solution_mode,
         )
         for _ in range(num_samples)
@@ -1137,7 +741,6 @@ def relative_pde_loss(
     k: torch.Tensor,
     h: float,
     coeff_mode: str = "pow",
-    discretization: str = "kirchhoff",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return mean((R / rms(f))^2) and the raw residual R."""
 
@@ -1146,7 +749,6 @@ def relative_pde_loss(
         f,
         k,
         h,
-        discretization=discretization,
         coeff_mode=coeff_mode,
     )
     fi = f[:, :, 1:-1, 1:-1]
@@ -1193,7 +795,6 @@ def _accumulate_metrics(
     u_pred: torch.Tensor,
     batch: dict[str, torch.Tensor | float],
     coeff_mode: str,
-    discretization: str,
     include_gradient: bool = True,
 ) -> None:
     n = u_pred.shape[0]
@@ -1213,7 +814,6 @@ def _accumulate_metrics(
         batch["f"],  # type: ignore[arg-type]
         batch["k"],  # type: ignore[arg-type]
         batch["h"],  # type: ignore[arg-type]
-        discretization=discretization,
         coeff_mode=coeff_mode,
     )
     bmax = boundary_max_error(
@@ -1273,59 +873,17 @@ def evaluate_on(
     stats: InputStats,
     batch_size: int,
     coeff_mode: str,
-    discretization: str,
     normalize_k: bool,
     positive_interior: bool,
-    compare_transform_solver: bool = False,
     include_gradient: bool = True,
-    cg_tol: float | None = None,
-    cg_max_iter: int | None = None,
-) -> dict[str, EvalMetrics]:
-    return _evaluate_on_impl(
-        model=model,
-        data=data,
-        stats=stats,
-        batch_size=batch_size,
-        coeff_mode=coeff_mode,
-        discretization=discretization,
-        normalize_k=normalize_k,
-        positive_interior=positive_interior,
-        compare_transform_solver=compare_transform_solver,
-        include_gradient=include_gradient,
-        cg_tol=cg_tol,
-        cg_max_iter=cg_max_iter,
-    )
-
-
-def _evaluate_on_impl(
-    model: nn.Module,
-    data: dict[str, torch.Tensor | float],
-    stats: InputStats,
-    batch_size: int,
-    coeff_mode: str,
-    discretization: str,
-    normalize_k: bool,
-    positive_interior: bool,
-    compare_transform_solver: bool = False,
-    include_gradient: bool = True,
-    cg_tol: float | None = None,
-    cg_max_iter: int | None = None,
 ) -> dict[str, EvalMetrics]:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
-    validate_discretization(discretization, coeff_mode)
-    if compare_transform_solver and discretization != "kirchhoff":
-        raise ValueError(
-            "--compare-transform-solver requires discretization='kirchhoff'; "
-            "the flux stencil and transformed Poisson solver are different discrete equations."
-        )
 
     model.eval()
     n = data["f"].shape[0]  # type: ignore[union-attr]
     device = data["f"].device  # type: ignore[union-attr]
     totals = {"cnn": _MetricSums()}
-    if compare_transform_solver:
-        totals["transform"] = _MetricSums()
 
     with torch.no_grad():
         for start in range(0, n, batch_size):
@@ -1343,27 +901,8 @@ def _evaluate_on_impl(
                 u_pred,
                 batch,
                 coeff_mode,
-                discretization,
                 include_gradient,
             )
-            if compare_transform_solver:
-                u_transform = solve_transformed_poisson(
-                    batch["f"],  # type: ignore[arg-type]
-                    batch["g"],  # type: ignore[arg-type]
-                    batch["k"],  # type: ignore[arg-type]
-                    batch["mask"],  # type: ignore[arg-type]
-                    batch["h"],  # type: ignore[arg-type]
-                    cg_tol=cg_tol,
-                    cg_max_iter=cg_max_iter,
-                )
-                _accumulate_metrics(
-                    totals["transform"],
-                    u_transform,
-                    batch,
-                    coeff_mode,
-                    discretization,
-                    include_gradient,
-                )
 
     return {name: _finalize_metrics(sums) for name, sums in totals.items()}
 
@@ -1372,13 +911,12 @@ def evaluate_predictions(
     predictions: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor | float],
     coeff_mode: str,
-    discretization: str,
     include_gradient: bool = True,
 ) -> dict[str, EvalMetrics]:
     metrics: dict[str, EvalMetrics] = {}
     for name, u_pred in predictions.items():
         sums = _MetricSums()
-        _accumulate_metrics(sums, u_pred, batch, coeff_mode, discretization, include_gradient)
+        _accumulate_metrics(sums, u_pred, batch, coeff_mode, include_gradient)
         metrics[name] = _finalize_metrics(sums)
     return metrics
 
@@ -1386,7 +924,6 @@ def evaluate_predictions(
 def oracle_floor(
     data: dict[str, torch.Tensor | float],
     coeff_mode: str,
-    discretization: str,
 ) -> float:
     """Raw resRMSE of the exact solution on the validation set."""
 
@@ -1396,7 +933,6 @@ def oracle_floor(
             data["f"],  # type: ignore[arg-type]
             data["k"],  # type: ignore[arg-type]
             data["h"],  # type: ignore[arg-type]
-            discretization=discretization,
             coeff_mode=coeff_mode,
         )
         return float(res.pow(2).mean().sqrt())
@@ -1436,12 +972,6 @@ def train(args: argparse.Namespace) -> nn.Module:
     set_seed(args.seed)
     device = select_device(args.device)
     k_range = (args.k_min, args.k_max)
-    validate_discretization(args.discretization, args.coeff_mode)
-    if args.compare_transform_solver and args.discretization != "kirchhoff":
-        raise ValueError(
-            "--compare-transform-solver requires discretization='kirchhoff'; "
-            "the flux stencil and transformed Poisson solver are different discrete equations."
-        )
     eval_batch_size = args.eval_batch_size or args.batch_size
     if args.eval_batches is not None:
         args.val_samples = args.eval_batches * eval_batch_size
@@ -1458,8 +988,7 @@ def train(args: argparse.Namespace) -> nn.Module:
     t0 = time.time()
     print(
         f"generating train set: {args.train_samples} samples "
-        f"(N={args.N}, rhs_mode={args.rhs_mode}, "
-        f"discretization={args.discretization}, solution_mode={args.solution_mode})",
+        f"(N={args.N}, rhs_mode={args.rhs_mode}, solution_mode={args.solution_mode})",
         flush=True,
     )
     train_data = build_dataset(
@@ -1469,7 +998,6 @@ def train(args: argparse.Namespace) -> nn.Module:
         k_range,
         args.rhs_mode,
         args.coeff_mode,
-        args.discretization,
         args.solution_mode,
     )
     print(f"generating val set: {args.val_samples} samples", flush=True)
@@ -1480,11 +1008,10 @@ def train(args: argparse.Namespace) -> nn.Module:
         k_range,
         args.rhs_mode,
         args.coeff_mode,
-        args.discretization,
         args.solution_mode,
     )
     stats = compute_input_stats(train_data, k_range)
-    floor = oracle_floor(val_data, args.coeff_mode, args.discretization)
+    floor = oracle_floor(val_data, args.coeff_mode)
 
     model = UNet2d(in_ch=6, out_ch=1, base_ch=args.base_ch).to(device)
     optimizer = torch.optim.AdamW(
@@ -1508,7 +1035,6 @@ def train(args: argparse.Namespace) -> nn.Module:
 
     print(
         f"device={device} N={args.N} rhs_mode={args.rhs_mode} "
-        f"discretization={args.discretization} "
         f"train={args.train_samples} val={args.val_samples} "
         f"gen_time={time.time() - t0:.1f}s"
     )
@@ -1538,7 +1064,6 @@ def train(args: argparse.Namespace) -> nn.Module:
                 batch["k"],  # type: ignore[arg-type]
                 batch["h"],  # type: ignore[arg-type]
                 coeff_mode=args.coeff_mode,
-                discretization=args.discretization,
             )
             loss_sup = masked_mse(
                 u_pred,
@@ -1592,12 +1117,8 @@ def train(args: argparse.Namespace) -> nn.Module:
                 stats,
                 eval_batch_size,
                 args.coeff_mode,
-                args.discretization,
                 normalize_k=args.normalize_k,
                 positive_interior=args.positive_interior,
-                compare_transform_solver=args.compare_transform_solver,
-                cg_tol=args.cg_tol,
-                cg_max_iter=args.cg_max_iter,
             )
             val_cnn = val_metrics["cnn"]
             if best_save_path is not None and val_cnn.rel_l2 < best_val_rel_l2:
@@ -1623,9 +1144,6 @@ def train(args: argparse.Namespace) -> nn.Module:
                 f"bmax={train_boundary:.2e} | {format_eval_metrics('val cnn', val_cnn)} "
                 f"(floor {floor:.4f})"
             )
-            if "transform" in val_metrics:
-                print(f"  {format_eval_metrics('val transform', val_metrics['transform'])}")
-
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -1681,8 +1199,8 @@ def load_model_from_checkpoint(
             k_std=max((k_max - k_min) / math.sqrt(12.0), 1e-8),
         )
         print("checkpoint has no input_stats; using legacy identity f normalization")
-    if not hasattr(checkpoint_args, "discretization"):
-        checkpoint_args.discretization = "flux"
+    if hasattr(checkpoint_args, "discretization"):
+        delattr(checkpoint_args, "discretization")
     apply_positive_interior_default(checkpoint_args)
     return model, stats, checkpoint_args
 
@@ -1708,11 +1226,9 @@ def resolve_checkpoint_model_config(checkpoint_args: argparse.Namespace) -> argp
     model_config = argparse.Namespace(
         base_ch=int(getattr(checkpoint_args, "base_ch", 32)),
         coeff_mode=getattr(checkpoint_args, "coeff_mode", "pow"),
-        discretization=getattr(checkpoint_args, "discretization", "flux"),
         normalize_k=getattr(checkpoint_args, "normalize_k", True),
         positive_interior=getattr(checkpoint_args, "positive_interior", None),
     )
-    validate_discretization(model_config.discretization, model_config.coeff_mode)
     apply_positive_interior_default(model_config)
     return model_config
 
@@ -1753,7 +1269,6 @@ def _save_prediction_payload(
     path: str | Path,
     batch: dict[str, torch.Tensor | float],
     u_pred: torch.Tensor,
-    u_transform: torch.Tensor | None,
     metrics: dict[str, EvalMetrics],
     prediction_config: PredictionConfig,
     model_config: argparse.Namespace,
@@ -1770,8 +1285,6 @@ def _save_prediction_payload(
         "u_exact": batch["u_exact"],
         "u_pred": u_pred,
     }
-    if u_transform is not None:
-        tensors["u_transform"] = u_transform
     if save_path.suffix.lower() == ".npz":
         import numpy as np
 
@@ -1796,19 +1309,9 @@ def _save_prediction_payload(
     print(f"saved predictions: {save_path}")
 
 
-EVAL_CSV_FIELDS = [
-    "sample_id",
-    "k",
-    "relL2_interior",
-    "RMSE_interior",
-    "MAE_interior",
-    "Linf_interior",
-    "boundary_max_error",
-    "pred_flux_resRMSE",
-    "exact_flux_resRMSE",
-]
+PredictionMetricValue = float | int | str
 
-PLOT_METRIC_FIELDS = [
+PREDICTION_CSV_FIELDS = [
     "sample_id",
     "k",
     "relL2",
@@ -1816,9 +1319,12 @@ PLOT_METRIC_FIELDS = [
     "mae",
     "linf",
     "boundary_max",
-    "flux_resRMSE",
-    "oracle_flux_resRMSE",
+    "pred_flux_resRMSE",
+    "exact_flux_resRMSE",
 ]
+
+EVAL_CSV_FIELDS = list(PREDICTION_CSV_FIELDS)
+PLOT_METRIC_FIELDS = list(PREDICTION_CSV_FIELDS)
 
 
 def _per_sample_rmse(values: torch.Tensor) -> torch.Tensor:
@@ -1836,7 +1342,7 @@ def _prediction_eval_rows(
     u_pred: torch.Tensor,
     pred_flux_residual: torch.Tensor,
     exact_flux_residual: torch.Tensor,
-) -> list[dict[str, float | int]]:
+) -> list[dict[str, PredictionMetricValue]]:
     u_exact = batch["u_exact"]  # type: ignore[assignment]
     k = batch["k"]  # type: ignore[assignment]
     boundary_mask = batch["mask"]  # type: ignore[assignment]
@@ -1859,17 +1365,17 @@ def _prediction_eval_rows(
     pred_res_rmse = _per_sample_rmse(pred_res_flat)
     exact_res_rmse = _per_sample_rmse(exact_res_flat)
 
-    rows: list[dict[str, float | int]] = []
+    rows: list[dict[str, PredictionMetricValue]] = []
     for sample_id in range(u_pred.shape[0]):
         rows.append(
             {
                 "sample_id": sample_id,
                 "k": float(k[sample_id].detach().cpu()),
-                "relL2_interior": float(rel_l2[sample_id].detach().cpu()),
-                "RMSE_interior": float(rmse[sample_id].detach().cpu()),
-                "MAE_interior": float(mae[sample_id].detach().cpu()),
-                "Linf_interior": float(linf[sample_id].detach().cpu()),
-                "boundary_max_error": float(boundary_max[sample_id].detach().cpu()),
+                "relL2": float(rel_l2[sample_id].detach().cpu()),
+                "rmse": float(rmse[sample_id].detach().cpu()),
+                "mae": float(mae[sample_id].detach().cpu()),
+                "linf": float(linf[sample_id].detach().cpu()),
+                "boundary_max": float(boundary_max[sample_id].detach().cpu()),
                 "pred_flux_resRMSE": float(pred_res_rmse[sample_id].detach().cpu()),
                 "exact_flux_resRMSE": float(exact_res_rmse[sample_id].detach().cpu()),
             }
@@ -1877,7 +1383,7 @@ def _prediction_eval_rows(
     return rows
 
 
-def _write_prediction_eval_csv(rows: list[dict[str, float | int]], path: Path) -> None:
+def _write_prediction_eval_csv(rows: list[dict[str, PredictionMetricValue]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=EVAL_CSV_FIELDS)
@@ -1885,7 +1391,7 @@ def _write_prediction_eval_csv(rows: list[dict[str, float | int]], path: Path) -
         writer.writerows(rows)
 
 
-def _write_prediction_plot_csv(rows: list[dict[str, float | int]], path: Path) -> None:
+def _write_prediction_plot_csv(rows: list[dict[str, PredictionMetricValue]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=PLOT_METRIC_FIELDS)
@@ -1919,21 +1425,21 @@ def _symmetric_limits(values: torch.Tensor) -> tuple[float, float]:
     return -vmax, vmax
 
 
-def _heatmap_values(values: torch.Tensor) -> list[list[float]]:
-    return values.detach().cpu().tolist()
+def _heatmap_values(values: torch.Tensor):
+    return values.detach().cpu().numpy()
 
 
 def _eval_figure_title(
     sample_id: int,
     N: int,
-    row: dict[str, float | int],
+    row: dict[str, PredictionMetricValue],
 ) -> str:
     return (
         f"sample {sample_id} | N={N} k={float(row['k']):.4g} "
-        f"relL2={float(row['relL2_interior']):.3e} "
-        f"RMSE={float(row['RMSE_interior']):.3e} "
-        f"Linf={float(row['Linf_interior']):.3e} "
-        f"resRMSE={float(row['pred_flux_resRMSE']):.3e}"
+        f"relL2={float(row['relL2']):.3e} "
+        f"RMSE={float(row['rmse']):.3e} "
+        f"Linf={float(row['linf']):.3e} "
+        f"flux_resRMSE={float(row['pred_flux_resRMSE']):.3e}"
     )
 
 
@@ -2018,7 +1524,7 @@ def _save_combined_eval_panel(
         (
             axes[1][1],
             pred_residual,
-            "pred flux residual",
+            "pred flux PDE residual",
             "coolwarm",
             residual_extent,
             pred_res_limits[0],
@@ -2027,7 +1533,7 @@ def _save_combined_eval_panel(
         (
             axes[1][2],
             exact_residual,
-            "exact flux residual",
+            "exact flux PDE residual",
             "coolwarm",
             residual_extent,
             exact_res_limits[0],
@@ -2038,6 +1544,50 @@ def _save_combined_eval_panel(
         _add_panel_heatmap(fig, ax, values, title, cmap, extent, vmin, vmax)
     fig.savefig(sample_dir / "combined_2x3_panel.png", dpi=180)
     plt.close(fig)
+
+
+def _prediction_residual_tensors(
+    batch: dict[str, torch.Tensor | float],
+    u_pred: torch.Tensor,
+    coeff_mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    u_exact = batch["u_exact"]  # type: ignore[assignment]
+    pred_flux_residual = compute_pde_residual(
+        u_pred,
+        batch["f"],  # type: ignore[arg-type]
+        batch["k"],  # type: ignore[arg-type]
+        batch["h"],  # type: ignore[arg-type]
+        coeff_mode=coeff_mode,
+    )
+    exact_flux_residual = compute_pde_residual(
+        u_exact,
+        batch["f"],  # type: ignore[arg-type]
+        batch["k"],  # type: ignore[arg-type]
+        batch["h"],  # type: ignore[arg-type]
+        coeff_mode=coeff_mode,
+    )
+    return (
+        pred_flux_residual,
+        exact_flux_residual,
+    )
+
+
+def _prediction_metric_rows(
+    batch: dict[str, torch.Tensor | float],
+    u_pred: torch.Tensor,
+    coeff_mode: str,
+) -> tuple[
+    list[dict[str, PredictionMetricValue]],
+    torch.Tensor,
+    torch.Tensor,
+]:
+    residuals = _prediction_residual_tensors(batch, u_pred, coeff_mode)
+    rows = _prediction_eval_rows(batch, u_pred, *residuals)
+    return rows, *residuals
+
+
+def _flux_residual_panel_label() -> str:
+    return "flux PDE residual"
 
 
 def save_prediction_evaluation_outputs(
@@ -2053,23 +1603,13 @@ def save_prediction_evaluation_outputs(
 
     with torch.no_grad():
         u_exact = batch["u_exact"]  # type: ignore[assignment]
-        pred_flux_residual = nonlinear_poisson_residual(
-            u_pred,
-            batch["f"],  # type: ignore[arg-type]
-            batch["k"],  # type: ignore[arg-type]
-            batch["h"],  # type: ignore[arg-type]
-            coeff_mode=coeff_mode,
-        )
-        exact_flux_residual = nonlinear_poisson_residual(
-            u_exact,
-            batch["f"],  # type: ignore[arg-type]
-            batch["k"],  # type: ignore[arg-type]
-            batch["h"],  # type: ignore[arg-type]
-            coeff_mode=coeff_mode,
-        )
         error = u_pred - u_exact
         abs_error = error.abs()
-        rows = _prediction_eval_rows(batch, u_pred, pred_flux_residual, exact_flux_residual)
+        rows, pred_flux_residual, exact_flux_residual = _prediction_metric_rows(
+            batch,
+            u_pred,
+            coeff_mode,
+        )
 
     csv_path = output_path / "eval_metrics_per_sample.csv"
     _write_prediction_eval_csv(rows, csv_path)
@@ -2143,7 +1683,7 @@ def save_prediction_evaluation_outputs(
             plt,
             pred_residual_i,
             sample_dir / "pred_residual_heatmap.png",
-            f"predicted flux residual\n{metrics_title}",
+            f"predicted {_flux_residual_panel_label()}\n{metrics_title}",
             "coolwarm",
             residual_extent,
             pred_res_limits[0],
@@ -2173,24 +1713,9 @@ def save_prediction_evaluation_outputs(
 
 
 def _prediction_plot_rows(
-    eval_rows: list[dict[str, float | int]],
-) -> list[dict[str, float | int]]:
-    rows: list[dict[str, float | int]] = []
-    for row in eval_rows:
-        rows.append(
-            {
-                "sample_id": row["sample_id"],
-                "k": row["k"],
-                "relL2": row["relL2_interior"],
-                "rmse": row["RMSE_interior"],
-                "mae": row["MAE_interior"],
-                "linf": row["Linf_interior"],
-                "boundary_max": row["boundary_max_error"],
-                "flux_resRMSE": row["pred_flux_resRMSE"],
-                "oracle_flux_resRMSE": row["exact_flux_resRMSE"],
-            }
-        )
-    return rows
+    eval_rows: list[dict[str, PredictionMetricValue]],
+) -> list[dict[str, PredictionMetricValue]]:
+    return [dict(row) for row in eval_rows]
 
 
 def _save_prediction_panel(
@@ -2225,7 +1750,7 @@ def _save_prediction_panel(
         (
             axes[1][1],
             flux_residual,
-            "flux PDE residual",
+            _flux_residual_panel_label(),
             "coolwarm",
             residual_extent,
             residual_limits[0],
@@ -2241,14 +1766,14 @@ def _save_prediction_panel(
     plt.close(fig)
 
 
-def _prediction_panel_title(row: dict[str, float | int]) -> str:
+def _prediction_panel_title(row: dict[str, PredictionMetricValue]) -> str:
     return (
         f"sample {int(row['sample_id'])} | k={float(row['k']):.4g} "
         f"relL2={float(row['relL2']):.3e} "
         f"RMSE={float(row['rmse']):.3e} "
         f"MAE={float(row['mae']):.3e} "
         f"Linf={float(row['linf']):.3e} "
-        f"flux_resRMSE={float(row['flux_resRMSE']):.3e}"
+        f"flux_resRMSE={float(row['pred_flux_resRMSE']):.3e}"
     )
 
 
@@ -2264,23 +1789,13 @@ def save_prediction_plot_outputs(
 
     with torch.no_grad():
         u_exact = batch["u_exact"]  # type: ignore[assignment]
-        pred_flux_residual = nonlinear_poisson_residual(
-            u_pred,
-            batch["f"],  # type: ignore[arg-type]
-            batch["k"],  # type: ignore[arg-type]
-            batch["h"],  # type: ignore[arg-type]
-            coeff_mode=coeff_mode,
-        )
-        exact_flux_residual = nonlinear_poisson_residual(
-            u_exact,
-            batch["f"],  # type: ignore[arg-type]
-            batch["k"],  # type: ignore[arg-type]
-            batch["h"],  # type: ignore[arg-type]
-            coeff_mode=coeff_mode,
-        )
         error = u_pred - u_exact
         abs_error = error.abs()
-        eval_rows = _prediction_eval_rows(batch, u_pred, pred_flux_residual, exact_flux_residual)
+        eval_rows, pred_flux_residual, _ = _prediction_metric_rows(
+            batch,
+            u_pred,
+            coeff_mode,
+        )
         plot_rows = _prediction_plot_rows(eval_rows)
 
     metrics_path = output_path / "metrics.csv"
@@ -2330,7 +1845,6 @@ def run_prediction(args: argparse.Namespace) -> None:
         "resolved prediction config: "
         f"N={prediction_config.N} rhs_mode={prediction_config.rhs_mode} "
         f"solution_mode={prediction_config.solution_mode} "
-        f"discretization={model_config.discretization} "
         f"k_range=({prediction_config.k_min:g}, {prediction_config.k_max:g}) "
         f"test_seed={prediction_config.test_seed} samples={prediction_config.samples}",
         flush=True,
@@ -2343,40 +1857,15 @@ def run_prediction(args: argparse.Namespace) -> None:
         k_range,
         prediction_config.rhs_mode,
         model_config.coeff_mode,
-        model_config.discretization,
         prediction_config.solution_mode,
     )
     u_pred = predict_on_batch(model, batch, stats, model_config)
 
-    u_transform: torch.Tensor | None = None
-    if args.compare_transform_solver:
-        if model_config.discretization != "kirchhoff":
-            raise ValueError(
-                "--compare-transform-solver requires discretization='kirchhoff'; "
-                "the flux stencil and transformed Poisson solver are different discrete equations."
-            )
-        else:
-            with torch.no_grad():
-                u_transform, cg_diagnostics = solve_transformed_poisson(
-                    batch["f"],  # type: ignore[arg-type]
-                    batch["g"],  # type: ignore[arg-type]
-                    batch["k"],  # type: ignore[arg-type]
-                    batch["mask"],  # type: ignore[arg-type]
-                    batch["h"],  # type: ignore[arg-type]
-                    cg_tol=args.cg_tol,
-                    cg_max_iter=args.cg_max_iter,
-                    return_diagnostics=True,
-                )
-            print(format_cg_diagnostics("predict transform", cg_diagnostics))
-
     predictions = {"cnn": u_pred}
-    if args.compare_transform_solver and u_transform is not None:
-        predictions["transform"] = u_transform
     metrics = evaluate_predictions(
         predictions,
         batch,
         model_config.coeff_mode,
-        model_config.discretization,
     )
     for name, metric in metrics.items():
         print(format_eval_metrics(f"predict {name}", metric))
@@ -2406,7 +1895,6 @@ def run_prediction(args: argparse.Namespace) -> None:
             args.predict_save,
             batch,
             u_pred,
-            u_transform,
             metrics,
             prediction_config,
             model_config,
@@ -2453,7 +1941,6 @@ def run_demo(args: argparse.Namespace) -> None:
     predict_args.predict_solution_mode = None
     predict_args.predict_k_min = None
     predict_args.predict_k_max = None
-    predict_args.compare_transform_solver = False
     predict_args.eval_output_dir = ""
     predict_args.plot_predictions = True
     predict_args.plot_dir = str(figure_dir)
@@ -2465,112 +1952,32 @@ def run_demo(args: argparse.Namespace) -> None:
     print(f"demo metrics saved: {figure_dir / 'metrics.csv'}")
 
 
-def run_grid_convergence(args: argparse.Namespace) -> None:
-    if args.predict_samples < 1:
-        raise ValueError("--predict-samples must be positive")
-    if args.coeff_mode != "pow":
-        raise ValueError("--grid-convergence uses the transformed solver and requires coeff_mode='pow'.")
-    if args.discretization != "kirchhoff":
-        raise ValueError(
-            "--grid-convergence uses the transformed Poisson solver and requires "
-            "discretization='kirchhoff'; the flux stencil solves a different discrete equation."
-        )
-
-    set_seed(args.seed)
-    device = select_device(args.device)
-    k_range = (args.k_min, args.k_max)
-    previous_h: float | None = None
-    previous_rel_l2: float | None = None
-
-    print(
-        "transformed Poisson grid convergence "
-        f"(samples={args.predict_samples}, rhs_mode={args.rhs_mode}, "
-        f"discretization={args.discretization}, solution_mode={args.solution_mode})"
-    )
-    if args.rhs_mode == "discrete":
-        print(
-            "note: rhs_mode='discrete' uses the Kirchhoff-transformed "
-            "five-point Laplacian, so the transformed linear solve matches "
-            "the selected discrete equation."
-        )
-
-    for N in args.grid_Ns:
-        # Reuse the same manufactured parameters at each N so rates compare grids.
-        set_seed(args.seed)
-        data = build_dataset(
-            N,
-            args.predict_samples,
-            device,
-            k_range,
-            args.rhs_mode,
-            args.coeff_mode,
-            args.discretization,
-            args.solution_mode,
-        )
-        with torch.no_grad():
-            u_transform, cg_diagnostics = solve_transformed_poisson(
-                data["f"],  # type: ignore[arg-type]
-                data["g"],  # type: ignore[arg-type]
-                data["k"],  # type: ignore[arg-type]
-                data["mask"],  # type: ignore[arg-type]
-                data["h"],  # type: ignore[arg-type]
-                cg_tol=args.cg_tol,
-                cg_max_iter=args.cg_max_iter,
-                return_diagnostics=True,
-            )
-        metrics = evaluate_predictions(
-            {"transform": u_transform},
-            data,
-            args.coeff_mode,
-            args.discretization,
-        )["transform"]
-        h = float(data["h"])  # type: ignore[arg-type]
-        rate = "-"
-        if previous_h is not None and previous_rel_l2 is not None and metrics.rel_l2 > 0:
-            rate_value = math.log(previous_rel_l2 / metrics.rel_l2) / math.log(previous_h / h)
-            rate = f"{rate_value:.2f}"
-        print(
-            f"N={N:4d} h={h:.4e} relL2={metrics.rel_l2:.4e} "
-            f"rate={rate:>5} linf={metrics.linf:.4e} "
-            f"resRMSE={metrics.res_rmse:.4f} "
-            f"cg_iters={cg_diagnostics.iterations} "
-            f"cg_relres={cg_diagnostics.final_max_relative_residual:.3e}"
-        )
-        previous_h = h
-        previous_rel_l2 = metrics.rel_l2
-
-
 def run_residual_check(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = select_device(args.device)
     k_range = (args.k_min, args.k_max)
-    validate_discretization(args.discretization, args.coeff_mode)
-    batch = make_batch(
+    batch = build_dataset(
         args.N,
         args.batch_size,
         device,
         k_range,
         "discrete",
         args.coeff_mode,
-        args.discretization,
         args.solution_mode,
     )
     with torch.no_grad():
-        _, res = pde_loss(
+        res = compute_pde_residual(
             batch["u_exact"],  # type: ignore[arg-type]
             batch["f"],  # type: ignore[arg-type]
             batch["k"],  # type: ignore[arg-type]
             batch["h"],  # type: ignore[arg-type]
-            scale_with_h=False,
             coeff_mode=args.coeff_mode,
-            discretization=args.discretization,
         )
         rmse = torch.sqrt((res * res).mean())
         max_abs = res.abs().max()
         scaled_rmse = torch.sqrt(((res * (batch["h"] ** 2)) ** 2).mean())  # type: ignore[operator]
     print(
-        "discrete RHS residual check: "
-        f"discretization={args.discretization}, "
+        "flux RHS residual check: "
         f"rmse={float(rmse.cpu()):.4e}, "
         f"scaled_rmse={float(scaled_rmse.cpu()):.4e}, "
         f"max_abs={float(max_abs.cpu()):.4e}"
@@ -2591,7 +1998,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--base-ch", type=int, default=32)
     parser.add_argument("--rhs-mode", choices=["continuous", "discrete"], default="continuous")
-    parser.add_argument("--discretization", choices=["flux", "kirchhoff"], default="kirchhoff")
     parser.add_argument(
         "--solution-mode",
         choices=["base", "fourier", "gaussian", "mixed"],
@@ -2643,11 +2049,6 @@ def parse_args() -> argparse.Namespace:
         help="Directory for --predict-manufactured evaluation CSV and figures.",
     )
     parser.add_argument("--test-seed", type=int, default=1234)
-    parser.add_argument("--compare-transform-solver", action="store_true")
-    parser.add_argument("--cg-tol", type=float, default=None)
-    parser.add_argument("--cg-max-iter", type=int, default=None)
-    parser.add_argument("--grid-convergence", action="store_true")
-    parser.add_argument("--grid-Ns", "--grid-ns", dest="grid_Ns", nargs="+", type=int, default=[8, 16, 32, 64])
     parser.add_argument("--check-residual", action="store_true")
     parser.add_argument("--train-after-check", action="store_true")
     return parser.parse_args()
@@ -2665,9 +2066,6 @@ def main() -> None:
         run_residual_check(args)
         if not args.train_after_check:
             return
-    if args.grid_convergence:
-        run_grid_convergence(args)
-        return
     if args.predict_manufactured:
         run_prediction(args)
         return

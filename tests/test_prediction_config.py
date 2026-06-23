@@ -93,9 +93,6 @@ def _run_prediction_payload(
         predict_k_min=None,
         predict_k_max=None,
         test_seed=test_seed,
-        compare_transform_solver=False,
-        cg_tol=None,
-        cg_max_iter=None,
         device="cpu",
         seed=1234,
     )
@@ -154,6 +151,7 @@ def test_model_config_comes_from_checkpoint() -> None:
     assert config.coeff_mode == "abs_pow"
     assert config.normalize_k is False
     assert config.positive_interior is False
+    assert not hasattr(config, "discretization")
 
 
 def test_test_seed_reproduces_prediction_dataset(tmp_path: Path) -> None:
@@ -191,6 +189,6 @@ def test_legacy_checkpoint_missing_newer_prediction_fields_loads(tmp_path: Path)
     )
 
     assert payload["prediction_config"]["solution_mode"] == "base"
-    assert payload["args"]["discretization"] == "flux"
+    assert "discretization" not in payload["args"]
     assert payload["prediction_config"]["N"] == 8
     assert "u_pred" in payload

@@ -1406,8 +1406,9 @@ def _save_prediction_payload(
         "k": batch["k"],
         "u_exact": batch["u_exact"],
         "u_pred": u_pred,
-        "u_transform": u_transform,
     }
+    if u_transform is not None:
+        tensors["u_transform"] = u_transform
     if save_path.suffix.lower() == ".npz":
         import numpy as np
 
@@ -1460,13 +1461,9 @@ def run_prediction(args: argparse.Namespace) -> None:
     u_pred = predict_on_batch(model, batch, stats, pred_args)
 
     u_transform: torch.Tensor | None = None
-    need_transform = args.compare_transform_solver or bool(args.predict_save)
-    if need_transform:
+    if args.compare_transform_solver:
         if pred_args.coeff_mode != "pow":
-            if args.compare_transform_solver:
-                raise ValueError(
-                    "--compare-transform-solver is valid only for coeff_mode='pow'."
-                )
+            raise ValueError("--compare-transform-solver is valid only for coeff_mode='pow'.")
         else:
             with torch.no_grad():
                 u_transform = solve_transformed_poisson(

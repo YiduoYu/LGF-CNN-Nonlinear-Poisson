@@ -94,6 +94,8 @@ def _run_prediction_payload(
         predict_k_max=None,
         test_seed=test_seed,
         compare_transform_solver=False,
+        cg_tol=None,
+        cg_max_iter=None,
         device="cpu",
         seed=1234,
     )

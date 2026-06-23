@@ -355,6 +355,13 @@ def gradient_relative_l2_error(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class PoissonCGDiagnostics:
+    iterations: int
+    final_max_relative_residual: float
+    converged: bool
+
+
 def _k_plus_one_to_broadcast(k: torch.Tensor | float, u: torch.Tensor) -> torch.Tensor:
     kp1 = _k_to_broadcast(k, u) + 1.0
     if bool((kp1.abs() < 1e-8).any().item()):
@@ -370,13 +377,188 @@ def w_to_u(w: torch.Tensor, k: torch.Tensor | float, eps: float = 1e-8) -> torch
     return inverse_kirchhoff_transform(w, k, eps=eps)
 
 
-def solve_poisson_dirichlet_dense(
+def _negative_laplacian_interior_matvec(v: torch.Tensor) -> torch.Tensor:
+    """Dimensionless interior operator A(v)=4v-v_e-v_w-v_n-v_s."""
+
+    if v.ndim != 4 or v.shape[1] != 1:
+        raise ValueError("v must have shape [B, 1, N, N].")
+    out = 4.0 * v
+    out[:, :, :, 1:] = out[:, :, :, 1:] - v[:, :, :, :-1]
+    out[:, :, :, :-1] = out[:, :, :, :-1] - v[:, :, :, 1:]
+    out[:, :, 1:, :] = out[:, :, 1:, :] - v[:, :, :-1, :]
+    out[:, :, :-1, :] = out[:, :, :-1, :] - v[:, :, 1:, :]
+    return out
+
+
+def _poisson_dirichlet_rhs(
+    f: torch.Tensor,
+    w_boundary: torch.Tensor,
+    h: float,
+) -> torch.Tensor:
+    if f.ndim != 4 or f.shape[1] != 1:
+        raise ValueError("f must have shape [B, 1, H, W].")
+    B, _, H, W = f.shape
+    if H != W:
+        raise ValueError("Only square grids are supported.")
+    N = H - 2
+    if N < 1:
+        raise ValueError("Interior grid size N must be positive.")
+    if w_boundary.shape[0] == 1 and B > 1:
+        w_boundary = w_boundary.expand(B, -1, -1, -1)
+    if w_boundary.shape != f.shape:
+        raise ValueError("w_boundary must have shape [B, 1, H, W] or batch size 1.")
+
+    w_boundary = w_boundary.to(device=f.device, dtype=f.dtype)
+    rhs = (h * h) * f[:, :, 1:-1, 1:-1].clone()
+    rhs[:, :, :, 0] = rhs[:, :, :, 0] + w_boundary[:, :, 1:-1, 0]
+    rhs[:, :, :, -1] = rhs[:, :, :, -1] + w_boundary[:, :, 1:-1, -1]
+    rhs[:, :, 0, :] = rhs[:, :, 0, :] + w_boundary[:, :, 0, 1:-1]
+    rhs[:, :, -1, :] = rhs[:, :, -1, :] + w_boundary[:, :, -1, 1:-1]
+    return rhs
+
+
+def _interior_dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return (a * b).flatten(start_dim=1).sum(dim=1)
+
+
+def _default_cg_tol(dtype: torch.dtype) -> float:
+    return 1e-10 if dtype == torch.float64 else 1e-6
+
+
+def _default_cg_max_iter(N: int, cg_max_iter: int | None) -> int:
+    if cg_max_iter is None or cg_max_iter <= 0:
+        return max(100, 10 * N)
+    return int(cg_max_iter)
+
+
+def solve_laplacian_interior_cg(
+    rhs: torch.Tensor,
+    cg_tol: float | None = None,
+    cg_max_iter: int | None = None,
+) -> tuple[torch.Tensor, PoissonCGDiagnostics]:
+    """Solve A(x)=rhs for batched interior arrays with matrix-free CG."""
+
+    if rhs.ndim != 4 or rhs.shape[1] != 1:
+        raise ValueError("rhs must have shape [B, 1, N, N].")
+    B, _, N, W = rhs.shape
+    if N != W:
+        raise ValueError("Only square interior grids are supported.")
+    if N < 1:
+        raise ValueError("Interior grid size N must be positive.")
+    if not torch.isfinite(rhs).all():
+        raise ValueError("Poisson CG inputs must be finite.")
+
+    tol = _default_cg_tol(rhs.dtype) if cg_tol is None or cg_tol <= 0 else float(cg_tol)
+    max_iter = _default_cg_max_iter(N, cg_max_iter)
+    x = torch.zeros_like(rhs)
+    r = rhs.clone()
+    p = r.clone()
+
+    b_norm = torch.linalg.vector_norm(rhs.flatten(start_dim=1), dim=1)
+    denom = torch.where(b_norm > 0, b_norm, torch.ones_like(b_norm))
+    rr = _interior_dot(r, r)
+    rel = rr.sqrt() / denom
+    if bool((rel <= tol).all().item()):
+        return x, PoissonCGDiagnostics(
+            iterations=0,
+            final_max_relative_residual=float(rel.max().detach().cpu()),
+            converged=True,
+        )
+
+    tiny = torch.finfo(rhs.dtype).tiny
+    for iteration in range(1, max_iter + 1):
+        active = rel > tol
+        active4 = active.view(B, 1, 1, 1)
+        Ap = _negative_laplacian_interior_matvec(p)
+        if not torch.isfinite(Ap).all():
+            raise ValueError("Poisson CG produced non-finite operator values.")
+        denom_alpha = _interior_dot(p, Ap)
+        if bool(((denom_alpha <= 0) & active).any().item()):
+            raise RuntimeError("Poisson CG encountered a non-positive search direction.")
+
+        alpha = torch.zeros_like(rr)
+        alpha[active] = rr[active] / denom_alpha[active]
+        alpha4 = alpha.view(B, 1, 1, 1)
+        x = torch.where(active4, x + alpha4 * p, x)
+        r_next = r - alpha4 * Ap
+        r = torch.where(active4, r_next, r)
+        if not torch.isfinite(x).all() or not torch.isfinite(r).all():
+            raise ValueError("Poisson CG produced non-finite iterates.")
+
+        rr_next = _interior_dot(r, r)
+        rel = rr_next.sqrt() / denom
+        if bool((rel <= tol).all().item()):
+            return x, PoissonCGDiagnostics(
+                iterations=iteration,
+                final_max_relative_residual=float(rel.max().detach().cpu()),
+                converged=True,
+            )
+
+        beta = torch.zeros_like(rr)
+        beta[active] = rr_next[active] / rr[active].clamp_min(tiny)
+        beta4 = beta.view(B, 1, 1, 1)
+        p_next = r + beta4 * p
+        p = torch.where(active4, p_next, p)
+        rr = rr_next
+
+    final_rel = float(rel.max().detach().cpu())
+    raise RuntimeError(
+        "Poisson CG failed to converge "
+        f"after {max_iter} iterations (max relative residual {final_rel:.3e}, tol {tol:.3e})."
+    )
+
+
+def solve_poisson_dirichlet_cg(
+    f: torch.Tensor,
+    w_boundary: torch.Tensor,
+    h: float,
+    mask: torch.Tensor,
+    cg_tol: float | None = None,
+    cg_max_iter: int | None = None,
+) -> tuple[torch.Tensor, PoissonCGDiagnostics]:
+    """Matrix-free batched CG solve for -Delta w = f with Dirichlet data."""
+
+    if f.ndim != 4 or f.shape[1] != 1:
+        raise ValueError("f must have shape [B, 1, H, W].")
+    B, _, H, W = f.shape
+    if H != W:
+        raise ValueError("Only square grids are supported.")
+    N = H - 2
+    if N < 1:
+        raise ValueError("Interior grid size N must be positive.")
+    if mask.shape[0] == 1 and B > 1:
+        mask = mask.expand(B, -1, -1, -1)
+    if w_boundary.shape[0] == 1 and B > 1:
+        w_boundary = w_boundary.expand(B, -1, -1, -1)
+    if mask.shape != f.shape or w_boundary.shape != f.shape:
+        raise ValueError("mask and w_boundary must match f shape or use batch size 1.")
+
+    w_boundary = w_boundary.to(device=f.device, dtype=f.dtype)
+    mask = mask.to(device=f.device, dtype=f.dtype)
+    b = _poisson_dirichlet_rhs(f, w_boundary, h)
+    if not torch.isfinite(w_boundary).all():
+        raise ValueError("Poisson CG inputs must be finite.")
+    x, diagnostics = solve_laplacian_interior_cg(b, cg_tol=cg_tol, cg_max_iter=cg_max_iter)
+    w = mask * w_boundary
+    w[:, :, 1:-1, 1:-1] = x
+    return w, diagnostics
+
+
+def format_cg_diagnostics(label: str, diagnostics: PoissonCGDiagnostics) -> str:
+    return (
+        f"{label} cg_iters={diagnostics.iterations} "
+        f"cg_relres={diagnostics.final_max_relative_residual:.3e} "
+        f"cg_converged={diagnostics.converged}"
+    )
+
+
+def _solve_poisson_dirichlet_dense_reference(
     f: torch.Tensor,
     w_boundary: torch.Tensor,
     h: float,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Dense 5-point solve for -Delta w = f with Dirichlet boundary data."""
+    """Test-only dense reference; unsuitable for production-size grids."""
 
     if f.ndim != 4 or f.shape[1] != 1:
         raise ValueError("f must have shape [B, 1, H, W].")
@@ -424,21 +606,29 @@ def solve_transformed_poisson(
     k: torch.Tensor,
     mask: torch.Tensor,
     h: float,
-) -> torch.Tensor:
-    """Solve via w = u^(k+1)/(k+1), a strong continuous-PDE baseline.
-
-    This linearized Poisson solve targets -Delta w = f. It is not expected to
-    exactly match the conservative nonlinear flux discretization when
-    rhs_mode="discrete".
-    """
+    cg_tol: float | None = None,
+    cg_max_iter: int | None = None,
+    return_diagnostics: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, PoissonCGDiagnostics]:
+    """Solve via w = u^(k+1)/(k+1) using matrix-free Poisson CG."""
 
     if mask.shape[0] == 1 and g_map.shape[0] > 1:
         mask = mask.expand(g_map.shape[0], -1, -1, -1)
     safe_g = torch.where(mask > 0, g_map, torch.ones_like(g_map))
     w_boundary = mask * kirchhoff_transform(safe_g, k)
-    w = solve_poisson_dirichlet_dense(f, w_boundary, h, mask)
+    w, diagnostics = solve_poisson_dirichlet_cg(
+        f,
+        w_boundary,
+        h,
+        mask,
+        cg_tol=cg_tol,
+        cg_max_iter=cg_max_iter,
+    )
     u = inverse_kirchhoff_transform(w, k)
-    return mask * g_map + (1.0 - mask) * u
+    u_full = mask * g_map + (1.0 - mask) * u
+    if return_diagnostics:
+        return u_full, diagnostics
+    return u_full
 
 
 # ---------------------------------------------------------------------------
@@ -1084,6 +1274,8 @@ def evaluate_on(
     positive_interior: bool,
     compare_transform_solver: bool = False,
     include_gradient: bool = True,
+    cg_tol: float | None = None,
+    cg_max_iter: int | None = None,
 ) -> dict[str, EvalMetrics]:
     return _evaluate_on_impl(
         model=model,
@@ -1096,6 +1288,8 @@ def evaluate_on(
         positive_interior=positive_interior,
         compare_transform_solver=compare_transform_solver,
         include_gradient=include_gradient,
+        cg_tol=cg_tol,
+        cg_max_iter=cg_max_iter,
     )
 
 
@@ -1110,6 +1304,8 @@ def _evaluate_on_impl(
     positive_interior: bool,
     compare_transform_solver: bool = False,
     include_gradient: bool = True,
+    cg_tol: float | None = None,
+    cg_max_iter: int | None = None,
 ) -> dict[str, EvalMetrics]:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -1153,6 +1349,8 @@ def _evaluate_on_impl(
                     batch["k"],  # type: ignore[arg-type]
                     batch["mask"],  # type: ignore[arg-type]
                     batch["h"],  # type: ignore[arg-type]
+                    cg_tol=cg_tol,
+                    cg_max_iter=cg_max_iter,
                 )
                 _accumulate_metrics(
                     totals["transform"],
@@ -1394,6 +1592,8 @@ def train(args: argparse.Namespace) -> nn.Module:
                 normalize_k=args.normalize_k,
                 positive_interior=args.positive_interior,
                 compare_transform_solver=args.compare_transform_solver,
+                cg_tol=args.cg_tol,
+                cg_max_iter=args.cg_max_iter,
             )
             val_cnn = val_metrics["cnn"]
             if best_save_path is not None and val_cnn.rel_l2 < best_val_rel_l2:
@@ -1636,13 +1836,17 @@ def run_prediction(args: argparse.Namespace) -> None:
             )
         else:
             with torch.no_grad():
-                u_transform = solve_transformed_poisson(
+                u_transform, cg_diagnostics = solve_transformed_poisson(
                     batch["f"],  # type: ignore[arg-type]
                     batch["g"],  # type: ignore[arg-type]
                     batch["k"],  # type: ignore[arg-type]
                     batch["mask"],  # type: ignore[arg-type]
                     batch["h"],  # type: ignore[arg-type]
+                    cg_tol=args.cg_tol,
+                    cg_max_iter=args.cg_max_iter,
+                    return_diagnostics=True,
                 )
+            print(format_cg_diagnostics("predict transform", cg_diagnostics))
 
     predictions = {"cnn": u_pred}
     if args.compare_transform_solver and u_transform is not None:
@@ -1711,12 +1915,15 @@ def run_grid_convergence(args: argparse.Namespace) -> None:
             args.solution_mode,
         )
         with torch.no_grad():
-            u_transform = solve_transformed_poisson(
+            u_transform, cg_diagnostics = solve_transformed_poisson(
                 data["f"],  # type: ignore[arg-type]
                 data["g"],  # type: ignore[arg-type]
                 data["k"],  # type: ignore[arg-type]
                 data["mask"],  # type: ignore[arg-type]
                 data["h"],  # type: ignore[arg-type]
+                cg_tol=args.cg_tol,
+                cg_max_iter=args.cg_max_iter,
+                return_diagnostics=True,
             )
         metrics = evaluate_predictions(
             {"transform": u_transform},
@@ -1732,7 +1939,9 @@ def run_grid_convergence(args: argparse.Namespace) -> None:
         print(
             f"N={N:4d} h={h:.4e} relL2={metrics.rel_l2:.4e} "
             f"rate={rate:>5} linf={metrics.linf:.4e} "
-            f"resRMSE={metrics.res_rmse:.4f}"
+            f"resRMSE={metrics.res_rmse:.4f} "
+            f"cg_iters={cg_diagnostics.iterations} "
+            f"cg_relres={cg_diagnostics.final_max_relative_residual:.3e}"
         )
         previous_h = h
         previous_rel_l2 = metrics.rel_l2
@@ -1833,6 +2042,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predict-k-max", type=float, default=None)
     parser.add_argument("--test-seed", type=int, default=1234)
     parser.add_argument("--compare-transform-solver", action="store_true")
+    parser.add_argument("--cg-tol", type=float, default=None)
+    parser.add_argument("--cg-max-iter", type=int, default=None)
     parser.add_argument("--grid-convergence", action="store_true")
     parser.add_argument("--grid-Ns", "--grid-ns", dest="grid_Ns", nargs="+", type=int, default=[8, 16, 32, 64])
     parser.add_argument("--check-residual", action="store_true")

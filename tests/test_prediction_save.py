@@ -45,6 +45,8 @@ def _prediction_args(
         predict_samples=1,
         predict_save=str(save_path),
         compare_transform_solver=compare_transform_solver,
+        cg_tol=None,
+        cg_max_iter=None,
         device="cpu",
         seed=1234,
         check_residual=False,
@@ -89,8 +91,12 @@ def test_predict_save_with_compare_includes_transform_solver_output(
     save_path = tmp_path / "prediction.pt"
     _write_checkpoint(checkpoint_path)
 
-    def fake_transform(f, g_map, k, mask, h):
-        return torch.ones_like(g_map)
+    def fake_transform(f, g_map, k, mask, h, **kwargs):
+        return torch.ones_like(g_map), Baseline.PoissonCGDiagnostics(
+            iterations=1,
+            final_max_relative_residual=0.0,
+            converged=True,
+        )
 
     monkeypatch.setattr(Baseline, "solve_transformed_poisson", fake_transform)
 

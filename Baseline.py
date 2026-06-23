@@ -16,10 +16,11 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import median
 
@@ -870,6 +871,17 @@ class EvalMetrics:
     grad_rel_l2: float | None = None
 
 
+@dataclass(frozen=True)
+class PredictionConfig:
+    N: int
+    rhs_mode: str
+    solution_mode: str
+    k_min: float
+    k_max: float
+    test_seed: int
+    samples: int
+
+
 @dataclass
 class _MetricSums:
     samples: int = 0
@@ -1352,41 +1364,47 @@ def predict_on_batch(
         )
 
 
-def _prediction_args_from_checkpoint(
+def resolve_checkpoint_model_config(checkpoint_args: argparse.Namespace) -> argparse.Namespace:
+    model_config = argparse.Namespace(
+        base_ch=int(getattr(checkpoint_args, "base_ch", 32)),
+        coeff_mode=getattr(checkpoint_args, "coeff_mode", "pow"),
+        normalize_k=getattr(checkpoint_args, "normalize_k", True),
+        positive_interior=getattr(checkpoint_args, "positive_interior", None),
+    )
+    apply_positive_interior_default(model_config)
+    return model_config
+
+
+def resolve_prediction_config(
     runtime_args: argparse.Namespace,
     checkpoint_args: argparse.Namespace,
-) -> argparse.Namespace:
-    merged = argparse.Namespace(**vars(runtime_args))
-    runtime_only = {
-        "check_residual",
-        "train_after_check",
-        "grid_convergence",
-        "grid_Ns",
-        "load_path",
-        "predict_manufactured",
-        "predict_samples",
-        "predict_save",
-        "compare_transform_solver",
-        "device",
-        "seed",
-    }
-    for name, value in vars(checkpoint_args).items():
-        if name not in runtime_only:
-            setattr(merged, name, value)
+) -> PredictionConfig:
+    N = int(getattr(checkpoint_args, "N", 32))
+    rhs_mode = getattr(checkpoint_args, "rhs_mode", "continuous")
+    solution_mode = getattr(checkpoint_args, "solution_mode", "base")
+    k_min = float(getattr(checkpoint_args, "k_min", 0.5))
+    k_max = float(getattr(checkpoint_args, "k_max", 2.5))
 
-    for name, default in (
-        ("rhs_mode", runtime_args.rhs_mode),
-        ("coeff_mode", runtime_args.coeff_mode),
-        ("solution_mode", "base"),
-        ("normalize_k", True),
-        ("k_min", runtime_args.k_min),
-        ("k_max", runtime_args.k_max),
-        ("N", runtime_args.N),
-    ):
-        if not hasattr(merged, name):
-            setattr(merged, name, default)
-    apply_positive_interior_default(merged)
-    return merged
+    if getattr(runtime_args, "predict_N", None) is not None:
+        N = int(runtime_args.predict_N)
+    if getattr(runtime_args, "predict_rhs_mode", None) is not None:
+        rhs_mode = runtime_args.predict_rhs_mode
+    if getattr(runtime_args, "predict_solution_mode", None) is not None:
+        solution_mode = runtime_args.predict_solution_mode
+    if getattr(runtime_args, "predict_k_min", None) is not None:
+        k_min = float(runtime_args.predict_k_min)
+    if getattr(runtime_args, "predict_k_max", None) is not None:
+        k_max = float(runtime_args.predict_k_max)
+
+    return PredictionConfig(
+        N=N,
+        rhs_mode=rhs_mode,
+        solution_mode=solution_mode,
+        k_min=k_min,
+        k_max=k_max,
+        test_seed=int(getattr(runtime_args, "test_seed", getattr(runtime_args, "seed", 1234))),
+        samples=int(runtime_args.predict_samples),
+    )
 
 
 def _save_prediction_payload(
@@ -1395,10 +1413,13 @@ def _save_prediction_payload(
     u_pred: torch.Tensor,
     u_transform: torch.Tensor | None,
     metrics: dict[str, EvalMetrics],
-    args: argparse.Namespace,
+    prediction_config: PredictionConfig,
+    model_config: argparse.Namespace,
 ) -> None:
     save_path = Path(path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
+    prediction_metadata = asdict(prediction_config)
+    args_metadata = {**vars(model_config), **prediction_metadata}
 
     tensors = {
         "f": batch["f"],
@@ -1418,6 +1439,7 @@ def _save_prediction_payload(
             if torch.is_tensor(tensor)
         }
         np_payload["h"] = np.array(float(batch["h"]))  # type: ignore[arg-type]
+        np_payload["prediction_config"] = np.array(json.dumps(prediction_metadata))
         np.savez(save_path, **np_payload)
     else:
         torch_payload = {
@@ -1426,7 +1448,8 @@ def _save_prediction_payload(
         }
         torch_payload["h"] = float(batch["h"])  # type: ignore[arg-type]
         torch_payload["metrics"] = {name: vars(value) for name, value in metrics.items()}
-        torch_payload["args"] = vars(args)
+        torch_payload["prediction_config"] = prediction_metadata
+        torch_payload["args"] = args_metadata
         torch.save(torch_payload, save_path)
     print(f"saved predictions: {save_path}")
 
@@ -1440,29 +1463,33 @@ def run_prediction(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = select_device(args.device)
     model, stats, checkpoint_args = load_model_from_checkpoint(args.load_path, device)
-    pred_args = _prediction_args_from_checkpoint(args, checkpoint_args)
-    k_range = (pred_args.k_min, pred_args.k_max)
+    model_config = resolve_checkpoint_model_config(checkpoint_args)
+    prediction_config = resolve_prediction_config(args, checkpoint_args)
+    k_range = (prediction_config.k_min, prediction_config.k_max)
 
     print(
-        f"predicting manufactured set: samples={args.predict_samples} "
-        f"N={pred_args.N} rhs_mode={pred_args.rhs_mode} "
-        f"solution_mode={pred_args.solution_mode}",
+        "resolved prediction config: "
+        f"N={prediction_config.N} rhs_mode={prediction_config.rhs_mode} "
+        f"solution_mode={prediction_config.solution_mode} "
+        f"k_range=({prediction_config.k_min:g}, {prediction_config.k_max:g}) "
+        f"test_seed={prediction_config.test_seed} samples={prediction_config.samples}",
         flush=True,
     )
+    set_seed(prediction_config.test_seed)
     batch = build_dataset(
-        pred_args.N,
-        args.predict_samples,
+        prediction_config.N,
+        prediction_config.samples,
         device,
         k_range,
-        pred_args.rhs_mode,
-        pred_args.coeff_mode,
-        pred_args.solution_mode,
+        prediction_config.rhs_mode,
+        model_config.coeff_mode,
+        prediction_config.solution_mode,
     )
-    u_pred = predict_on_batch(model, batch, stats, pred_args)
+    u_pred = predict_on_batch(model, batch, stats, model_config)
 
     u_transform: torch.Tensor | None = None
     if args.compare_transform_solver:
-        if pred_args.coeff_mode != "pow":
+        if model_config.coeff_mode != "pow":
             raise ValueError("--compare-transform-solver is valid only for coeff_mode='pow'.")
         else:
             with torch.no_grad():
@@ -1477,12 +1504,20 @@ def run_prediction(args: argparse.Namespace) -> None:
     predictions = {"cnn": u_pred}
     if args.compare_transform_solver and u_transform is not None:
         predictions["transform"] = u_transform
-    metrics = evaluate_predictions(predictions, batch, pred_args.coeff_mode)
+    metrics = evaluate_predictions(predictions, batch, model_config.coeff_mode)
     for name, metric in metrics.items():
         print(format_eval_metrics(f"predict {name}", metric))
 
     if args.predict_save:
-        _save_prediction_payload(args.predict_save, batch, u_pred, u_transform, metrics, pred_args)
+        _save_prediction_payload(
+            args.predict_save,
+            batch,
+            u_pred,
+            u_transform,
+            metrics,
+            prediction_config,
+            model_config,
+        )
 
 
 def run_grid_convergence(args: argparse.Namespace) -> None:
@@ -1622,6 +1657,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predict-manufactured", action="store_true")
     parser.add_argument("--predict-samples", type=int, default=8)
     parser.add_argument("--predict-save", default="")
+    parser.add_argument("--predict-N", "--predict-n", dest="predict_N", type=int, default=None)
+    parser.add_argument(
+        "--predict-rhs-mode",
+        choices=["continuous", "discrete"],
+        default=None,
+    )
+    parser.add_argument(
+        "--predict-solution-mode",
+        choices=["base", "fourier", "gaussian", "mixed"],
+        default=None,
+    )
+    parser.add_argument("--predict-k-min", type=float, default=None)
+    parser.add_argument("--predict-k-max", type=float, default=None)
+    parser.add_argument("--test-seed", type=int, default=1234)
     parser.add_argument("--compare-transform-solver", action="store_true")
     parser.add_argument("--grid-convergence", action="store_true")
     parser.add_argument("--grid-Ns", "--grid-ns", dest="grid_Ns", nargs="+", type=int, default=[8, 16, 32, 64])

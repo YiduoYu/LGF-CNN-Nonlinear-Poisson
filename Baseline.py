@@ -1296,7 +1296,7 @@ def load_model_from_checkpoint(
     path: str | Path,
     device: torch.device,
 ) -> tuple[nn.Module, InputStats, argparse.Namespace]:
-    with torch.serialization.safe_globals([argparse.Namespace]):
+    with torch.serialization.safe_globals([argparse.Namespace, InputStats]):
         checkpoint = torch.load(path, map_location=device)
     raw_args = checkpoint.get("args", {})
     if isinstance(raw_args, argparse.Namespace):

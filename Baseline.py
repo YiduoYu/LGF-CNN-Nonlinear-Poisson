@@ -16,9 +16,12 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
+import os
 import random
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -1792,6 +1795,360 @@ def _save_prediction_payload(
     print(f"saved predictions: {save_path}")
 
 
+EVAL_CSV_FIELDS = [
+    "sample_id",
+    "k",
+    "relL2_interior",
+    "RMSE_interior",
+    "MAE_interior",
+    "Linf_interior",
+    "boundary_max_error",
+    "pred_flux_resRMSE",
+    "exact_flux_resRMSE",
+]
+
+
+def _per_sample_rmse(values: torch.Tensor) -> torch.Tensor:
+    return values.pow(2).mean(dim=1).sqrt()
+
+
+def _per_sample_rel_l2(diff: torch.Tensor, ref: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    num = torch.linalg.vector_norm(diff, dim=1)
+    den = torch.linalg.vector_norm(ref, dim=1).clamp_min(eps)
+    return num / den
+
+
+def _prediction_eval_rows(
+    batch: dict[str, torch.Tensor | float],
+    u_pred: torch.Tensor,
+    pred_flux_residual: torch.Tensor,
+    exact_flux_residual: torch.Tensor,
+) -> list[dict[str, float | int]]:
+    u_exact = batch["u_exact"]  # type: ignore[assignment]
+    k = batch["k"]  # type: ignore[assignment]
+    boundary_mask = batch["mask"]  # type: ignore[assignment]
+    if boundary_mask.shape[0] == 1 and u_pred.shape[0] > 1:
+        boundary_mask = boundary_mask.expand_as(u_pred)
+
+    error = u_pred - u_exact
+    interior_error = error[:, :, 1:-1, 1:-1].flatten(start_dim=1)
+    interior_abs_error = interior_error.abs()
+    interior_exact = u_exact[:, :, 1:-1, 1:-1].flatten(start_dim=1)
+    boundary_error = (error.abs() * boundary_mask).flatten(start_dim=1)
+    pred_res_flat = pred_flux_residual.flatten(start_dim=1)
+    exact_res_flat = exact_flux_residual.flatten(start_dim=1)
+
+    rel_l2 = _per_sample_rel_l2(interior_error, interior_exact)
+    rmse = _per_sample_rmse(interior_error)
+    mae = interior_abs_error.mean(dim=1)
+    linf = interior_abs_error.amax(dim=1)
+    boundary_max = boundary_error.amax(dim=1)
+    pred_res_rmse = _per_sample_rmse(pred_res_flat)
+    exact_res_rmse = _per_sample_rmse(exact_res_flat)
+
+    rows: list[dict[str, float | int]] = []
+    for sample_id in range(u_pred.shape[0]):
+        rows.append(
+            {
+                "sample_id": sample_id,
+                "k": float(k[sample_id].detach().cpu()),
+                "relL2_interior": float(rel_l2[sample_id].detach().cpu()),
+                "RMSE_interior": float(rmse[sample_id].detach().cpu()),
+                "MAE_interior": float(mae[sample_id].detach().cpu()),
+                "Linf_interior": float(linf[sample_id].detach().cpu()),
+                "boundary_max_error": float(boundary_max[sample_id].detach().cpu()),
+                "pred_flux_resRMSE": float(pred_res_rmse[sample_id].detach().cpu()),
+                "exact_flux_resRMSE": float(exact_res_rmse[sample_id].detach().cpu()),
+            }
+        )
+    return rows
+
+
+def _write_prediction_eval_csv(rows: list[dict[str, float | int]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=EVAL_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _load_matplotlib_pyplot():
+    cache_dir = Path(tempfile.gettempdir())
+    os.environ.setdefault("MPLCONFIGDIR", str(cache_dir / "matplotlib"))
+    os.environ.setdefault("XDG_CACHE_HOME", str(cache_dir / "xdg-cache"))
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def _nondegenerate_limits(vmin: float, vmax: float) -> tuple[float, float]:
+    if math.isclose(vmin, vmax, rel_tol=1e-12, abs_tol=1e-12):
+        pad = max(abs(vmin), 1.0) * 1e-6
+        return vmin - pad, vmax + pad
+    return vmin, vmax
+
+
+def _symmetric_limits(values: torch.Tensor) -> tuple[float, float]:
+    vmax = max(float(values.detach().abs().max().cpu()), 1e-12)
+    return -vmax, vmax
+
+
+def _heatmap_values(values: torch.Tensor) -> list[list[float]]:
+    return values.detach().cpu().tolist()
+
+
+def _eval_figure_title(
+    sample_id: int,
+    N: int,
+    row: dict[str, float | int],
+) -> str:
+    return (
+        f"sample {sample_id} | N={N} k={float(row['k']):.4g} "
+        f"relL2={float(row['relL2_interior']):.3e} "
+        f"RMSE={float(row['RMSE_interior']):.3e} "
+        f"Linf={float(row['Linf_interior']):.3e} "
+        f"resRMSE={float(row['pred_flux_resRMSE']):.3e}"
+    )
+
+
+def _save_heatmap_figure(
+    plt,
+    values: torch.Tensor,
+    path: Path,
+    title: str,
+    cmap: str,
+    extent: list[float],
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> None:
+    fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
+    image = ax.imshow(
+        _heatmap_values(values),
+        origin="lower",
+        extent=extent,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        aspect="equal",
+    )
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title(title)
+    fig.colorbar(image, ax=ax)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _add_panel_heatmap(
+    fig,
+    ax,
+    values: torch.Tensor,
+    title: str,
+    cmap: str,
+    extent: list[float],
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> None:
+    image = ax.imshow(
+        _heatmap_values(values),
+        origin="lower",
+        extent=extent,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        aspect="equal",
+    )
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title(title)
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+
+
+def _save_combined_eval_panel(
+    plt,
+    sample_dir: Path,
+    figure_title: str,
+    u_exact: torch.Tensor,
+    u_pred: torch.Tensor,
+    error: torch.Tensor,
+    abs_error: torch.Tensor,
+    pred_residual: torch.Tensor,
+    exact_residual: torch.Tensor,
+    full_extent: list[float],
+    residual_extent: list[float],
+    u_limits: tuple[float, float],
+    error_limits: tuple[float, float],
+    abs_error_max: float,
+    pred_res_limits: tuple[float, float],
+    exact_res_limits: tuple[float, float],
+) -> None:
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
+    fig.suptitle(figure_title)
+    panels = [
+        (axes[0][0], u_exact, "true u", "viridis", full_extent, u_limits[0], u_limits[1]),
+        (axes[0][1], u_pred, "predicted u", "viridis", full_extent, u_limits[0], u_limits[1]),
+        (axes[0][2], error, "u_pred - u_exact", "coolwarm", full_extent, error_limits[0], error_limits[1]),
+        (axes[1][0], abs_error, "|u_pred - u_exact|", "magma", full_extent, 0.0, abs_error_max),
+        (
+            axes[1][1],
+            pred_residual,
+            "pred flux residual",
+            "coolwarm",
+            residual_extent,
+            pred_res_limits[0],
+            pred_res_limits[1],
+        ),
+        (
+            axes[1][2],
+            exact_residual,
+            "exact flux residual",
+            "coolwarm",
+            residual_extent,
+            exact_res_limits[0],
+            exact_res_limits[1],
+        ),
+    ]
+    for ax, values, title, cmap, extent, vmin, vmax in panels:
+        _add_panel_heatmap(fig, ax, values, title, cmap, extent, vmin, vmax)
+    fig.savefig(sample_dir / "combined_2x3_panel.png", dpi=180)
+    plt.close(fig)
+
+
+def save_prediction_evaluation_outputs(
+    output_dir: str | Path,
+    batch: dict[str, torch.Tensor | float],
+    u_pred: torch.Tensor,
+    prediction_config: PredictionConfig,
+    coeff_mode: str,
+) -> None:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    with torch.no_grad():
+        u_exact = batch["u_exact"]  # type: ignore[assignment]
+        pred_flux_residual = nonlinear_poisson_residual(
+            u_pred,
+            batch["f"],  # type: ignore[arg-type]
+            batch["k"],  # type: ignore[arg-type]
+            batch["h"],  # type: ignore[arg-type]
+            coeff_mode=coeff_mode,
+        )
+        exact_flux_residual = nonlinear_poisson_residual(
+            u_exact,
+            batch["f"],  # type: ignore[arg-type]
+            batch["k"],  # type: ignore[arg-type]
+            batch["h"],  # type: ignore[arg-type]
+            coeff_mode=coeff_mode,
+        )
+        error = u_pred - u_exact
+        abs_error = error.abs()
+        rows = _prediction_eval_rows(batch, u_pred, pred_flux_residual, exact_flux_residual)
+
+    csv_path = output_path / "eval_metrics_per_sample.csv"
+    _write_prediction_eval_csv(rows, csv_path)
+
+    plt = _load_matplotlib_pyplot()
+    h = float(batch["h"])  # type: ignore[arg-type]
+    full_extent = [-1.0, 1.0, -1.0, 1.0]
+    residual_extent = [-1.0 + h, 1.0 - h, -1.0 + h, 1.0 - h]
+
+    for sample_id, row in enumerate(rows):
+        sample_dir = output_path / f"sample_{sample_id:04d}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+
+        u_exact_i = u_exact[sample_id, 0].detach()
+        u_pred_i = u_pred[sample_id, 0].detach()
+        error_i = error[sample_id, 0].detach()
+        abs_error_i = abs_error[sample_id, 0].detach()
+        pred_residual_i = pred_flux_residual[sample_id, 0].detach()
+        exact_residual_i = exact_flux_residual[sample_id, 0].detach()
+
+        u_vmin = min(float(u_exact_i.min().cpu()), float(u_pred_i.min().cpu()))
+        u_vmax = max(float(u_exact_i.max().cpu()), float(u_pred_i.max().cpu()))
+        u_limits = _nondegenerate_limits(u_vmin, u_vmax)
+        error_limits = _symmetric_limits(error_i)
+        abs_error_max = max(float(abs_error_i.max().cpu()), 1e-12)
+        pred_res_limits = _symmetric_limits(pred_residual_i)
+        exact_res_limits = _symmetric_limits(exact_residual_i)
+        metrics_title = _eval_figure_title(sample_id, prediction_config.N, row)
+
+        _save_heatmap_figure(
+            plt,
+            u_exact_i,
+            sample_dir / "true_u.png",
+            f"true u\n{metrics_title}",
+            "viridis",
+            full_extent,
+            u_limits[0],
+            u_limits[1],
+        )
+        _save_heatmap_figure(
+            plt,
+            u_pred_i,
+            sample_dir / "pred_u.png",
+            f"predicted u\n{metrics_title}",
+            "viridis",
+            full_extent,
+            u_limits[0],
+            u_limits[1],
+        )
+        _save_heatmap_figure(
+            plt,
+            error_i,
+            sample_dir / "error_heatmap.png",
+            f"error = u_pred - u_exact\n{metrics_title}",
+            "coolwarm",
+            full_extent,
+            error_limits[0],
+            error_limits[1],
+        )
+        _save_heatmap_figure(
+            plt,
+            abs_error_i,
+            sample_dir / "abs_error_heatmap.png",
+            f"absolute error\n{metrics_title}",
+            "magma",
+            full_extent,
+            0.0,
+            abs_error_max,
+        )
+        _save_heatmap_figure(
+            plt,
+            pred_residual_i,
+            sample_dir / "pred_residual_heatmap.png",
+            f"predicted flux residual\n{metrics_title}",
+            "coolwarm",
+            residual_extent,
+            pred_res_limits[0],
+            pred_res_limits[1],
+        )
+        _save_combined_eval_panel(
+            plt,
+            sample_dir,
+            metrics_title,
+            u_exact_i,
+            u_pred_i,
+            error_i,
+            abs_error_i,
+            pred_residual_i,
+            exact_residual_i,
+            full_extent,
+            residual_extent,
+            u_limits,
+            error_limits,
+            abs_error_max,
+            pred_res_limits,
+            exact_res_limits,
+        )
+
+    print(f"saved evaluation metrics: {csv_path}")
+    print(f"saved evaluation figures: {output_path}")
+
+
 def run_prediction(args: argparse.Namespace) -> None:
     if not args.load_path:
         raise ValueError("--predict-manufactured requires --load-path")
@@ -1859,6 +2216,16 @@ def run_prediction(args: argparse.Namespace) -> None:
     )
     for name, metric in metrics.items():
         print(format_eval_metrics(f"predict {name}", metric))
+
+    eval_output_dir = getattr(args, "eval_output_dir", None)
+    if eval_output_dir:
+        save_prediction_evaluation_outputs(
+            eval_output_dir,
+            batch,
+            u_pred,
+            prediction_config,
+            model_config.coeff_mode,
+        )
 
     if args.predict_save:
         _save_prediction_payload(
@@ -2040,6 +2407,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--predict-k-min", type=float, default=None)
     parser.add_argument("--predict-k-max", type=float, default=None)
+    parser.add_argument(
+        "--eval-output-dir",
+        default="results/eval_figures",
+        help="Directory for --predict-manufactured evaluation CSV and figures.",
+    )
     parser.add_argument("--test-seed", type=int, default=1234)
     parser.add_argument("--compare-transform-solver", action="store_true")
     parser.add_argument("--cg-tol", type=float, default=None)

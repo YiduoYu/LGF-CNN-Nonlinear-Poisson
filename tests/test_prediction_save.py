@@ -22,6 +22,7 @@ def _write_checkpoint(path: Path) -> None:
                 "base_ch": 1,
                 "rhs_mode": "continuous",
                 "coeff_mode": "pow",
+                "discretization": "kirchhoff",
                 "solution_mode": "base",
                 "k_min": 0.5,
                 "k_max": 2.5,

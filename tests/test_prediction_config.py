@@ -189,5 +189,6 @@ def test_legacy_checkpoint_missing_newer_prediction_fields_loads(tmp_path: Path)
     )
 
     assert payload["prediction_config"]["solution_mode"] == "base"
+    assert payload["args"]["discretization"] == "flux"
     assert payload["prediction_config"]["N"] == 8
     assert "u_pred" in payload

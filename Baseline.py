@@ -8,8 +8,7 @@ on Omega = [-1, 1]^2.  The loss is the conservative finite-difference
 flux residual on the interior grid nodes, with Dirichlet boundary values
 enforced exactly by an output projection.
 
-Example:
-    python Baseline.py --check-residual
+Recommended:
     python Baseline.py --N 32 --train-samples 2048 --epochs 40
 """
 
@@ -26,14 +25,10 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from statistics import median
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-SHARP_SOFTPLUS_BETA = 20.0
 
 
 def set_seed(seed: int) -> None:
@@ -146,57 +141,26 @@ def _k_to_broadcast(k: torch.Tensor | float, u: torch.Tensor) -> torch.Tensor:
     return k
 
 
-def _coefficient_base_and_derivative(
-    u: torch.Tensor,
-    mode: str,
-    eps: float,
-    softplus_beta: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if mode == "pow":
-        return torch.clamp(u, min=eps), (u > eps).to(dtype=u.dtype)
-    if mode == "abs_pow":
-        abs_u = u.abs()
-        return torch.clamp(abs_u, min=eps), (abs_u > eps).to(dtype=u.dtype) * u.sign()
-    if mode == "softplus_pow":
-        beta = torch.as_tensor(softplus_beta, device=u.device, dtype=u.dtype)
-        return eps + F.softplus(beta * u) / beta, torch.sigmoid(beta * u)
-    raise ValueError(f"Unknown coeff_mode: {mode}")
-
-
 def power_coefficient(
     u: torch.Tensor,
     k: torch.Tensor | float,
-    mode: str = "pow",
     eps: float = 1e-6,
-    softplus_beta: float = SHARP_SOFTPLUS_BETA,
 ) -> torch.Tensor:
-    """Compute a(u).
-
-    mode="pow" clamps only as a numerical guard. mode="softplus_pow" uses a
-    sharp softplus base, which is a smooth clamp approximation rather than the
-    broad F.softplus(u) smoothing.
-    """
+    """Compute a(u) = u^k, with a small clamp as a numerical guard."""
 
     k = _k_to_broadcast(k, u)
-    base, _ = _coefficient_base_and_derivative(u, mode, eps, softplus_beta)
-    return torch.pow(base, k)
+    return torch.pow(torch.clamp(u, min=eps), k)
 
 
-def nonlinear_poisson_residual(
+def flux_minus_divergence(
     u: torch.Tensor,
-    f: torch.Tensor,
     k: torch.Tensor | float,
     h: float,
-    coeff_mode: str = "pow",
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Interior residual R = -div_h(a(u) grad_h u) - f.
+    """Return interior -div_h(a(u) grad_h u) with shared face fluxes."""
 
-    Interface coefficients are arithmetic averages, so each face has one
-    conservative flux shared by adjacent control volumes.
-    """
-
-    a = power_coefficient(u, k, mode=coeff_mode, eps=eps)
+    a = power_coefficient(u, k, eps=eps)
 
     uc = u[:, :, 1:-1, 1:-1]
     ue = u[:, :, 1:-1, 2:]
@@ -216,7 +180,28 @@ def nonlinear_poisson_residual(
     flux_s = a_s * (uc - us) / h
 
     div_h = (flux_e - flux_w + flux_n - flux_s) / h
-    return -div_h - f[:, :, 1:-1, 1:-1]
+    return -div_h
+
+
+def nonlinear_poisson_residual(
+    u: torch.Tensor,
+    f: torch.Tensor,
+    k: torch.Tensor | float,
+    h: float,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Interior residual R = -div_h(a(u) grad_h u) - f.
+
+    Interface coefficients are arithmetic averages, so each face has one
+    conservative flux shared by adjacent control volumes.
+    """
+
+    return flux_minus_divergence(
+        u,
+        k,
+        h,
+        eps=eps,
+    ) - f[:, :, 1:-1, 1:-1]
 
 
 def compute_pde_residual(
@@ -224,7 +209,6 @@ def compute_pde_residual(
     f: torch.Tensor,
     k: torch.Tensor | float,
     h: float,
-    coeff_mode: str = "pow",
     eps: float = 1e-6,
 ) -> torch.Tensor:
     return nonlinear_poisson_residual(
@@ -232,15 +216,8 @@ def compute_pde_residual(
         f,
         k,
         h,
-        coeff_mode=coeff_mode,
         eps=eps,
     )
-
-
-def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    diff = (pred - target) * mask
-    denom = mask.sum().clamp_min(1.0)
-    return (diff * diff).sum() / denom
 
 
 def relative_l2_error(
@@ -423,7 +400,6 @@ def manufactured_u(
     x: torch.Tensor,
     y: torch.Tensor,
     params: dict[str, torch.Tensor],
-    solution_mode: str = "base",
 ) -> torch.Tensor:
     """A positive solution family with nontrivial boundary values."""
 
@@ -435,29 +411,7 @@ def manufactured_u(
         params["a1"] * torch.sin(math.pi * x) * torch.sin(math.pi * y)
         + params["a2"] * torch.cos(2.0 * math.pi * x) * torch.cos(math.pi * y)
     )
-
-    if solution_mode == "base":
-        interior_part = base_part
-    elif solution_mode == "fourier":
-        interior_part = base_part + (
-            params["a3"] * torch.sin(2.0 * math.pi * x) * torch.sin(3.0 * math.pi * y)
-            + params["a4"] * torch.cos(3.0 * math.pi * x) * torch.sin(2.0 * math.pi * y)
-        )
-    elif solution_mode == "gaussian":
-        r1 = (x - params["gx1"]) ** 2 + (y - params["gy1"]) ** 2
-        r2 = (x - params["gx2"]) ** 2 + (y - params["gy2"]) ** 2
-        g1 = torch.exp(-r1 / (2.0 * params["gs1"] ** 2))
-        g2 = torch.exp(-r2 / (2.0 * params["gs2"] ** 2))
-        interior_part = params["ga1"] * g1 + params["ga2"] * g2
-    elif solution_mode == "mixed":
-        r1 = (x - params["gx1"]) ** 2 + (y - params["gy1"]) ** 2
-        g1 = torch.exp(-r1 / (2.0 * params["gs1"] ** 2))
-        interior_part = base_part + params["a3"] * torch.sin(
-            2.0 * math.pi * x
-        ) * torch.sin(3.0 * math.pi * y) + params["ga1"] * g1
-    else:
-        raise ValueError(f"Unknown solution_mode: {solution_mode}")
-    return boundary_part + phi * interior_part
+    return boundary_part + phi * base_part
 
 
 def continuous_rhs_from_params(
@@ -465,11 +419,9 @@ def continuous_rhs_from_params(
     y: torch.Tensor,
     k: torch.Tensor,
     params: dict[str, torch.Tensor],
-    coeff_mode: str = "pow",
     eps: float = 1e-6,
-    softplus_beta: float = SHARP_SOFTPLUS_BETA,
 ) -> torch.Tensor:
-    """Compute f = -div(a(u) grad u) analytically for manufactured_u."""
+    """Compute f = -div(a(u) grad u) with analytic derivatives of manufactured_u."""
 
     pi = math.pi
     sin_px = torch.sin(pi * x)
@@ -505,49 +457,11 @@ def continuous_rhs_from_params(
 
     grad_sq = u_x * u_x + u_y * u_y
     k4 = _k_to_broadcast(k, u)
-    base, dbase_du = _coefficient_base_and_derivative(
-        u,
-        coeff_mode,
-        eps,
-        softplus_beta,
-    )
+    base = torch.clamp(u, min=eps)
+    dbase_du = (u > eps).to(dtype=u.dtype)
     a = torch.pow(base, k4)
     da_du = k4 * torch.pow(base, k4 - 1.0) * dbase_du
     return -(da_du * grad_sq + a * (u_xx + u_yy))
-
-
-def discrete_rhs_from_u(
-    u_exact: torch.Tensor,
-    k: torch.Tensor,
-    h: float,
-    coeff_mode: str = "pow",
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """Build flux-form f so u_exact satisfies the discrete residual to roundoff."""
-
-    f = torch.zeros_like(u_exact)
-    a = power_coefficient(u_exact, k, mode=coeff_mode, eps=eps)
-
-    uc = u_exact[:, :, 1:-1, 1:-1]
-    ue = u_exact[:, :, 1:-1, 2:]
-    uw = u_exact[:, :, 1:-1, :-2]
-    un = u_exact[:, :, 2:, 1:-1]
-    us = u_exact[:, :, :-2, 1:-1]
-
-    ac = a[:, :, 1:-1, 1:-1]
-    ae = 0.5 * (ac + a[:, :, 1:-1, 2:])
-    aw = 0.5 * (ac + a[:, :, 1:-1, :-2])
-    an = 0.5 * (ac + a[:, :, 2:, 1:-1])
-    a_s = 0.5 * (ac + a[:, :, :-2, 1:-1])
-
-    minus_div = -(
-        ae * (ue - uc)
-        - aw * (uc - uw)
-        + an * (un - uc)
-        - a_s * (uc - us)
-    ) / (h * h)
-    f[:, :, 1:-1, 1:-1] = minus_div
-    return f
 
 
 def _sample_params(device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
@@ -559,16 +473,6 @@ def _sample_params(device: torch.device, dtype: torch.dtype) -> dict[str, torch.
         "c3": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.10, 0.10),
         "a1": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.20, 0.20),
         "a2": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.20, 0.20),
-        "a3": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.12, 0.12),
-        "a4": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.12, 0.12),
-        "gx1": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.55, 0.55),
-        "gy1": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.55, 0.55),
-        "gx2": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.55, 0.55),
-        "gy2": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.55, 0.55),
-        "gs1": torch.empty(shape, device=device, dtype=dtype).uniform_(0.18, 0.45),
-        "gs2": torch.empty(shape, device=device, dtype=dtype).uniform_(0.18, 0.45),
-        "ga1": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.35, 0.35),
-        "ga2": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.35, 0.35),
     }
 
 
@@ -576,44 +480,30 @@ def sample_manufactured_problem(
     N: int,
     device: torch.device,
     k_range: tuple[float, float] = (0.5, 2.5),
-    rhs_mode: str = "continuous",
     positive_only: bool = True,
-    coeff_mode: str = "pow",
-    solution_mode: str = "base",
     dtype: torch.dtype = torch.float32,
 ) -> dict[str, torch.Tensor | float]:
-    """Return one manufactured problem instance."""
+    """Return one manufactured problem instance.
 
-    if rhs_mode == "continuous" and solution_mode != "base":
-        raise ValueError(
-            "rhs_mode='continuous' currently supports only solution_mode='base'; "
-            "use rhs_mode='discrete' for richer manufactured modes."
-        )
+    The data path is LeVeque-style manufactured forcing: choose analytic
+    u_exact, sample k, and compute f = -div(u_exact^k grad u_exact) with
+    analytic derivatives. u_exact is not used by the training loss.
+    """
 
     x0, y0, boundary_mask, interior_mask, h = make_grid(N, device=device, dtype=dtype)
     x = x0.clone().detach()
     y = y0.clone().detach()
 
     params = _sample_params(device, dtype)
-    u_exact = manufactured_u(x, y, params, solution_mode=solution_mode)
+    u_exact = manufactured_u(x, y, params)
     if positive_only:
         margin = 0.2 - u_exact.detach().min()
         if margin.item() > 0:
             params["c0"] = params["c0"] + margin
-            u_exact = manufactured_u(x, y, params, solution_mode=solution_mode)
+            u_exact = manufactured_u(x, y, params)
 
     k = torch.empty((1,), device=device, dtype=dtype).uniform_(k_range[0], k_range[1])
-    if rhs_mode == "continuous":
-        f = continuous_rhs_from_params(x, y, k, params, coeff_mode=coeff_mode)
-    elif rhs_mode == "discrete":
-        f = discrete_rhs_from_u(
-            u_exact.detach(),
-            k,
-            h,
-            coeff_mode=coeff_mode,
-        )
-    else:
-        raise ValueError("rhs_mode must be 'continuous' or 'discrete'")
+    f = continuous_rhs_from_params(x, y, k, params)
 
     u_exact = u_exact.detach()
     g_map = boundary_mask * u_exact
@@ -658,19 +548,13 @@ def build_dataset(
     num_samples: int,
     device: torch.device,
     k_range: tuple[float, float],
-    rhs_mode: str,
-    coeff_mode: str,
-    solution_mode: str = "base",
 ) -> dict[str, torch.Tensor | float]:
     problems = [
         sample_manufactured_problem(
             N=N,
             device=device,
             k_range=k_range,
-            rhs_mode=rhs_mode,
             positive_only=True,
-            coeff_mode=coeff_mode,
-            solution_mode=solution_mode,
         )
         for _ in range(num_samples)
     ]
@@ -740,16 +624,14 @@ def relative_pde_loss(
     f: torch.Tensor,
     k: torch.Tensor,
     h: float,
-    coeff_mode: str = "pow",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return mean((R / rms(f))^2) and the raw residual R."""
+    """Return mean((R / rms(f))^2) and raw flux residual R."""
 
     res = compute_pde_residual(
         u,
         f,
         k,
         h,
-        coeff_mode=coeff_mode,
     )
     fi = f[:, :, 1:-1, 1:-1]
     denom = fi.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt().clamp_min(1e-3)
@@ -769,8 +651,6 @@ class EvalMetrics:
 @dataclass(frozen=True)
 class PredictionConfig:
     N: int
-    rhs_mode: str
-    solution_mode: str
     k_min: float
     k_max: float
     test_seed: int
@@ -794,7 +674,6 @@ def _accumulate_metrics(
     sums: _MetricSums,
     u_pred: torch.Tensor,
     batch: dict[str, torch.Tensor | float],
-    coeff_mode: str,
     include_gradient: bool = True,
 ) -> None:
     n = u_pred.shape[0]
@@ -814,7 +693,6 @@ def _accumulate_metrics(
         batch["f"],  # type: ignore[arg-type]
         batch["k"],  # type: ignore[arg-type]
         batch["h"],  # type: ignore[arg-type]
-        coeff_mode=coeff_mode,
     )
     bmax = boundary_max_error(
         u_pred,
@@ -872,7 +750,6 @@ def evaluate_on(
     data: dict[str, torch.Tensor | float],
     stats: InputStats,
     batch_size: int,
-    coeff_mode: str,
     normalize_k: bool,
     positive_interior: bool,
     include_gradient: bool = True,
@@ -900,7 +777,6 @@ def evaluate_on(
                 totals["cnn"],
                 u_pred,
                 batch,
-                coeff_mode,
                 include_gradient,
             )
 
@@ -910,20 +786,18 @@ def evaluate_on(
 def evaluate_predictions(
     predictions: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor | float],
-    coeff_mode: str,
     include_gradient: bool = True,
 ) -> dict[str, EvalMetrics]:
     metrics: dict[str, EvalMetrics] = {}
     for name, u_pred in predictions.items():
         sums = _MetricSums()
-        _accumulate_metrics(sums, u_pred, batch, coeff_mode, include_gradient)
+        _accumulate_metrics(sums, u_pred, batch, include_gradient)
         metrics[name] = _finalize_metrics(sums)
     return metrics
 
 
 def oracle_floor(
     data: dict[str, torch.Tensor | float],
-    coeff_mode: str,
 ) -> float:
     """Raw resRMSE of the exact solution on the validation set."""
 
@@ -933,7 +807,6 @@ def oracle_floor(
             data["f"],  # type: ignore[arg-type]
             data["k"],  # type: ignore[arg-type]
             data["h"],  # type: ignore[arg-type]
-            coeff_mode=coeff_mode,
         )
         return float(res.pow(2).mean().sqrt())
 
@@ -964,8 +837,7 @@ def add_path_suffix(path: Path, suffix: str) -> Path:
 
 
 def apply_positive_interior_default(args: argparse.Namespace) -> None:
-    if getattr(args, "positive_interior", None) is None:
-        args.positive_interior = getattr(args, "coeff_mode", "pow") == "pow"
+    args.positive_interior = True
 
 
 def train(args: argparse.Namespace) -> nn.Module:
@@ -981,14 +853,12 @@ def train(args: argparse.Namespace) -> nn.Module:
         raise ValueError("batch_size and eval_batch_size must be positive")
     if args.eval_every < 1:
         raise ValueError("eval_every must be positive")
-    if args.pde_scale_batches < 1:
-        raise ValueError("pde_scale_batches must be positive")
     apply_positive_interior_default(args)
 
     t0 = time.time()
     print(
         f"generating train set: {args.train_samples} samples "
-        f"(N={args.N}, rhs_mode={args.rhs_mode}, solution_mode={args.solution_mode})",
+        f"(N={args.N}, continuous manufactured forcing)",
         flush=True,
     )
     train_data = build_dataset(
@@ -996,9 +866,6 @@ def train(args: argparse.Namespace) -> nn.Module:
         args.train_samples,
         device,
         k_range,
-        args.rhs_mode,
-        args.coeff_mode,
-        args.solution_mode,
     )
     print(f"generating val set: {args.val_samples} samples", flush=True)
     val_data = build_dataset(
@@ -1006,12 +873,10 @@ def train(args: argparse.Namespace) -> nn.Module:
         args.val_samples,
         device,
         k_range,
-        args.rhs_mode,
-        args.coeff_mode,
-        args.solution_mode,
     )
     stats = compute_input_stats(train_data, k_range)
-    floor = oracle_floor(val_data, args.coeff_mode)
+    floor = oracle_floor(val_data)
+    floor_label = "oracle resRMSE floor (finite-difference truncation floor)"
 
     model = UNet2d(in_ch=6, out_ch=1, base_ch=args.base_ch).to(device)
     optimizer = torch.optim.AdamW(
@@ -1034,17 +899,15 @@ def train(args: argparse.Namespace) -> nn.Module:
     best_val_rel_l2 = math.inf
 
     print(
-        f"device={device} N={args.N} rhs_mode={args.rhs_mode} "
-        f"train={args.train_samples} val={args.val_samples} "
+        f"device={device} N={args.N} train={args.train_samples} val={args.val_samples} "
         f"gen_time={time.time() - t0:.1f}s"
     )
     print(f"f stats: mean={stats.f_mean:.3f} std={stats.f_std:.3f}")
-    print(f"oracle resRMSE floor: {floor:.4f}")
+    print(f"{floor_label}: {floor:.4f}")
+    print("training objective: normalized flux-form PDE residual")
     print(f"steps/epoch={steps_per_epoch} total_steps={total_steps}")
 
     step = 0
-    pde_scale: float | None = None
-    pde_scale_samples: list[float] = []
     for epoch in range(args.epochs):
         model.train()
         perm = torch.randperm(args.train_samples, device=device)
@@ -1063,37 +926,8 @@ def train(args: argparse.Namespace) -> nn.Module:
                 batch["f"],  # type: ignore[arg-type]
                 batch["k"],  # type: ignore[arg-type]
                 batch["h"],  # type: ignore[arg-type]
-                coeff_mode=args.coeff_mode,
             )
-            loss_sup = masked_mse(
-                u_pred,
-                batch["u_exact"],  # type: ignore[arg-type]
-                batch["interior_mask"].expand_as(u_pred),  # type: ignore[union-attr]
-            )
-
-            if args.pure_physics:
-                loss = loss_pde
-            elif epoch < args.pretrain_epochs:
-                loss = loss_sup
-            else:
-                if pde_scale is None:
-                    pde_scale_samples.append(
-                        float(loss_sup.detach() / loss_pde.detach().clamp_min(1e-12))
-                    )
-                    current_pde_scale = float(median(pde_scale_samples))
-                    if len(pde_scale_samples) >= args.pde_scale_batches:
-                        pde_scale = current_pde_scale
-                        print(
-                            "[auto-balance] "
-                            f"pde_scale={pde_scale:.3e} "
-                            f"(median of {len(pde_scale_samples)} batches)"
-                        )
-                else:
-                    current_pde_scale = pde_scale
-                loss = (
-                    args.supervised_weight * loss_sup
-                    + args.pde_weight * current_pde_scale * loss_pde
-                )
+            loss = loss_pde
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -1116,7 +950,6 @@ def train(args: argparse.Namespace) -> nn.Module:
                 val_data,
                 stats,
                 eval_batch_size,
-                args.coeff_mode,
                 normalize_k=args.normalize_k,
                 positive_interior=args.positive_interior,
             )
@@ -1139,10 +972,9 @@ def train(args: argparse.Namespace) -> nn.Module:
                 print(f"saved best checkpoint: {best_save_path}")
             print(
                 f"epoch={epoch:03d} step={step:05d} lr={scheduler.get_last_lr()[0]:.2e} "
-                f"loss={float(loss.detach()):.3e} sup={float(loss_sup.detach()):.3e} "
-                f"pde={float(loss_pde.detach()):.3e} train_resRMSE={train_res_rmse:.4f} "
+                f"loss_pde={float(loss_pde.detach()):.3e} train_resRMSE={train_res_rmse:.4f} "
                 f"bmax={train_boundary:.2e} | {format_eval_metrics('val cnn', val_cnn)} "
-                f"(floor {floor:.4f})"
+                f"(oracle floor {floor:.4f})"
             )
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1199,8 +1031,6 @@ def load_model_from_checkpoint(
             k_std=max((k_max - k_min) / math.sqrt(12.0), 1e-8),
         )
         print("checkpoint has no input_stats; using legacy identity f normalization")
-    if hasattr(checkpoint_args, "discretization"):
-        delattr(checkpoint_args, "discretization")
     apply_positive_interior_default(checkpoint_args)
     return model, stats, checkpoint_args
 
@@ -1225,9 +1055,8 @@ def predict_on_batch(
 def resolve_checkpoint_model_config(checkpoint_args: argparse.Namespace) -> argparse.Namespace:
     model_config = argparse.Namespace(
         base_ch=int(getattr(checkpoint_args, "base_ch", 32)),
-        coeff_mode=getattr(checkpoint_args, "coeff_mode", "pow"),
         normalize_k=getattr(checkpoint_args, "normalize_k", True),
-        positive_interior=getattr(checkpoint_args, "positive_interior", None),
+        positive_interior=True,
     )
     apply_positive_interior_default(model_config)
     return model_config
@@ -1238,17 +1067,11 @@ def resolve_prediction_config(
     checkpoint_args: argparse.Namespace,
 ) -> PredictionConfig:
     N = int(getattr(checkpoint_args, "N", 32))
-    rhs_mode = getattr(checkpoint_args, "rhs_mode", "continuous")
-    solution_mode = getattr(checkpoint_args, "solution_mode", "base")
     k_min = float(getattr(checkpoint_args, "k_min", 0.5))
     k_max = float(getattr(checkpoint_args, "k_max", 2.5))
 
     if getattr(runtime_args, "predict_N", None) is not None:
         N = int(runtime_args.predict_N)
-    if getattr(runtime_args, "predict_rhs_mode", None) is not None:
-        rhs_mode = runtime_args.predict_rhs_mode
-    if getattr(runtime_args, "predict_solution_mode", None) is not None:
-        solution_mode = runtime_args.predict_solution_mode
     if getattr(runtime_args, "predict_k_min", None) is not None:
         k_min = float(runtime_args.predict_k_min)
     if getattr(runtime_args, "predict_k_max", None) is not None:
@@ -1256,8 +1079,6 @@ def resolve_prediction_config(
 
     return PredictionConfig(
         N=N,
-        rhs_mode=rhs_mode,
-        solution_mode=solution_mode,
         k_min=k_min,
         k_max=k_max,
         test_seed=int(getattr(runtime_args, "test_seed", getattr(runtime_args, "seed", 1234))),
@@ -1549,7 +1370,6 @@ def _save_combined_eval_panel(
 def _prediction_residual_tensors(
     batch: dict[str, torch.Tensor | float],
     u_pred: torch.Tensor,
-    coeff_mode: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     u_exact = batch["u_exact"]  # type: ignore[assignment]
     pred_flux_residual = compute_pde_residual(
@@ -1557,14 +1377,12 @@ def _prediction_residual_tensors(
         batch["f"],  # type: ignore[arg-type]
         batch["k"],  # type: ignore[arg-type]
         batch["h"],  # type: ignore[arg-type]
-        coeff_mode=coeff_mode,
     )
     exact_flux_residual = compute_pde_residual(
         u_exact,
         batch["f"],  # type: ignore[arg-type]
         batch["k"],  # type: ignore[arg-type]
         batch["h"],  # type: ignore[arg-type]
-        coeff_mode=coeff_mode,
     )
     return (
         pred_flux_residual,
@@ -1575,13 +1393,12 @@ def _prediction_residual_tensors(
 def _prediction_metric_rows(
     batch: dict[str, torch.Tensor | float],
     u_pred: torch.Tensor,
-    coeff_mode: str,
 ) -> tuple[
     list[dict[str, PredictionMetricValue]],
     torch.Tensor,
     torch.Tensor,
 ]:
-    residuals = _prediction_residual_tensors(batch, u_pred, coeff_mode)
+    residuals = _prediction_residual_tensors(batch, u_pred)
     rows = _prediction_eval_rows(batch, u_pred, *residuals)
     return rows, *residuals
 
@@ -1595,7 +1412,6 @@ def save_prediction_evaluation_outputs(
     batch: dict[str, torch.Tensor | float],
     u_pred: torch.Tensor,
     prediction_config: PredictionConfig,
-    coeff_mode: str,
     show_plots: bool = False,
 ) -> None:
     output_path = Path(output_dir)
@@ -1608,7 +1424,6 @@ def save_prediction_evaluation_outputs(
         rows, pred_flux_residual, exact_flux_residual = _prediction_metric_rows(
             batch,
             u_pred,
-            coeff_mode,
         )
 
     csv_path = output_path / "eval_metrics_per_sample.csv"
@@ -1781,7 +1596,6 @@ def save_prediction_plot_outputs(
     plot_dir: str | Path,
     batch: dict[str, torch.Tensor | float],
     u_pred: torch.Tensor,
-    coeff_mode: str,
     show_plots: bool = False,
 ) -> None:
     output_path = Path(plot_dir)
@@ -1794,7 +1608,6 @@ def save_prediction_plot_outputs(
         eval_rows, pred_flux_residual, _ = _prediction_metric_rows(
             batch,
             u_pred,
-            coeff_mode,
         )
         plot_rows = _prediction_plot_rows(eval_rows)
 
@@ -1843,8 +1656,7 @@ def run_prediction(args: argparse.Namespace) -> None:
 
     print(
         "resolved prediction config: "
-        f"N={prediction_config.N} rhs_mode={prediction_config.rhs_mode} "
-        f"solution_mode={prediction_config.solution_mode} "
+        f"N={prediction_config.N} continuous manufactured forcing "
         f"k_range=({prediction_config.k_min:g}, {prediction_config.k_max:g}) "
         f"test_seed={prediction_config.test_seed} samples={prediction_config.samples}",
         flush=True,
@@ -1855,9 +1667,6 @@ def run_prediction(args: argparse.Namespace) -> None:
         prediction_config.samples,
         device,
         k_range,
-        prediction_config.rhs_mode,
-        model_config.coeff_mode,
-        prediction_config.solution_mode,
     )
     u_pred = predict_on_batch(model, batch, stats, model_config)
 
@@ -1865,7 +1674,6 @@ def run_prediction(args: argparse.Namespace) -> None:
     metrics = evaluate_predictions(
         predictions,
         batch,
-        model_config.coeff_mode,
     )
     for name, metric in metrics.items():
         print(format_eval_metrics(f"predict {name}", metric))
@@ -1877,7 +1685,6 @@ def run_prediction(args: argparse.Namespace) -> None:
             batch,
             u_pred,
             prediction_config,
-            model_config.coeff_mode,
             show_plots=getattr(args, "show_plots", False),
         )
 
@@ -1886,7 +1693,6 @@ def run_prediction(args: argparse.Namespace) -> None:
             getattr(args, "plot_dir", "results/figures"),
             batch,
             u_pred,
-            model_config.coeff_mode,
             show_plots=getattr(args, "show_plots", False),
         )
 
@@ -1937,8 +1743,6 @@ def run_demo(args: argparse.Namespace) -> None:
     predict_args.predict_samples = 4
     predict_args.predict_save = ""
     predict_args.predict_N = None
-    predict_args.predict_rhs_mode = None
-    predict_args.predict_solution_mode = None
     predict_args.predict_k_min = None
     predict_args.predict_k_max = None
     predict_args.eval_output_dir = ""
@@ -1956,14 +1760,12 @@ def run_residual_check(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = select_device(args.device)
     k_range = (args.k_min, args.k_max)
+
     batch = build_dataset(
         args.N,
         args.batch_size,
         device,
         k_range,
-        "discrete",
-        args.coeff_mode,
-        args.solution_mode,
     )
     with torch.no_grad():
         res = compute_pde_residual(
@@ -1971,13 +1773,15 @@ def run_residual_check(args: argparse.Namespace) -> None:
             batch["f"],  # type: ignore[arg-type]
             batch["k"],  # type: ignore[arg-type]
             batch["h"],  # type: ignore[arg-type]
-            coeff_mode=args.coeff_mode,
         )
         rmse = torch.sqrt((res * res).mean())
         max_abs = res.abs().max()
-        scaled_rmse = torch.sqrt(((res * (batch["h"] ** 2)) ** 2).mean())  # type: ignore[operator]
+        scaled_rmse = torch.sqrt(
+            ((res * (batch["h"] ** 2)) ** 2).mean()  # type: ignore[operator]
+        )
     print(
-        "flux RHS residual check: "
+        "continuous manufactured oracle floor "
+        "(flux residual on analytic RHS, finite-difference truncation floor): "
         f"rmse={float(rmse.cpu()):.4e}, "
         f"scaled_rmse={float(scaled_rmse.cpu()):.4e}, "
         f"max_abs={float(max_abs.cpu()):.4e}"
@@ -1991,34 +1795,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-samples", type=int, default=2048)
     parser.add_argument("--val-samples", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=40, help="Real epochs over the fixed dataset.")
-    parser.add_argument("--pretrain-epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--eval-batch-size", type=int, default=0, help="Defaults to --batch-size.")
     parser.add_argument("--eval-batches", type=int, default=None, help="Compatibility alias for val samples.")
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--base-ch", type=int, default=32)
-    parser.add_argument("--rhs-mode", choices=["continuous", "discrete"], default="continuous")
-    parser.add_argument(
-        "--solution-mode",
-        choices=["base", "fourier", "gaussian", "mixed"],
-        default="base",
-    )
-    parser.add_argument("--coeff-mode", choices=["pow", "abs_pow", "softplus_pow"], default="pow")
     parser.add_argument("--k-min", type=float, default=0.5)
     parser.add_argument("--k-max", type=float, default=2.5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--supervised-weight", type=float, default=1.0)
-    parser.add_argument("--pde-weight", type=float, default=1.0)
-    parser.add_argument("--pde-scale-batches", type=int, default=20)
-    parser.add_argument("--pure-physics", action="store_true")
-    parser.add_argument(
-        "--positive-interior",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Defaults to on when --coeff-mode pow.",
-    )
     parser.add_argument("--normalize-k", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, mps, ...")
     parser.add_argument("--seed", type=int, default=1234)
@@ -2031,16 +1817,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-dir", default="results/figures")
     parser.add_argument("--show-plots", action="store_true")
     parser.add_argument("--predict-N", "--predict-n", dest="predict_N", type=int, default=None)
-    parser.add_argument(
-        "--predict-rhs-mode",
-        choices=["continuous", "discrete"],
-        default=None,
-    )
-    parser.add_argument(
-        "--predict-solution-mode",
-        choices=["base", "fourier", "gaussian", "mixed"],
-        default=None,
-    )
     parser.add_argument("--predict-k-min", type=float, default=None)
     parser.add_argument("--predict-k-max", type=float, default=None)
     parser.add_argument(
@@ -2049,7 +1825,11 @@ def parse_args() -> argparse.Namespace:
         help="Directory for --predict-manufactured evaluation CSV and figures.",
     )
     parser.add_argument("--test-seed", type=int, default=1234)
-    parser.add_argument("--check-residual", action="store_true")
+    parser.add_argument(
+        "--check-residual",
+        action="store_true",
+        help="Print the continuous manufactured oracle residual floor.",
+    )
     parser.add_argument("--train-after-check", action="store_true")
     return parser.parse_args()
 

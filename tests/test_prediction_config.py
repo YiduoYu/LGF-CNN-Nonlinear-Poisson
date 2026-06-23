@@ -11,13 +11,9 @@ import Baseline
 def _runtime_args(**overrides) -> argparse.Namespace:
     values = {
         "N": 99,
-        "rhs_mode": "continuous",
-        "solution_mode": "base",
         "k_min": 10.0,
         "k_max": 20.0,
         "predict_N": None,
-        "predict_rhs_mode": None,
-        "predict_solution_mode": None,
         "predict_k_min": None,
         "predict_k_max": None,
         "predict_samples": 2,
@@ -31,14 +27,10 @@ def _runtime_args(**overrides) -> argparse.Namespace:
 def _checkpoint_args(**overrides) -> argparse.Namespace:
     values = {
         "N": 12,
-        "rhs_mode": "discrete",
-        "solution_mode": "mixed",
         "k_min": 0.2,
         "k_max": 0.8,
         "base_ch": 5,
-        "coeff_mode": "abs_pow",
         "normalize_k": False,
-        "positive_interior": False,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -71,9 +63,6 @@ def _run_prediction_payload(
     args = {
         "N": 8,
         "base_ch": 1,
-        "rhs_mode": "continuous",
-        "coeff_mode": "pow",
-        "solution_mode": "base",
         "k_min": 0.5,
         "k_max": 2.5,
         "normalize_k": True,
@@ -88,8 +77,6 @@ def _run_prediction_payload(
         predict_samples=2,
         predict_save=str(save_path),
         predict_N=None,
-        predict_rhs_mode=None,
-        predict_solution_mode=None,
         predict_k_min=None,
         predict_k_max=None,
         test_seed=test_seed,
@@ -105,8 +92,6 @@ def test_prediction_config_uses_checkpoint_values_without_overrides() -> None:
 
     assert config == Baseline.PredictionConfig(
         N=12,
-        rhs_mode="discrete",
-        solution_mode="mixed",
         k_min=0.2,
         k_max=0.8,
         test_seed=777,
@@ -118,8 +103,6 @@ def test_prediction_config_uses_checkpoint_values_without_overrides() -> None:
     ("override_name", "override_value", "field_name", "expected"),
     [
         ("predict_N", 16, "N", 16),
-        ("predict_rhs_mode", "continuous", "rhs_mode", "continuous"),
-        ("predict_solution_mode", "gaussian", "solution_mode", "gaussian"),
         ("predict_k_min", 1.1, "k_min", 1.1),
         ("predict_k_max", 3.3, "k_max", 3.3),
     ],
@@ -148,10 +131,8 @@ def test_model_config_comes_from_checkpoint() -> None:
     config = Baseline.resolve_checkpoint_model_config(_checkpoint_args())
 
     assert config.base_ch == 5
-    assert config.coeff_mode == "abs_pow"
     assert config.normalize_k is False
-    assert config.positive_interior is False
-    assert not hasattr(config, "discretization")
+    assert config.positive_interior is True
 
 
 def test_test_seed_reproduces_prediction_dataset(tmp_path: Path) -> None:
@@ -180,15 +161,11 @@ def test_legacy_checkpoint_missing_newer_prediction_fields_loads(tmp_path: Path)
         checkpoint_args={
             "N": 8,
             "base_ch": 1,
-            "rhs_mode": "continuous",
-            "coeff_mode": "pow",
             "k_min": 0.5,
             "k_max": 2.5,
             "normalize_k": True,
         },
     )
 
-    assert payload["prediction_config"]["solution_mode"] == "base"
-    assert "discretization" not in payload["args"]
     assert payload["prediction_config"]["N"] == 8
     assert "u_pred" in payload

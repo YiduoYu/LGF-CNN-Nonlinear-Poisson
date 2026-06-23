@@ -20,14 +20,9 @@ def _write_checkpoint(path: Path) -> None:
             "args": {
                 "N": 8,
                 "base_ch": 1,
-                "rhs_mode": "continuous",
-                "coeff_mode": "pow",
-                "discretization": "kirchhoff",
-                "solution_mode": "base",
                 "k_min": 0.5,
                 "k_max": 2.5,
                 "normalize_k": True,
-                "positive_interior": True,
             },
         },
         path,
@@ -43,8 +38,6 @@ def _prediction_args(checkpoint_path: Path, save_path: Path) -> argparse.Namespa
         device="cpu",
         seed=1234,
         predict_N=None,
-        predict_rhs_mode=None,
-        predict_solution_mode=None,
         predict_k_min=None,
         predict_k_max=None,
         eval_output_dir="",
@@ -54,7 +47,7 @@ def _prediction_args(checkpoint_path: Path, save_path: Path) -> argparse.Namespa
     )
 
 
-def test_predict_save_ignores_legacy_discretization_field(tmp_path: Path) -> None:
+def test_predict_save_writes_minimal_payload(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "checkpoint.pt"
     save_path = tmp_path / "prediction.pt"
     _write_checkpoint(checkpoint_path)
@@ -65,4 +58,3 @@ def test_predict_save_ignores_legacy_discretization_field(tmp_path: Path) -> Non
     assert "u_pred" in payload
     assert "u_transform" not in payload
     assert set(payload["metrics"]) == {"cnn"}
-    assert "discretization" not in payload["args"]

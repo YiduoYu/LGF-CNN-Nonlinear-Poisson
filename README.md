@@ -29,7 +29,7 @@ or explicitly:
 python3 Baseline.py --demo
 ```
 
-Run the discrete residual self-check:
+Check the manufactured oracle residual floor:
 
 ```bash
 python3 Baseline.py --check-residual --N 32 --device cpu
@@ -38,14 +38,28 @@ python3 Baseline.py --check-residual --N 32 --device cpu
 Train a small baseline:
 
 ```bash
-python3 Baseline.py --N 32 --epochs 200 --pretrain-epochs 50 --batch-size 8 --rhs-mode continuous --save-path checkpoints/unet_n32.pt
+python3 Baseline.py --N 32 --epochs 200 --batch-size 8 --save-path checkpoints/unet_n32.pt
 ```
 
-Pure physics-only training:
+## Residual Training Method
+
+Recommended run:
 
 ```bash
-python3 Baseline.py --N 32 --epochs 200 --pure-physics --pretrain-epochs 0 --rhs-mode continuous
+python3 Baseline.py --N 32 --epochs 200
 ```
+
+The data is manufactured continuously: choose analytic `u_exact(x,y)`, sample
+`k`, and compute `f = -div(u_exact^k grad u_exact)` with analytic derivatives.
+The training objective is only the normalized conservative flux residual:
+
+```text
+loss_pde = mean(([-div_h(u_pred^k grad_h u_pred) - f] / rms(f))^2)
+```
+
+There is no supervised MSE warmup or mixed supervised/PDE objective. `u_exact`
+is used to manufacture `f`, provide boundary values `g`, and report evaluation
+metrics/plots after training.
 
 ## One-Click Demo
 
@@ -77,18 +91,13 @@ The model takes six input channels: `[f, boundary_g, boundary_mask, k, x, y]`.
 The U-Net predicts a full-grid solution and then applies an exact Dirichlet
 projection, so boundary values are copied from the manufactured boundary data.
 
-Training uses manufactured nonlinear Poisson problems. The only PDE residual is
-the conservative flux-form finite-difference stencil with shared face fluxes:
+Training uses manufactured nonlinear Poisson problems. The forcing `f` comes
+from the continuous PDE using analytic derivatives of `u_exact`. The only PDE
+residual used by the loss is the conservative flux-form finite-difference
+stencil with shared face fluxes:
 
 ```text
 R_flux(u_pred) = -div_h(u_pred^k grad_h u_pred) - f
-```
-
-For `rhs_mode=discrete`, the manufactured RHS is generated with the same flux
-stencil:
-
-```text
-f = -div_h(u_exact^k grad_h u_exact)
 ```
 
 Prediction and plotting reuse the same checkpoint loader and manufactured test
@@ -101,6 +110,9 @@ data path as normal prediction. For each sample, the code computes:
 - CNN flux residual RMSE in `pred_flux_resRMSE`
 - oracle flux residual RMSE from `u_exact` in `exact_flux_resRMSE`
 
+These `u_pred` versus `u_exact` comparisons are evaluation outputs, not the
+default backward training objective.
+
 Figures are saved with Matplotlib `imshow` panels and colorbars using
 `plt.savefig(..., dpi=200, bbox_inches="tight")`, followed by `plt.close(fig)`.
 
@@ -109,5 +121,5 @@ Figures are saved with Matplotlib `imshow` panels and colorbars using
 - Full grid size is `(N + 2) x (N + 2)`, including boundary nodes.
 - Input channels are `[f, boundary_g, boundary_mask, k, x, y]`.
 - Boundary values are imposed exactly by projection, so the boundary error should be near floating-point roundoff.
-- `rhs_mode=discrete` is useful for debugging because the manufactured solution satisfies the same finite-difference stencil used by the loss.
-- `rhs_mode=continuous` computes the manufactured RHS from the continuous PDE by automatic differentiation.
+- The manufactured RHS is always continuous analytic forcing.
+- The training loss is always the flux-form PDE residual; `u_exact` comparisons are evaluation only.

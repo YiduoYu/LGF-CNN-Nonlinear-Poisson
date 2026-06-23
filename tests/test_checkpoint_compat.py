@@ -31,7 +31,6 @@ class CheckpointCompatibilityTest(unittest.TestCase):
                 ),
                 "args": argparse.Namespace(
                     base_ch=1,
-                    coeff_mode="pow",
                     normalize_k=True,
                 ),
             }
@@ -55,7 +54,6 @@ class CheckpointCompatibilityTest(unittest.TestCase):
                 },
                 "args": {
                     "base_ch": 1,
-                    "coeff_mode": "abs_pow",
                     "normalize_k": False,
                 },
             }
@@ -64,7 +62,7 @@ class CheckpointCompatibilityTest(unittest.TestCase):
         _, stats, args = Baseline.load_model_from_checkpoint(path, torch.device("cpu"))
 
         self.assertEqual(stats, Baseline.InputStats(0.5, 1.5, 2.5, 3.5))
-        self.assertFalse(args.positive_interior)
+        self.assertTrue(args.positive_interior)
 
 
 if __name__ == "__main__":

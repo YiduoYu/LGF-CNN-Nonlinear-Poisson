@@ -157,10 +157,54 @@ def pinn_loss(model: nn.Module,
 
 
 # ===========================================================================
-# 5. Training
+# 5. Grid evaluation helper (shared by training and final eval)
 # ===========================================================================
 
-def train(args: argparse.Namespace) -> nn.Module:
+@torch.no_grad()
+def _eval_grid(model, x, y, boundary, interior, h, f, k, g, need_gradient=False):
+    """Evaluate PINN on a pre-computed grid. Returns (metrics_dict, u_pred).
+
+    Called both during training (need_gradient=False) and at final
+    evaluation (need_gradient=True for gradRelL2).
+    """
+    xp = x.reshape(-1, 1)
+    yp = y.reshape(-1, 1)
+    u_pred_flat = model(xp, yp)
+    u_pred = u_pred_flat.reshape(1, 1, x.shape[-2], x.shape[-1])
+
+    ue = u_exact(x, y)
+    err = (u_pred - ue) * interior
+
+    m = {
+        "relL2": float(err.norm(p=2) / ue.mul(interior).norm(p=2).clamp_min(1e-12)),
+        "linf": float(err.abs().max()),
+        "bmax": float(((u_pred - g) * boundary).abs().max()),
+    }
+
+    res_pred = fd_residual(u_pred, f, k, h)
+    res_exact = fd_residual(ue, f, k, h)
+    m["resRMSE"] = float(res_pred.pow(2).mean().sqrt())
+    m["exact_resRMSE"] = float(res_exact.pow(2).mean().sqrt())
+
+    if need_gradient:
+        du = lambda v: (v[:, :, 1:-1, 2:] - v[:, :, 1:-1, :-2]) / (2.0 * h)
+        dv = lambda v: (v[:, :, 2:, 1:-1] - v[:, :, :-2, 1:-1]) / (2.0 * h)
+        p_grad = torch.cat([du(u_pred), dv(u_pred)], dim=1)
+        t_grad = torch.cat([du(ue), dv(ue)], dim=1)
+        m["gradRelL2"] = float(
+            (p_grad - t_grad).norm(p=2) / t_grad.norm(p=2).clamp_min(1e-12)
+        )
+    else:
+        m["gradRelL2"] = 0.0
+
+    return m, u_pred
+
+
+# ===========================================================================
+# 6. Training
+# ===========================================================================
+
+def train(args: argparse.Namespace):
     set_seed(args.seed)
     device = select_device(args.device)
     t0 = time.time()
@@ -173,18 +217,15 @@ def train(args: argparse.Namespace) -> nn.Module:
 
     # ---- fixed grid: identical to CNN baseline's training grid ----
     x_grid, y_grid, boundary, interior, h = make_grid(args.N, device)
-    ue_grid = u_exact(x_grid, y_grid)
     k_grid = torch.full((1, 1), 2.0, device=device)
     f_grid = forcing(x_grid, y_grid).detach()
-    g_grid = boundary * ue_grid
+    g_grid = boundary * u_exact(x_grid, y_grid)
 
     # extract collocation points from the grid (NOT random sampling)
     x_int, y_int, x_bnd, y_bnd = get_grid_points(x_grid, y_grid, interior, boundary)
-    n_int = x_int.shape[0]
-    n_bnd = x_bnd.shape[0]
 
     print(f"device={device}  N={args.N}  epochs={args.epochs}  "
-          f"grid_points: interior={n_int}  boundary={n_bnd}  "
+          f"grid_points: interior={x_int.shape[0]}  boundary={x_bnd.shape[0]}  "
           f"(same grid as CNN baseline)")
     print(f"hidden_dim={args.hidden_dim}  n_layers={args.n_layers}")
     print(f"{'epoch':>6s}  {'loss_pde':>10s}  {'loss_bc':>10s}  "
@@ -192,6 +233,7 @@ def train(args: argparse.Namespace) -> nn.Module:
 
     best_relL2 = math.inf
     best_state = None
+    history: list[dict] = []
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -205,28 +247,12 @@ def train(args: argparse.Namespace) -> nn.Module:
         optimizer.step()
         scheduler.step()
 
-        # ---- evaluation on fixed grid ----
+        # ---- evaluation ----
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             model.eval()
-            with torch.no_grad():
-                # evaluate on grid: need [N,1] point format
-                xp = x_grid.reshape(-1, 1)
-                yp = y_grid.reshape(-1, 1)
-                u_pred_flat = model(xp, yp)
-                u_pred = u_pred_flat.reshape(1, 1, args.N + 2, args.N + 2)
-
-                # relative L2 error (interior)
-                err = (u_pred - ue_grid) * interior
-                relL2 = float(
-                    err.norm(p=2) / ue_grid.mul(interior).norm(p=2).clamp_min(1e-12)
-                )
-
-                # PDE residual on grid (FD, same as Baseline for comparison)
-                res = fd_residual(u_pred, f_grid, k_grid, h)
-                res_rmse = float(res.pow(2).mean().sqrt())
-
-                # boundary max error
-                bmax = float(((u_pred - g_grid) * boundary).abs().max())
+            vm, _ = _eval_grid(model, x_grid, y_grid, boundary, interior,
+                               h, f_grid, k_grid, g_grid)
+            relL2 = vm["relL2"]
 
             if relL2 < best_relL2:
                 best_relL2 = relL2
@@ -234,77 +260,47 @@ def train(args: argparse.Namespace) -> nn.Module:
 
             elapsed = time.time() - t0
             print(f"{epoch:6d}  {float(loss_pde):10.3e}  {float(loss_bc):10.3e}  "
-                  f"{relL2:10.3e}  {res_rmse:10.3e}  {elapsed:7.1f}s")
+                  f"{relL2:10.3e}  {vm['resRMSE']:10.3e}  {elapsed:7.1f}s")
+
+            history.append({
+                "epoch": epoch,
+                "loss_pde": float(loss_pde),
+                "loss_bc": float(loss_bc),
+                "relL2": relL2,
+                "resRMSE": vm["resRMSE"],
+                "bmax": vm["bmax"],
+            })
 
     # restore best
     if best_state is not None:
         model.load_state_dict(best_state)
         print(f"restored best model (val relL2={best_relL2:.4e})")
 
-    return model
+    return model, history
 
 
 # ===========================================================================
-# 6. Evaluation & prediction on uniform grid
+# 7. Final evaluation
 # ===========================================================================
 
 @torch.no_grad()
-def evaluate_on_grid(model: nn.Module, N: int, device: torch.device) -> dict:
-    """Evaluate PINN on the same uniform grid as the CNN baseline.
-
-    Returns dict of tensors suitable for visualization and metric dict.
-    """
+def evaluate_final(model: nn.Module, N: int, device: torch.device):
+    """Full evaluation on uniform grid. Returns (data_dict, metrics_dict)."""
     x, y, boundary, interior, h = make_grid(N, device)
-    ue = u_exact(x, y)
-    g = boundary * ue
     k = torch.full((1, 1), 2.0, device=device)
     f = forcing(x, y)
+    g = boundary * u_exact(x, y)
 
-    # PINN prediction on grid
-    xp = x.reshape(-1, 1)
-    yp = y.reshape(-1, 1)
-    u_pred_flat = model(xp, yp)
-    u_pred = u_pred_flat.reshape(1, 1, N + 2, N + 2)
+    vm, u_pred = _eval_grid(model, x, y, boundary, interior,
+                            h, f, k, g, need_gradient=True)
 
-    # metrics
-    err = (u_pred - ue) * interior
-    relL2 = float(err.norm(p=2) / ue.mul(interior).norm(p=2).clamp_min(1e-12))
-    linf = float((err).abs().max())
-    bmax = float(((u_pred - g) * boundary).abs().max())
-
-    res_pred = fd_residual(u_pred, f, k, h)
-    res_exact = fd_residual(ue, f, k, h)
-    res_rmse = float(res_pred.pow(2).mean().sqrt())
-    exact_res_rmse = float(res_exact.pow(2).mean().sqrt())
-
-    # gradient error
-    du = lambda v: (v[:, :, 1:-1, 2:] - v[:, :, 1:-1, :-2]) / (2.0 * h)
-    dv = lambda v: (v[:, :, 2:, 1:-1] - v[:, :, :-2, 1:-1]) / (2.0 * h)
-    p_grad = torch.cat([du(u_pred), dv(u_pred)], dim=1)
-    t_grad = torch.cat([du(ue), dv(ue)], dim=1)
-    grad_relL2 = float(
-        ((p_grad - t_grad).norm(p=2) / t_grad.norm(p=2).clamp_min(1e-12))
-    )
-
-    return {
-        "u_pred": u_pred,
-        "u_exact": ue,
-        "f": f,
-        "h": h,
-        "boundary": boundary,
-        "interior": interior,
-    }, {
-        "relL2": relL2,
-        "linf": linf,
-        "resRMSE": res_rmse,
-        "exact_resRMSE": exact_res_rmse,
-        "bmax": bmax,
-        "gradRelL2": grad_relL2,
-    }
+    data = {"u_pred": u_pred, "u_exact": u_exact(x, y),
+            "f": f, "h": h, "boundary": boundary, "interior": interior}
+    return data, vm
 
 
 # ===========================================================================
-# 7. Visualization
+# 8. Visualization
 # ===========================================================================
 
 def _get_plt():
@@ -354,7 +350,7 @@ def _save_panel(u_true, u_pred, error, abs_error, res_pred, res_exact,
 
 
 # ===========================================================================
-# 8. CLI & main
+# 9. CLI & main
 # ===========================================================================
 
 def parse_args():
@@ -387,9 +383,9 @@ def main():
     args = parse_args()
 
     # train
-    model = train(args)
+    model, history = train(args)
 
-    # save
+    # save checkpoint
     save_path = Path(args.save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -398,9 +394,17 @@ def main():
     }, save_path)
     print(f"saved: {save_path}")
 
+    # save training history CSV
+    hist_path = save_path.with_suffix(".csv")
+    with open(str(hist_path), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+        w.writeheader()
+        w.writerows(history)
+    print(f"saved history: {hist_path}")
+
     # evaluate & plot
     device = select_device(args.device)
-    data, metrics = evaluate_on_grid(model, args.N, device)
+    data, metrics = evaluate_final(model, args.N, device)
 
     print(f"\nFinal metrics (N={args.N} grid):")
     for k, v in metrics.items():

@@ -289,7 +289,12 @@ def u_exact(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 def forcing(x: torch.Tensor, y: torch.Tensor, k: torch.Tensor,
             eps: float = 1e-6) -> torch.Tensor:
-    """Analytic f = -div(u^k grad u) for u = sin(pi*x)*cos(pi*y)."""
+    """Analytic f = -div(u^k grad u) for u = sin(pi*x)*cos(pi*y).
+
+    For integer k (e.g. k=2), u^k is well-defined for negative u, so no
+    clamp is applied. For fractional k, a small positive clamp prevents
+    NaN gradients from negative bases.
+    """
     pi = math.pi
     u = u_exact(x, y)
     u_x = pi * torch.cos(pi * x) * torch.cos(pi * y)
@@ -301,8 +306,13 @@ def forcing(x: torch.Tensor, y: torch.Tensor, k: torch.Tensor,
     while k.ndim < 4:
         k = k.unsqueeze(-1)
 
-    a = torch.pow(torch.clamp(u, min=eps), k)
-    da = k * torch.pow(torch.clamp(u, min=eps), k - 1.0)
+    if torch.allclose(k, k.round(), atol=1e-6, rtol=0.0):
+        a = torch.pow(u, k)                    # integer k: safe for all u
+        da = k * torch.pow(u, k - 1.0)
+    else:
+        a = torch.pow(torch.clamp(u, min=eps), k)      # fractional k: guard
+        da = k * torch.pow(torch.clamp(u, min=eps), k - 1.0)
+
     return -(da * grad_sq + a * laplacian)
 
 
@@ -537,6 +547,25 @@ def train(args: argparse.Namespace) -> nn.Module:
 # 7. Evaluation
 # ===========================================================================
 
+def _error_tensors(u_pred: torch.Tensor, batch: dict):
+    """Compute error & residual tensors shared by evaluate and per_sample_metrics.
+
+    Returns (err, res_pred, res_exact, bnd_err_abs, interior, u_exact, h).
+    """
+    ue = batch["u_exact"]
+    interior = batch["interior_mask"].expand_as(u_pred)
+    boundary = batch["mask"]
+    if boundary.shape[0] == 1:
+        boundary = boundary.expand_as(u_pred)
+
+    err = (u_pred - ue) * interior
+    res_pred = pde_residual(u_pred, batch["f"], batch["k"], batch["h"])
+    res_exact = pde_residual(ue, batch["f"], batch["k"], batch["h"])
+    bnd_err = (u_pred - batch["g"]).abs() * boundary
+
+    return err, res_pred, res_exact, bnd_err, interior, ue, float(batch["h"])
+
+
 @torch.no_grad()
 def evaluate(model: nn.Module, data: dict, stats: InputStats,
              batch_size: int, norm_k: bool) -> dict:
@@ -553,30 +582,24 @@ def evaluate(model: nn.Module, data: dict, stats: InputStats,
         batch = _take_batch(data, idx)
         u_pred = _forward(model, batch, stats, norm_k)
 
-        interior = batch["interior_mask"].expand_as(u_pred)
-        err = (u_pred - batch["u_exact"]) * interior
-        res = pde_residual(u_pred, batch["f"], batch["k"], batch["h"])
+        err, res_pred, _, bnd_err, interior, ue, h = _error_tensors(u_pred, batch)
 
         m = u_pred.shape[0]
         sums["count"] += m
         sums["relL2"] += float(
             (err.flatten(1).norm(dim=1)
-             / batch["u_exact"].mul(interior).flatten(1).norm(dim=1)
-                               .clamp_min(1e-12)).sum()
+             / ue.mul(interior).flatten(1).norm(dim=1).clamp_min(1e-12)).sum()
         )
         sums["linf"] = max(sums["linf"], float(err.abs().max()))
-        sums["res_sq"] += float(res.pow(2).sum())
-        sums["res_linf"] = max(sums["res_linf"], float(res.abs().max()))
-        sums["bmax"] = max(sums["bmax"], float(
-            ((u_pred - batch["g"]).abs() * batch["mask"]).max()
-        ))
+        sums["res_sq"] += float(res_pred.pow(2).sum())
+        sums["res_linf"] = max(sums["res_linf"], float(res_pred.abs().max()))
+        sums["bmax"] = max(sums["bmax"], float(bnd_err.max()))
 
-        # gradient relative L2
-        h = batch["h"]
+        # gradient relative L2 (not in _error_tensors — only needed here)
         du = lambda v: (v[:, :, 1:-1, 2:] - v[:, :, 1:-1, :-2]) / (2.0 * h)
         dv = lambda v: (v[:, :, 2:, 1:-1] - v[:, :, :-2, 1:-1]) / (2.0 * h)
         p_grad = torch.cat([du(u_pred), dv(u_pred)], dim=1)
-        t_grad = torch.cat([du(batch["u_exact"]), dv(batch["u_exact"])], dim=1)
+        t_grad = torch.cat([du(ue), dv(ue)], dim=1)
         sums["grad_sum"] += float(
             ((p_grad - t_grad).flatten(1).norm(dim=1)
              / t_grad.flatten(1).norm(dim=1).clamp_min(1e-12)).sum()
@@ -597,27 +620,22 @@ def evaluate(model: nn.Module, data: dict, stats: InputStats,
 
 def per_sample_metrics(u_pred: torch.Tensor, batch: dict) -> list[dict]:
     """Compute per-sample metrics (for CSV export)."""
-    ue = batch["u_exact"]
-    interior = batch["interior_mask"].expand_as(u_pred)
-    boundary = batch["mask"]
-    if boundary.shape[0] == 1:
-        boundary = boundary.expand_as(u_pred)
+    err, res_pred, res_exact, bnd_err, _, ue, _ = _error_tensors(u_pred, batch)
 
-    err = u_pred - ue
-    int_err = (err * interior)[:, :, 1:-1, 1:-1].flatten(1)
+    int_err = err[:, :, 1:-1, 1:-1].flatten(1)
     int_ue = ue[:, :, 1:-1, 1:-1].flatten(1)
-    res = pde_residual(u_pred, batch["f"], batch["k"], batch["h"]).flatten(1)
-    res_exact = pde_residual(ue, batch["f"], batch["k"], batch["h"]).flatten(1)
-    bnd_err = (err.abs() * boundary).flatten(1)
+    res_flat = res_pred.flatten(1)
+    res_exact_flat = res_exact.flatten(1)
+    bnd_flat = bnd_err.flatten(1)
     f_flat = batch["f"].flatten(1)
 
     relL2 = int_err.norm(dim=1) / int_ue.norm(dim=1).clamp_min(1e-12)
     rmse = int_err.pow(2).mean(1).sqrt()
     mae = int_err.abs().mean(1)
     linf = int_err.abs().max(1).values
-    bmax = bnd_err.max(1).values
-    pred_res_rmse = res.pow(2).mean(1).sqrt()
-    exact_res_rmse = res_exact.pow(2).mean(1).sqrt()
+    bmax = bnd_flat.max(1).values
+    pred_res_rmse = res_flat.pow(2).mean(1).sqrt()
+    exact_res_rmse = res_exact_flat.pow(2).mean(1).sqrt()
     f_rmse = f_flat.pow(2).mean(1).sqrt()
 
     rows = []
@@ -667,25 +685,6 @@ def _get_plt():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     return plt
-
-
-def _save_heatmap(values: torch.Tensor, path: Path, title: str,
-                  cmap: str = "viridis", extent: list | None = None,
-                  vmin: float | None = None, vmax: float | None = None,
-                  dpi: int = 180):
-    """Save a single heatmap as PNG."""
-    plt = _get_plt()
-    arr = values.detach().cpu().numpy()
-    ext = extent or [-1.0, 1.0, -1.0, 1.0]
-
-    fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
-    im = ax.imshow(arr, origin="lower", extent=ext, cmap=cmap,
-                   vmin=vmin, vmax=vmax, aspect="equal")
-    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_title(title)
-    fig.colorbar(im, ax=ax)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(path), dpi=dpi)
-    plt.close(fig)
 
 
 def _save_panel(u_exact: torch.Tensor, u_pred: torch.Tensor,
@@ -862,60 +861,6 @@ def run_prediction(args: argparse.Namespace) -> None:
         _write_csv(rows, out / "metrics.csv")
         print(f"saved panels + metrics: {out}")
 
-    # ---- detailed evaluation output ----
-    if args.eval_output_dir:
-        out = Path(args.eval_output_dir)
-        h = float(batch["h"])
-        full_ext = [-1.0, 1.0, -1.0, 1.0]
-        resid_ext = [-1.0 + h, 1.0 - h, -1.0 + h, 1.0 - h]
-
-        for i, row in enumerate(rows):
-            sid = row["sample_id"]
-            d = out / f"sample_{sid:04d}"
-            d.mkdir(parents=True, exist_ok=True)
-
-            ui = batch["u_exact"][i, 0]
-            up = u_pred[i, 0]
-            err = up - ui
-            res_pred = pde_residual(u_pred[i:i + 1], batch["f"][i:i + 1],
-                                    batch["k"][i:i + 1], h)[0, 0]
-            res_ex = pde_residual(batch["u_exact"][i:i + 1],
-                                  batch["f"][i:i + 1],
-                                  batch["k"][i:i + 1], h)[0, 0]
-
-            title = (f"sample {sid} | N={N} k={row['k']:.4g}  "
-                     f"relL2={row['relL2']:.3e}  RMSE={row['RMSE']:.3e}  "
-                     f"Linf={row['Linf']:.3e}")
-
-            u_min = min(float(ui.min()), float(up.min()))
-            u_max = max(float(ui.max()), float(up.max()))
-            e_max = max(float(err.abs().max().cpu()), 1e-12)
-            rp_max = max(float(res_pred.abs().max().cpu()), 1e-12)
-            re_max = max(float(res_ex.abs().max().cpu()), 1e-12)
-
-            _save_heatmap(ui, d / "true_u.png",
-                          f"true u\n{title}", "viridis", full_ext, u_min, u_max)
-            _save_heatmap(up, d / "pred_u.png",
-                          f"predicted u\n{title}", "viridis", full_ext, u_min, u_max)
-            _save_heatmap(err, d / "error.png",
-                          f"error = pred - true\n{title}", "coolwarm",
-                          full_ext, -e_max, e_max)
-            _save_heatmap(err.abs(), d / "abs_error.png",
-                          f"|error|\n{title}", "magma", full_ext, 0.0, e_max)
-            _save_heatmap(res_pred, d / "pred_residual.png",
-                          f"pred flux residual\n{title}", "coolwarm",
-                          resid_ext, -rp_max, rp_max)
-            _save_heatmap(res_ex, d / "exact_residual.png",
-                          f"exact flux residual\n{title}", "coolwarm",
-                          resid_ext, -re_max, re_max)
-            # combined 2x3
-            err_panel = up - ui
-            _save_panel(ui, up, err_panel, err_panel.abs(), res_pred,
-                        res_ex, d / "combined_panel.png",
-                        title, full_ext, resid_ext)
-
-        _write_csv(rows, out / "eval_metrics.csv")
-        print(f"saved evaluation: {out}")
 
 
 # ===========================================================================
@@ -970,8 +915,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--plot", action="store_true",
                    help="Save prediction panel figures")
     p.add_argument("--plot-dir", default="results/figures")
-    p.add_argument("--eval-output-dir", default="",
-                   help="Detailed per-sample evaluation output dir")
 
     return p.parse_args()
 
@@ -1019,7 +962,6 @@ def main() -> None:
         pred_args.predict_save = ""
         pred_args.plot = True
         pred_args.plot_dir = str(figure_dir)
-        pred_args.eval_output_dir = ""
         pred_args.predict_N = None
         pred_args.test_seed = 1234
         run_prediction(pred_args)

@@ -440,6 +440,7 @@ def train(args: argparse.Namespace) -> nn.Module:
     print(f"steps/epoch={steps_per_epoch}  total_steps={total_steps}")
 
     # ---- training loop ----
+    history: list[dict] = []
     step = 0
     for epoch in range(args.epochs):
         model.train()
@@ -497,16 +498,37 @@ def train(args: argparse.Namespace) -> nn.Module:
                 f"resLinf={val_m['resLinf']:.4e}  "
                 f"gradRelL2={val_m['gradRelL2']:.4e}"
             )
+            history.append({
+                "epoch": epoch, "step": step,
+                "lr": float(scheduler.get_last_lr()[0]),
+                "loss": float(loss),
+                "train_resRMSE": train_res_rmse,
+                "val_relL2": val_m["relL2"],
+                "val_resRMSE": val_m["resRMSE"],
+                "val_linf": val_m["linf"],
+                "val_gradRelL2": val_m["gradRelL2"],
+            })
 
     # ---- save final ----
     if save_path:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
+        sp = Path(save_path)
+        sp.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             "model_state_dict": model.state_dict(),
             "input_stats": vars(stats),
             "args": vars(args),
-        }, save_path)
-        print(f"saved checkpoint: {save_path}")
+        }, sp)
+        print(f"saved checkpoint: {sp}")
+
+        # training history CSV
+        hist_path = sp.with_suffix(".csv")
+        _write_csv(history, hist_path)
+        print(f"saved training history: {hist_path}")
+
+        # convergence plot
+        plot_path = sp.with_suffix(".png")
+        _save_convergence_plot(history, plot_path, oracle_floor)
+        print(f"saved convergence plot: {plot_path}")
 
     return model
 
@@ -709,6 +731,47 @@ def _save_panel(u_exact: torch.Tensor, u_pred: torch.Tensor,
 
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_convergence_plot(history: list[dict], path: Path,
+                           oracle_floor: float = 0.0):
+    """Save a 2-panel convergence plot: loss + validation metrics vs epoch."""
+    if len(history) < 2:
+        return
+    plt = _get_plt()
+
+    epochs = [h["epoch"] for h in history]
+    loss = [h["loss"] for h in history]
+    train_res = [h["train_resRMSE"] for h in history]
+    val_relL2 = [h["val_relL2"] for h in history]
+    val_res = [h["val_resRMSE"] for h in history]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+    fig.suptitle("Training convergence")
+
+    # left panel: training loss + residual
+    ax1b = ax1.twinx()
+    l1, = ax1.plot(epochs, loss, "b-", label="PDE loss (train)")
+    l2, = ax1b.plot(epochs, train_res, "r--", label="train resRMSE")
+    ax1.set_xlabel("epoch"); ax1.set_ylabel("loss"); ax1b.set_ylabel("resRMSE")
+    ax1.set_title("Training loss")
+    ax1.legend(handles=[l1, l2], loc="upper right")
+    ax1.grid(True, alpha=0.3)
+
+    # right panel: validation metrics
+    ax2b = ax2.twinx()
+    l3, = ax2.plot(epochs, val_relL2, "g-", label="val relL2")
+    l4, = ax2b.plot(epochs, val_res, "m--", label="val resRMSE")
+    if oracle_floor > 0:
+        ax2b.axhline(oracle_floor, color="gray", ls=":", label=f"oracle floor ({oracle_floor:.4f})")
+    ax2.set_xlabel("epoch"); ax2.set_ylabel("relL2"); ax2b.set_ylabel("resRMSE")
+    ax2.set_title("Validation metrics")
+    ax2.legend(handles=[l3, l4], loc="upper right")
+    ax2.grid(True, alpha=0.3)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(path), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 

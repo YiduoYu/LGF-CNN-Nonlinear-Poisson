@@ -5,16 +5,13 @@ Same PDE as Baseline.py:
     -div(u^k grad u) = f,  a(u) = u^k,  u = g on boundary
     Manufactured solution: u = sin(pi*x)*cos(pi*y),  k = 2
 
-Uses the SAME fixed grid as Baseline.py for training — the grid points
-are extracted from make_grid(N) and used as collocation points every epoch.
-No random sampling, so both methods see identical training data.
-
-Difference from Baseline.py:
-    PINN:  MLP + autodiff derivatives + penalty BC
-    CNN:   U-Net + finite differences + hard BC enforcement
+Uses the SAME fixed grid as Baseline.py for training + Adam + L-BFGS
+fine-tuning (per Raissi et al. 2017). High bc_weight (default 50) to
+prevent boundary condition underfitting.
 
 Recommended:
     python PINN.py --N 32 --epochs 5000
+    python PINN.py --N 32 --epochs 5000 --bc-weight 100  # stronger BC
 """
 
 import argparse
@@ -271,10 +268,58 @@ def train(args: argparse.Namespace):
                 "bmax": vm["bmax"],
             })
 
-    # restore best
+    # restore best Adam state
     if best_state is not None:
         model.load_state_dict(best_state)
-        print(f"restored best model (val relL2={best_relL2:.4e})")
+        print(f"best Adam model (val relL2={best_relL2:.4e})")
+
+    # ---- L-BFGS fine-tuning ----
+    if args.lbfgs_epochs > 0:
+        print(f"\nL-BFGS fine-tuning ({args.lbfgs_epochs} steps)...")
+        optimizer_lbfgs = torch.optim.LBFGS(
+            model.parameters(),
+            lr=0.5,
+            max_iter=20,
+            max_eval=25,
+            history_size=50,
+            line_search_fn="strong_wolfe",
+        )
+
+        def lbfgs_closure():
+            optimizer_lbfgs.zero_grad()
+            loss_total, _, _ = pinn_loss(
+                model, x_int, y_int, x_bnd, y_bnd, args.bc_weight,
+            )
+            loss_total.backward()
+            return loss_total
+
+        for i in range(args.lbfgs_epochs):
+            model.train()
+            loss_lbfgs = optimizer_lbfgs.step(lbfgs_closure)
+            model.eval()
+
+            if (i + 1) % 20 == 0 or i == 0 or i == args.lbfgs_epochs - 1:
+                vm, _ = _eval_grid(model, x_grid, y_grid, boundary, interior,
+                                   h, f_grid, k_grid, g_grid)
+                elapsed = time.time() - t0
+                print(f"  lbfgs {i+1:4d}  loss={float(loss_lbfgs):.3e}  "
+                      f"relL2={vm['relL2']:.3e}  resRMSE={vm['resRMSE']:.3e}  "
+                      f"bmax={vm['bmax']:.3e}  {elapsed:.0f}s")
+
+                if vm["relL2"] < best_relL2:
+                    best_relL2 = vm["relL2"]
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    history.append({
+                        "epoch": f"lbfgs_{i+1}",
+                        "loss_pde": 0, "loss_bc": 0,
+                        "relL2": vm["relL2"],
+                        "resRMSE": vm["resRMSE"],
+                        "bmax": vm["bmax"],
+                    })
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+            print(f"best overall model (val relL2={best_relL2:.4e})")
 
     return model, history
 
@@ -361,12 +406,15 @@ def parse_args():
     # training
     p.add_argument("--epochs", type=int, default=5000)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--bc-weight", type=float, default=1.0,
-                   help="Boundary loss weight")
+    p.add_argument("--bc-weight", type=float, default=50.0,
+                   help="Boundary loss weight (higher = stronger BC enforcement)")
     p.add_argument("--eval-every", type=int, default=500)
     # model
     p.add_argument("--hidden-dim", type=int, default=64)
     p.add_argument("--n-layers", type=int, default=4)
+    # L-BFGS
+    p.add_argument("--lbfgs-epochs", type=int, default=100,
+                   help="L-BFGS fine-tuning steps (0 to skip)")
     # system
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=1234)

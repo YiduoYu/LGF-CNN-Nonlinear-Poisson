@@ -958,7 +958,7 @@ def main() -> None:
 
         pred_args = argparse.Namespace(**vars(args))
         pred_args.load_path = str(pred_ckpt)
-        pred_args.predict_samples = 4
+        pred_args.predict_samples = 1
         pred_args.predict_save = ""
         pred_args.plot = True
         pred_args.plot_dir = str(figure_dir)

@@ -905,25 +905,30 @@ def main() -> None:
         args.demo = True
 
     if args.demo:
-        print("=" * 60)
-        print("  Demo: train → predict pipeline")
-        print("=" * 60)
-
         checkpoint = Path("checkpoints/demo.pt")
         best_checkpoint = Path("checkpoints/demo_best.pt")
         figure_dir = Path("results/demo_figures")
 
-        # --- train ---
-        train_args = argparse.Namespace(**vars(args))
-        train_args.N = 32
-        train_args.train_samples = 2048
-        train_args.val_samples = 128
-        train_args.epochs = 40
-        train_args.batch_size = 16
-        train_args.eval_batch_size = 0
-        train_args.eval_every = 1
-        train_args.save_path = str(checkpoint)
-        train(train_args)
+        # --- train (skip if checkpoint exists) ---
+        if checkpoint.exists():
+            print("=" * 60)
+            print("  Checkpoint found — skipping training.")
+            print(f"  Delete {checkpoint} to force retraining.")
+            print("=" * 60)
+        else:
+            print("=" * 60)
+            print("  Demo: train → predict pipeline")
+            print("=" * 60)
+            train_args = argparse.Namespace(**vars(args))
+            train_args.N = 32
+            train_args.train_samples = 2048
+            train_args.val_samples = 128
+            train_args.epochs = 40
+            train_args.batch_size = 16
+            train_args.eval_batch_size = 0
+            train_args.eval_every = 1
+            train_args.save_path = str(checkpoint)
+            train(train_args)
 
         # --- predict ---
         pred_ckpt = best_checkpoint if best_checkpoint.exists() else checkpoint

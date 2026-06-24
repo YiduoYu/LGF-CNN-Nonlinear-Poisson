@@ -312,9 +312,9 @@ def _get_plt():
     return plt
 
 
-def _save_panel(u_true, u_pred, error, abs_error, res_pred, res_exact,
+def _save_panel(u_true, u_pred, error, f_map, res_pred, res_exact,
                 path, title, full_ext, resid_ext, dpi=200):
-    """2×3 panel same layout as Baseline.py."""
+    """2×3 panel: true u | pred | error || forcing f | pred residual | exact residual."""
     plt = _get_plt()
 
     def _sym(v):
@@ -324,7 +324,6 @@ def _save_panel(u_true, u_pred, error, abs_error, res_pred, res_exact,
     u_min = min(float(u_true.min()), float(u_pred.min()))
     u_max = max(float(u_true.max()), float(u_pred.max()))
     err_lim = _sym(error)
-    abs_max = max(float(abs_error.max().cpu()), 1e-12)
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
     fig.suptitle(title)
@@ -333,7 +332,7 @@ def _save_panel(u_true, u_pred, error, abs_error, res_pred, res_exact,
         (0, 0, u_true,     "true u",                  "viridis",  full_ext,  u_min, u_max),
         (0, 1, u_pred,     "PINN prediction",          "viridis",  full_ext,  u_min, u_max),
         (0, 2, error,      "signed error",             "coolwarm", full_ext,  *err_lim),
-        (1, 0, abs_error,  "absolute error",           "magma",    full_ext,  0.0, abs_max),
+        (1, 0, f_map,      "forcing f",                "coolwarm", full_ext,  *_sym(f_map)),
         (1, 1, res_pred,   "pred PDE residual",        "coolwarm", resid_ext, *_sym(res_pred)),
         (1, 2, res_exact,  "exact PDE residual (floor)","coolwarm", resid_ext, *_sym(res_exact)),
     ]
@@ -434,7 +433,7 @@ def main():
                  f"resRMSE={metrics['resRMSE']:.3e}  "
                  f"exact_resRMSE={metrics['exact_resRMSE']:.3e}")
 
-        _save_panel(ui, up, err, err.abs(), res_pred, res_exact,
+        _save_panel(ui, up, err, data["f"][0, 0], res_pred, res_exact,
                     out / "pinn_panel.png", title, full_ext, resid_ext)
 
         # metrics CSV

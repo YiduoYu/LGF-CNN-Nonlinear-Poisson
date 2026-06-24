@@ -7,18 +7,6 @@ import torch
 import Baseline
 
 
-REQUIRED_PREDICTION_COLUMNS = {
-    "sample_id",
-    "k",
-    "relL2",
-    "rmse",
-    "mae",
-    "linf",
-    "boundary_max",
-    "pred_flux_resRMSE",
-    "exact_flux_resRMSE",
-}
-
 def _batch_and_prediction() -> tuple[dict[str, torch.Tensor | float], torch.Tensor]:
     torch.manual_seed(2026)
     batch = Baseline.build_dataset(
@@ -74,13 +62,25 @@ def test_flux_residual_panel_label_has_no_removed_terms() -> None:
     assert "selected" not in label.lower()
 
 
-def test_prediction_csv_contains_only_flux_residual_columns(tmp_path: Path) -> None:
+def test_prediction_output_pipeline_writes_requested_demo_columns(tmp_path: Path) -> None:
     batch, u_pred = _batch_and_prediction()
-    rows, *_ = Baseline._prediction_metric_rows(batch, u_pred)
-    path = tmp_path / "metrics.csv"
+    Baseline.save_prediction_outputs(
+        tmp_path / "prediction_outputs",
+        batch,
+        u_pred,
+        output_type="plot",
+    )
 
-    Baseline._write_prediction_plot_csv(rows, path)
+    with (tmp_path / "prediction_outputs" / "metrics.csv").open(newline="") as f:
+        header = next(csv.reader(f))
+    assert header == Baseline.PREDICTION_CSV_FIELDS
+    assert "exact_flux_resRMSE" in Baseline.EVALUATION_ONLY_METRIC_FIELDS
+    assert (tmp_path / "prediction_outputs" / "sample_000_panel.png").exists()
 
-    with path.open(newline="") as f:
-        header = set(next(csv.reader(f)))
-    assert REQUIRED_PREDICTION_COLUMNS.issubset(header)
+
+def test_oracle_floor_flag_keeps_residual_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(Baseline.sys, "argv", ["Baseline.py", "--check-oracle-floor"])
+    assert Baseline.parse_args().check_oracle_floor is True
+
+    monkeypatch.setattr(Baseline.sys, "argv", ["Baseline.py", "--check-residual"])
+    assert Baseline.parse_args().check_oracle_floor is True

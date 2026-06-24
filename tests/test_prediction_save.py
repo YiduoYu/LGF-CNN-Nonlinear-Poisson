@@ -58,3 +58,4 @@ def test_predict_save_writes_minimal_payload(tmp_path: Path) -> None:
     assert "u_pred" in payload
     assert "u_transform" not in payload
     assert set(payload["metrics"]) == {"cnn"}
+    assert {"relL2", "exact_flux_resRMSE"}.issubset(payload["evaluation_only_metrics"])

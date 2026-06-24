@@ -1116,6 +1116,7 @@ def _save_prediction_payload(
         }
         np_payload["h"] = np.array(float(batch["h"]))  # type: ignore[arg-type]
         np_payload["prediction_config"] = np.array(json.dumps(prediction_metadata))
+        np_payload["evaluation_only_metrics"] = np.array(json.dumps(sorted(EVALUATION_ONLY_METRIC_FIELDS)))
         np.savez(save_path, **np_payload)
     else:
         torch_payload = {
@@ -1124,6 +1125,7 @@ def _save_prediction_payload(
         }
         torch_payload["h"] = float(batch["h"])  # type: ignore[arg-type]
         torch_payload["metrics"] = {name: vars(value) for name, value in metrics.items()}
+        torch_payload["evaluation_only_metrics"] = sorted(EVALUATION_ONLY_METRIC_FIELDS)
         torch_payload["prediction_config"] = prediction_metadata
         torch_payload["args"] = args_metadata
         torch.save(torch_payload, save_path)
@@ -1133,19 +1135,13 @@ def _save_prediction_payload(
 PredictionMetricValue = float | int | str
 
 PREDICTION_CSV_FIELDS = [
-    "sample_id",
-    "k",
-    "relL2",
-    "rmse",
-    "mae",
-    "linf",
-    "boundary_max",
-    "pred_flux_resRMSE",
-    "exact_flux_resRMSE",
+    "sample_id", "k", "relL2", "rmse", "mae", "linf",
+    "boundary_max", "pred_flux_resRMSE", "exact_flux_resRMSE",
 ]
 
-EVAL_CSV_FIELDS = list(PREDICTION_CSV_FIELDS)
-PLOT_METRIC_FIELDS = list(PREDICTION_CSV_FIELDS)
+# u_exact-dependent metrics are evaluation-only reporting fields. The training
+# objective remains the flux residual on u_pred.
+EVALUATION_ONLY_METRIC_FIELDS = {"relL2", "rmse", "mae", "linf", "boundary_max", "exact_flux_resRMSE"}
 
 
 def _per_sample_rmse(values: torch.Tensor) -> torch.Tensor:
@@ -1204,18 +1200,10 @@ def _prediction_eval_rows(
     return rows
 
 
-def _write_prediction_eval_csv(rows: list[dict[str, PredictionMetricValue]], path: Path) -> None:
+def _write_prediction_csv(rows: list[dict[str, PredictionMetricValue]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=EVAL_CSV_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def _write_prediction_plot_csv(rows: list[dict[str, PredictionMetricValue]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=PLOT_METRIC_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=PREDICTION_CSV_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -1407,16 +1395,20 @@ def _flux_residual_panel_label() -> str:
     return "flux PDE residual"
 
 
-def save_prediction_evaluation_outputs(
-    output_dir: str | Path,
+@dataclass
+class PredictionOutputBundle:
+    rows: list[dict[str, PredictionMetricValue]]
+    u_exact: torch.Tensor
+    error: torch.Tensor
+    abs_error: torch.Tensor
+    pred_flux_residual: torch.Tensor
+    exact_flux_residual: torch.Tensor
+
+
+def _build_prediction_output_bundle(
     batch: dict[str, torch.Tensor | float],
     u_pred: torch.Tensor,
-    prediction_config: PredictionConfig,
-    show_plots: bool = False,
-) -> None:
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
+) -> PredictionOutputBundle:
     with torch.no_grad():
         u_exact = batch["u_exact"]  # type: ignore[assignment]
         error = u_pred - u_exact
@@ -1425,40 +1417,83 @@ def save_prediction_evaluation_outputs(
             batch,
             u_pred,
         )
+    return PredictionOutputBundle(
+        rows=rows,
+        u_exact=u_exact,
+        error=error,
+        abs_error=abs_error,
+        pred_flux_residual=pred_flux_residual,
+        exact_flux_residual=exact_flux_residual,
+    )
 
-    csv_path = output_path / "eval_metrics_per_sample.csv"
-    _write_prediction_eval_csv(rows, csv_path)
 
-    plt = _load_matplotlib_pyplot(show_plots=show_plots)
+def save_prediction_outputs(
+    output_dir: str | Path,
+    batch: dict[str, torch.Tensor | float],
+    u_pred: torch.Tensor,
+    *,
+    output_type: str,
+    prediction_config: PredictionConfig | None = None,
+    show_plots: bool = False,
+    output_bundle: PredictionOutputBundle | None = None,
+) -> PredictionOutputBundle:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    bundle = output_bundle or _build_prediction_output_bundle(batch, u_pred)
+    is_evaluation = output_type == "evaluation"
     h = float(batch["h"])  # type: ignore[arg-type]
+    f = batch["f"]  # type: ignore[assignment]
     full_extent = [-1.0, 1.0, -1.0, 1.0]
     residual_extent = [-1.0 + h, 1.0 - h, -1.0 + h, 1.0 - h]
 
-    for sample_id, row in enumerate(rows):
-        sample_dir = output_path / f"sample_{sample_id:04d}"
-        sample_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_path / ("eval_metrics_per_sample.csv" if is_evaluation else "metrics.csv")
+    _write_prediction_csv(bundle.rows, metrics_path)
+    plt = _load_matplotlib_pyplot(show_plots=show_plots)
 
-        u_exact_i = u_exact[sample_id, 0].detach()
-        u_pred_i = u_pred[sample_id, 0].detach()
-        error_i = error[sample_id, 0].detach()
-        abs_error_i = abs_error[sample_id, 0].detach()
-        pred_residual_i = pred_flux_residual[sample_id, 0].detach()
-        exact_residual_i = exact_flux_residual[sample_id, 0].detach()
+    for sample_index, row in enumerate(bundle.rows):
+        sample_id = int(row["sample_id"])
+        u_exact_i = bundle.u_exact[sample_index, 0].detach()
+        u_pred_i = u_pred[sample_index, 0].detach()
+        error_i = bundle.error[sample_index, 0].detach()
+        abs_error_i = bundle.abs_error[sample_index, 0].detach()
+        pred_residual_i = bundle.pred_flux_residual[sample_index, 0].detach()
+        exact_residual_i = bundle.exact_flux_residual[sample_index, 0].detach()
 
         u_vmin = min(float(u_exact_i.min().cpu()), float(u_pred_i.min().cpu()))
         u_vmax = max(float(u_exact_i.max().cpu()), float(u_pred_i.max().cpu()))
         u_limits = _nondegenerate_limits(u_vmin, u_vmax)
         error_limits = _symmetric_limits(error_i)
         abs_error_max = max(float(abs_error_i.max().cpu()), 1e-12)
+
+        if not is_evaluation:
+            figure_path = output_path / f"sample_{sample_id:03d}_panel.png"
+            _save_prediction_panel(
+                plt,
+                figure_path,
+                _prediction_panel_title(row),
+                u_exact_i,
+                u_pred_i,
+                error_i,
+                abs_error_i,
+                pred_residual_i,
+                f[sample_index, 0].detach(),
+                full_extent,
+                residual_extent,
+                show_plots,
+            )
+            continue
+
+        sample_dir = output_path / f"sample_{sample_id:04d}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
         pred_res_limits = _symmetric_limits(pred_residual_i)
         exact_res_limits = _symmetric_limits(exact_residual_i)
-        metrics_title = _eval_figure_title(sample_id, prediction_config.N, row)
+        metrics_title = _eval_figure_title(sample_id, prediction_config.N, row)  # type: ignore[union-attr]
 
         _save_heatmap_figure(
             plt,
             u_exact_i,
             sample_dir / "true_u.png",
-            f"true u\n{metrics_title}",
+            f"true u (evaluation only)\n{metrics_title}",
             "viridis",
             full_extent,
             u_limits[0],
@@ -1478,7 +1513,7 @@ def save_prediction_evaluation_outputs(
             plt,
             error_i,
             sample_dir / "error_heatmap.png",
-            f"error = u_pred - u_exact\n{metrics_title}",
+            f"evaluation-only error = u_pred - u_exact\n{metrics_title}",
             "coolwarm",
             full_extent,
             error_limits[0],
@@ -1488,7 +1523,7 @@ def save_prediction_evaluation_outputs(
             plt,
             abs_error_i,
             sample_dir / "abs_error_heatmap.png",
-            f"absolute error\n{metrics_title}",
+            f"evaluation-only absolute error\n{metrics_title}",
             "magma",
             full_extent,
             0.0,
@@ -1523,14 +1558,13 @@ def save_prediction_evaluation_outputs(
             exact_res_limits,
         )
 
-    print(f"saved evaluation metrics: {csv_path}")
-    print(f"saved evaluation figures: {output_path}")
-
-
-def _prediction_plot_rows(
-    eval_rows: list[dict[str, PredictionMetricValue]],
-) -> list[dict[str, PredictionMetricValue]]:
-    return [dict(row) for row in eval_rows]
+    if is_evaluation:
+        print(f"saved evaluation metrics: {metrics_path}")
+        print(f"saved evaluation figures: {output_path}")
+    else:
+        print(f"saved prediction plot metrics: {metrics_path}")
+        print(f"saved prediction panels: {output_path}")
+    return bundle
 
 
 def _save_prediction_panel(
@@ -1592,55 +1626,6 @@ def _prediction_panel_title(row: dict[str, PredictionMetricValue]) -> str:
     )
 
 
-def save_prediction_plot_outputs(
-    plot_dir: str | Path,
-    batch: dict[str, torch.Tensor | float],
-    u_pred: torch.Tensor,
-    show_plots: bool = False,
-) -> None:
-    output_path = Path(plot_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    with torch.no_grad():
-        u_exact = batch["u_exact"]  # type: ignore[assignment]
-        error = u_pred - u_exact
-        abs_error = error.abs()
-        eval_rows, pred_flux_residual, _ = _prediction_metric_rows(
-            batch,
-            u_pred,
-        )
-        plot_rows = _prediction_plot_rows(eval_rows)
-
-    metrics_path = output_path / "metrics.csv"
-    _write_prediction_plot_csv(plot_rows, metrics_path)
-
-    plt = _load_matplotlib_pyplot(show_plots=show_plots)
-    h = float(batch["h"])  # type: ignore[arg-type]
-    full_extent = [-1.0, 1.0, -1.0, 1.0]
-    residual_extent = [-1.0 + h, 1.0 - h, -1.0 + h, 1.0 - h]
-    f = batch["f"]  # type: ignore[assignment]
-
-    for sample_id in range(u_pred.shape[0]):
-        figure_path = output_path / f"sample_{sample_id:03d}_panel.png"
-        _save_prediction_panel(
-            plt,
-            figure_path,
-            _prediction_panel_title(plot_rows[sample_id]),
-            u_exact[sample_id, 0].detach(),
-            u_pred[sample_id, 0].detach(),
-            error[sample_id, 0].detach(),
-            abs_error[sample_id, 0].detach(),
-            pred_flux_residual[sample_id, 0].detach(),
-            f[sample_id, 0].detach(),
-            full_extent,
-            residual_extent,
-            show_plots,
-        )
-
-    print(f"saved prediction plot metrics: {metrics_path}")
-    print(f"saved prediction panels: {output_path}")
-
-
 def run_prediction(args: argparse.Namespace) -> None:
     if not args.load_path:
         raise ValueError("--predict-manufactured requires --load-path")
@@ -1678,22 +1663,27 @@ def run_prediction(args: argparse.Namespace) -> None:
     for name, metric in metrics.items():
         print(format_eval_metrics(f"predict {name}", metric))
 
+    prediction_output_bundle = None
     eval_output_dir = getattr(args, "eval_output_dir", None)
     if eval_output_dir:
-        save_prediction_evaluation_outputs(
+        prediction_output_bundle = save_prediction_outputs(
             eval_output_dir,
             batch,
             u_pred,
-            prediction_config,
+            output_type="evaluation",
+            prediction_config=prediction_config,
             show_plots=getattr(args, "show_plots", False),
+            output_bundle=prediction_output_bundle,
         )
 
     if getattr(args, "plot_predictions", False):
-        save_prediction_plot_outputs(
+        prediction_output_bundle = save_prediction_outputs(
             getattr(args, "plot_dir", "results/figures"),
             batch,
             u_pred,
+            output_type="plot",
             show_plots=getattr(args, "show_plots", False),
+            output_bundle=prediction_output_bundle,
         )
 
     if args.predict_save:
@@ -1756,7 +1746,7 @@ def run_demo(args: argparse.Namespace) -> None:
     print(f"demo metrics saved: {figure_dir / 'metrics.csv'}")
 
 
-def run_residual_check(args: argparse.Namespace) -> None:
+def run_oracle_floor_check(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = select_device(args.device)
     k_range = (args.k_min, args.k_max)
@@ -1826,9 +1816,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--test-seed", type=int, default=1234)
     parser.add_argument(
-        "--check-residual",
+        "--check-oracle-floor",
+        dest="check_oracle_floor",
         action="store_true",
         help="Print the continuous manufactured oracle residual floor.",
+    )
+    parser.add_argument(
+        "--check-residual",
+        dest="check_oracle_floor",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--train-after-check", action="store_true")
     return parser.parse_args()
@@ -1842,8 +1839,8 @@ def main() -> None:
     if args.demo:
         run_demo(args)
         return
-    if args.check_residual:
-        run_residual_check(args)
+    if args.check_oracle_floor:
+        run_oracle_floor_check(args)
         if not args.train_after_check:
             return
     if args.predict_manufactured:

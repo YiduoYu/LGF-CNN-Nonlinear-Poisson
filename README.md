@@ -32,7 +32,7 @@ python3 Baseline.py --demo
 Check the manufactured oracle residual floor:
 
 ```bash
-python3 Baseline.py --check-residual --N 32 --device cpu
+python3 Baseline.py --check-oracle-floor --N 32 --device cpu
 ```
 
 Train a small baseline:
@@ -100,8 +100,9 @@ stencil with shared face fluxes:
 R_flux(u_pred) = -div_h(u_pred^k grad_h u_pred) - f
 ```
 
-Prediction and plotting reuse the same checkpoint loader and manufactured test
-data path as normal prediction. For each sample, the code computes:
+Prediction and plotting reuse the same checkpoint loader, manufactured test
+data path, and shared prediction output pipeline. For each sample, the code
+computes these evaluation-only reported metrics:
 
 - `error = u_pred - u_exact`
 - `abs_error = |u_pred - u_exact|`

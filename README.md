@@ -29,16 +29,16 @@ or explicitly:
 python3 Baseline.py --demo
 ```
 
-Check the manufactured oracle residual floor:
-
-```bash
-python3 Baseline.py --check-oracle-floor --N 32 --device cpu
-```
-
-Train a small baseline:
+Train with custom settings:
 
 ```bash
 python3 Baseline.py --N 32 --epochs 200 --batch-size 8 --save-path checkpoints/unet_n32.pt
+```
+
+Predict from a saved checkpoint:
+
+```bash
+python3 Baseline.py --load-path checkpoints/unet_n32.pt --predict --plot
 ```
 
 ## Residual Training Method
@@ -78,12 +78,7 @@ It saves:
 - Demo panels: `results/demo_figures/sample_000_panel.png` through `sample_003_panel.png`
 
 Each panel contains true solution, CNN prediction, signed error, absolute
-error, the flux PDE residual, and the forcing term `f`. Use `--show-plots` if
-you also want Matplotlib to display the figures interactively after saving
-them.
-
-The committed demo results in this branch were generated with the demo code in
-this branch.
+error, the flux PDE residual, and the forcing term `f`.
 
 ## Implementation Method
 

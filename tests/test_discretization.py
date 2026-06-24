@@ -1,55 +1,59 @@
+"""Tests for the core PDE discretization (grid, manufactured solution, flux residual)."""
+
 import torch
 
 import Baseline
 
 
-def test_manufactured_u_uses_pi_scaled_trig_formula() -> None:
+def test_u_exact_formula() -> None:
+    """u_exact(x,y) = sin(pi*x) * cos(pi*y)."""
     x, y, *_ = Baseline.make_grid(4, dtype=torch.float64)
-
     expected = torch.sin(torch.pi * x) * torch.cos(torch.pi * y)
+    assert torch.allclose(Baseline.u_exact(x, y), expected)
 
-    assert torch.allclose(Baseline.manufactured_u(x, y), expected)
 
-
-def test_manufactured_problem_uses_continuous_rhs() -> None:
-    problem = Baseline.sample_manufactured_problem(
-        N=10,
-        device=torch.device("cpu"),
-        dtype=torch.float64,
+def test_pde_residual_on_exact_solution() -> None:
+    """PDE residual of the exact solution ≈ truncation error (small but >0)."""
+    data = Baseline.generate_dataset(N=10, n_samples=1,
+                                     device=torch.device("cpu"))
+    res = Baseline.pde_residual(
+        data["u_exact"], data["f"], data["k"], data["h"],
     )
-
-    res = Baseline.compute_pde_residual(
-        problem["u_exact"],  # type: ignore[arg-type]
-        problem["f"],  # type: ignore[arg-type]
-        problem["k"],  # type: ignore[arg-type]
-        problem["h"],  # type: ignore[arg-type]
-    )
-
     assert torch.isfinite(res).all()
-    assert float(res.pow(2).mean().sqrt()) > 0.0
+    rmse = float(res.pow(2).mean().sqrt())
+    assert 0.0 < rmse < 0.1, f"unexpected truncation error: {rmse:.2e}"
 
 
-def test_compute_pde_residual_is_flux_wrapper() -> None:
-    torch.manual_seed(123)
-    u = torch.rand((2, 1, 7, 7), dtype=torch.float64) + 1.0
-    f = torch.randn((2, 1, 7, 7), dtype=torch.float64)
-    k = torch.tensor([0.5, 1.7], dtype=torch.float64)
-    h = 0.25
-
-    wrapped = Baseline.compute_pde_residual(u, f, k, h)
-    direct = Baseline.nonlinear_poisson_residual(u, f, k, h)
-
-    assert torch.allclose(wrapped, direct, atol=0.0, rtol=0.0)
-
-
-def test_flux_minus_divergence_is_residual_plus_rhs() -> None:
+def test_flux_divergence_equals_residual_plus_forcing() -> None:
+    """By definition: pde_residual = flux_divergence - f_interior."""
     torch.manual_seed(456)
-    u = torch.rand((2, 1, 7, 7), dtype=torch.float64) + 1.0
-    f = torch.randn((2, 1, 7, 7), dtype=torch.float64)
-    k = torch.tensor([0.8, 1.2], dtype=torch.float64)
+    u = torch.rand(2, 1, 7, 7, dtype=torch.float64) + 1.0
+    f = torch.randn(2, 1, 7, 7, dtype=torch.float64)
+    k = torch.tensor([[0.8], [1.2]], dtype=torch.float64)
     h = 0.25
 
-    minus_div = Baseline.flux_minus_divergence(u, k, h)
-    residual = Baseline.compute_pde_residual(u, f, k, h)
+    div = Baseline.flux_divergence(u, k, h)
+    res = Baseline.pde_residual(u, f, k, h)
 
-    assert torch.allclose(residual, minus_div - f[:, :, 1:-1, 1:-1])
+    assert torch.allclose(res, div - f[:, :, 1:-1, 1:-1])
+
+
+def test_dirichlet_enforcement() -> None:
+    """Boundary values are exactly enforced after enforce_dirichlet."""
+    x, y, boundary, interior, h = Baseline.make_grid(8)
+    u_raw = torch.rand(1, 1, 10, 10)  # random prediction
+    g = boundary * torch.sin(torch.pi * x)  # arbitrary boundary values
+
+    u_out = Baseline.enforce_dirichlet(u_raw, g, boundary)
+    # boundary error should be exactly zero
+    bmax = float(((u_out - g) * boundary).abs().max())
+    assert bmax == 0.0, f"boundary not exactly enforced: {bmax:.2e}"
+
+
+def test_power_coefficient_integer_k() -> None:
+    """a(u) = u^2 for k=2 (no clamp needed for positive u)."""
+    u = torch.tensor([[[[0.5, 2.0]]]], dtype=torch.float64)
+    k = torch.tensor([[2.0]], dtype=torch.float64)
+    a = Baseline.power_coefficient(u, k)
+    expected = u ** 2
+    assert torch.allclose(a, expected)

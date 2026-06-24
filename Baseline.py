@@ -668,10 +668,14 @@ def _save_heatmap(values: torch.Tensor, path: Path, title: str,
 
 def _save_panel(u_exact: torch.Tensor, u_pred: torch.Tensor,
                 error: torch.Tensor, abs_error: torch.Tensor,
-                residual: torch.Tensor, f_map: torch.Tensor,
+                residual_pred: torch.Tensor, residual_exact: torch.Tensor,
                 path: Path, title: str,
                 full_ext: list, resid_ext: list, dpi: int = 200):
-    """Save a 2×3 comparison panel: true, pred, error, |error|, residual, f."""
+    """Save a 2×3 comparison panel.
+
+    Row 1: true u | CNN prediction | signed error
+    Row 2: |error| | pred PDE residual | exact PDE residual (oracle floor)
+    """
     plt = _get_plt()
 
     def _sym_lim(v):
@@ -682,19 +686,19 @@ def _save_panel(u_exact: torch.Tensor, u_pred: torch.Tensor,
     u_max = max(float(u_exact.max()), float(u_pred.max()))
     err_lim = _sym_lim(error)
     abs_max = max(float(abs_error.max().cpu()), 1e-12)
-    res_lim = _sym_lim(residual)
-    f_lim = _sym_lim(f_map)
+    pred_res_lim = _sym_lim(residual_pred)
+    exact_res_lim = _sym_lim(residual_exact)
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
     fig.suptitle(title)
 
     panels = [
-        (0, 0, u_exact,   "true u",            "viridis",   full_ext,  u_min, u_max),
-        (0, 1, u_pred,    "CNN prediction",     "viridis",   full_ext,  u_min, u_max),
-        (0, 2, error,     "signed error",       "coolwarm",  full_ext,  *err_lim),
-        (1, 0, abs_error, "absolute error",     "magma",     full_ext,  0.0, abs_max),
-        (1, 1, residual,  "flux PDE residual",  "coolwarm",  resid_ext, *res_lim),
-        (1, 2, f_map,     "forcing f",          "coolwarm",  full_ext,  *f_lim),
+        (0, 0, u_exact,        "true u",                  "viridis",   full_ext,  u_min, u_max),
+        (0, 1, u_pred,         "CNN prediction",           "viridis",   full_ext,  u_min, u_max),
+        (0, 2, error,          "signed error",             "coolwarm",  full_ext,  *err_lim),
+        (1, 0, abs_error,      "absolute error",           "magma",     full_ext,  0.0, abs_max),
+        (1, 1, residual_pred,  "pred PDE residual",        "coolwarm",  resid_ext, *pred_res_lim),
+        (1, 2, residual_exact, "exact PDE residual (floor)","coolwarm",  resid_ext, *exact_res_lim),
     ]
     for r, c, vals, lbl, cmap, ext, v0, v1 in panels:
         ax = axes[r][c]
@@ -722,8 +726,9 @@ def _write_csv(rows: list[dict], path: Path):
 def _panel_title(row: dict) -> str:
     return (f"sample {row['sample_id']} | k={row['k']:.4g}  "
             f"relL2={row['relL2']:.3e}  RMSE={row['RMSE']:.3e}  "
-            f"MAE={row['MAE']:.3e}  Linf={row['Linf']:.3e}  "
-            f"flux_resRMSE={row['pred_flux_resRMSE']:.3e}")
+            f"Linf={row['Linf']:.3e}  "
+            f"pred_resRMSE={row['pred_flux_resRMSE']:.3e}  "
+            f"exact_resRMSE={row['exact_flux_resRMSE']:.3e}")
 
 
 def run_prediction(args: argparse.Namespace) -> None:
@@ -782,10 +787,13 @@ def run_prediction(args: argparse.Namespace) -> None:
             ui = batch["u_exact"][i, 0]
             up = u_pred[i, 0]
             err = up - ui
-            res = pde_residual(u_pred[i:i + 1], batch["f"][i:i + 1],
-                               batch["k"][i:i + 1], h)[0, 0]
+            res_pred = pde_residual(u_pred[i:i + 1], batch["f"][i:i + 1],
+                                    batch["k"][i:i + 1], h)[0, 0]
+            res_exact = pde_residual(batch["u_exact"][i:i + 1],
+                                     batch["f"][i:i + 1],
+                                     batch["k"][i:i + 1], h)[0, 0]
 
-            _save_panel(ui, up, err, err.abs(), res, batch["f"][i, 0],
+            _save_panel(ui, up, err, err.abs(), res_pred, res_exact,
                         out / f"sample_{sid:03d}_panel.png",
                         _panel_title(row), full_ext, resid_ext)
         _write_csv(rows, out / "metrics.csv")
@@ -840,7 +848,7 @@ def run_prediction(args: argparse.Namespace) -> None:
             # combined 2x3
             err_panel = up - ui
             _save_panel(ui, up, err_panel, err_panel.abs(), res_pred,
-                        batch["f"][i, 0], d / "combined_panel.png",
+                        res_ex, d / "combined_panel.png",
                         title, full_ext, resid_ext)
 
         _write_csv(rows, out / "eval_metrics.csv")

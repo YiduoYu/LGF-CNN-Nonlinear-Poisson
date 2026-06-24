@@ -92,7 +92,10 @@ def build_input_tensor(
     k_mean: float | None = None,
     k_std: float | None = None,
 ) -> torch.Tensor:
-    """Build the six-channel input [f, boundary g, mask, k, x, y]."""
+    """Build the six-channel input [f, boundary g, mask, k, x, y].
+
+    Interior u_exact values are intentionally excluded from the CNN input.
+    """
 
     B, _, H, W = f.shape
 
@@ -149,6 +152,8 @@ def power_coefficient(
     """Compute a(u) = u^k, with a small clamp as a numerical guard."""
 
     k = _k_to_broadcast(k, u)
+    if torch.allclose(k, k.round(), atol=1e-6, rtol=0.0):
+        return torch.pow(u, k)
     return torch.pow(torch.clamp(u, min=eps), k)
 
 
@@ -399,110 +404,65 @@ class UNet2d(nn.Module):
 def manufactured_u(
     x: torch.Tensor,
     y: torch.Tensor,
-    params: dict[str, torch.Tensor],
+    params: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """A positive solution family with nontrivial boundary values."""
+    """Deterministic manufactured solution."""
 
-    phi = (1.0 - x * x) * (1.0 - y * y)
-    boundary_part = (
-        params["c0"] + params["c1"] * x + params["c2"] * y + params["c3"] * x * y
-    )
-    base_part = (
-        params["a1"] * torch.sin(math.pi * x) * torch.sin(math.pi * y)
-        + params["a2"] * torch.cos(2.0 * math.pi * x) * torch.cos(math.pi * y)
-    )
-    return boundary_part + phi * base_part
+    return torch.sin(math.pi * x) * torch.cos(math.pi * y)
 
 
 def continuous_rhs_from_params(
     x: torch.Tensor,
     y: torch.Tensor,
     k: torch.Tensor,
-    params: dict[str, torch.Tensor],
+    params: dict[str, torch.Tensor] | None = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Compute f = -div(a(u) grad u) with analytic derivatives of manufactured_u."""
 
     pi = math.pi
-    sin_px = torch.sin(pi * x)
-    cos_px = torch.cos(pi * x)
-    sin_py = torch.sin(pi * y)
-    cos_py = torch.cos(pi * y)
-    sin_2px = torch.sin(2.0 * pi * x)
-    cos_2px = torch.cos(2.0 * pi * x)
-
-    one_minus_x2 = 1.0 - x * x
-    one_minus_y2 = 1.0 - y * y
-    phi = one_minus_x2 * one_minus_y2
-    phi_x = -2.0 * x * one_minus_y2
-    phi_y = -2.0 * y * one_minus_x2
-    phi_xx = -2.0 * one_minus_y2
-    phi_yy = -2.0 * one_minus_x2
-
-    b = params["c0"] + params["c1"] * x + params["c2"] * y + params["c3"] * x * y
-    b_x = params["c1"] + params["c3"] * y
-    b_y = params["c2"] + params["c3"] * x
-
-    s = params["a1"] * sin_px * sin_py + params["a2"] * cos_2px * cos_py
-    s_x = params["a1"] * pi * cos_px * sin_py - 2.0 * pi * params["a2"] * sin_2px * cos_py
-    s_y = params["a1"] * pi * sin_px * cos_py - pi * params["a2"] * cos_2px * sin_py
-    s_xx = -params["a1"] * pi * pi * sin_px * sin_py - 4.0 * pi * pi * params["a2"] * cos_2px * cos_py
-    s_yy = -params["a1"] * pi * pi * sin_px * sin_py - pi * pi * params["a2"] * cos_2px * cos_py
-
-    u = b + phi * s
-    u_x = b_x + phi_x * s + phi * s_x
-    u_y = b_y + phi_y * s + phi * s_y
-    u_xx = phi_xx * s + 2.0 * phi_x * s_x + phi * s_xx
-    u_yy = phi_yy * s + 2.0 * phi_y * s_y + phi * s_yy
+    u = manufactured_u(x, y, params)
+    u_x = pi * torch.cos(pi * x) * torch.cos(pi * y)
+    u_y = -pi * torch.sin(pi * x) * torch.sin(pi * y)
+    u_xx = -pi * pi * u
+    u_yy = -pi * pi * u
 
     grad_sq = u_x * u_x + u_y * u_y
     k4 = _k_to_broadcast(k, u)
-    base = torch.clamp(u, min=eps)
-    dbase_du = (u > eps).to(dtype=u.dtype)
-    a = torch.pow(base, k4)
-    da_du = k4 * torch.pow(base, k4 - 1.0) * dbase_du
+    if torch.allclose(k4, k4.round(), atol=1e-6, rtol=0.0):
+        a = torch.pow(u, k4)
+        da_du = k4 * torch.pow(u, k4 - 1.0)
+    else:
+        base = torch.clamp(u, min=eps)
+        dbase_du = (u > eps).to(dtype=u.dtype)
+        a = torch.pow(base, k4)
+        da_du = k4 * torch.pow(base, k4 - 1.0) * dbase_du
     return -(da_du * grad_sq + a * (u_xx + u_yy))
-
-
-def _sample_params(device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
-    shape = (1, 1, 1, 1)
-    return {
-        "c0": torch.empty(shape, device=device, dtype=dtype).uniform_(1.2, 1.8),
-        "c1": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.15, 0.15),
-        "c2": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.15, 0.15),
-        "c3": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.10, 0.10),
-        "a1": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.20, 0.20),
-        "a2": torch.empty(shape, device=device, dtype=dtype).uniform_(-0.20, 0.20),
-    }
 
 
 def sample_manufactured_problem(
     N: int,
     device: torch.device,
-    k_range: tuple[float, float] = (0.5, 2.5),
+    k_range: tuple[float, float] = (2.0, 2.0),
     positive_only: bool = True,
     dtype: torch.dtype = torch.float32,
 ) -> dict[str, torch.Tensor | float]:
     """Return one manufactured problem instance.
 
-    The data path is LeVeque-style manufactured forcing: choose analytic
-    u_exact, sample k, and compute f = -div(u_exact^k grad u_exact) with
-    analytic derivatives. u_exact is not used by the training loss.
+    The data path is LeVeque-style manufactured forcing: use fixed analytic
+    u_exact = sin(pi x) cos(pi y), fixed k = 2, and compute
+    f = -div(u_exact^k grad u_exact) with analytic derivatives. u_exact is not
+    used by the training loss.
     """
 
     x0, y0, boundary_mask, interior_mask, h = make_grid(N, device=device, dtype=dtype)
     x = x0.clone().detach()
     y = y0.clone().detach()
 
-    params = _sample_params(device, dtype)
+    params: dict[str, torch.Tensor] | None = None
     u_exact = manufactured_u(x, y, params)
-    if positive_only:
-        margin = 0.2 - u_exact.detach().min()
-        if margin.item() > 0:
-            params["c0"] = params["c0"] + margin
-            u_exact = manufactured_u(x, y, params)
 
-    k = torch.empty((1,), device=device, dtype=dtype).uniform_(k_range[0], k_range[1])
+    k = torch.full((1,), 2.0, device=device, dtype=dtype)
     f = continuous_rhs_from_params(x, y, k, params)
 
     u_exact = u_exact.detach()
@@ -583,12 +543,13 @@ def compute_input_stats(
     k_range: tuple[float, float],
 ) -> InputStats:
     f = data["f"]  # type: ignore[assignment]
+    k = data["k"]  # type: ignore[assignment]
     fi = f[:, :, 1:-1, 1:-1]
     return InputStats(
         f_mean=float(fi.mean()),
         f_std=float(fi.std().clamp_min(1e-8)),
-        k_mean=0.5 * (k_range[0] + k_range[1]),
-        k_std=max((k_range[1] - k_range[0]) / math.sqrt(12.0), 1e-8),
+        k_mean=float(k.mean()),
+        k_std=float(k.std(unbiased=False).clamp_min(1e-8)),
     )
 
 
@@ -837,7 +798,8 @@ def add_path_suffix(path: Path, suffix: str) -> Path:
 
 
 def apply_positive_interior_default(args: argparse.Namespace) -> None:
-    args.positive_interior = True
+    if not hasattr(args, "positive_interior"):
+        args.positive_interior = False
 
 
 def train(args: argparse.Namespace) -> nn.Module:
@@ -1022,8 +984,8 @@ def load_model_from_checkpoint(
             k_std=float(stats_dict["k_std"]),
         )
     else:
-        k_min = float(getattr(checkpoint_args, "k_min", 0.5))
-        k_max = float(getattr(checkpoint_args, "k_max", 2.5))
+        k_min = float(getattr(checkpoint_args, "k_min", 2.0))
+        k_max = float(getattr(checkpoint_args, "k_max", 2.0))
         stats = InputStats(
             f_mean=0.0,
             f_std=1.0,
@@ -1056,7 +1018,7 @@ def resolve_checkpoint_model_config(checkpoint_args: argparse.Namespace) -> argp
     model_config = argparse.Namespace(
         base_ch=int(getattr(checkpoint_args, "base_ch", 32)),
         normalize_k=getattr(checkpoint_args, "normalize_k", True),
-        positive_interior=True,
+        positive_interior=getattr(checkpoint_args, "positive_interior", False),
     )
     apply_positive_interior_default(model_config)
     return model_config
@@ -1067,8 +1029,8 @@ def resolve_prediction_config(
     checkpoint_args: argparse.Namespace,
 ) -> PredictionConfig:
     N = int(getattr(checkpoint_args, "N", 32))
-    k_min = float(getattr(checkpoint_args, "k_min", 0.5))
-    k_max = float(getattr(checkpoint_args, "k_max", 2.5))
+    k_min = float(getattr(checkpoint_args, "k_min", 2.0))
+    k_max = float(getattr(checkpoint_args, "k_max", 2.0))
 
     if getattr(runtime_args, "predict_N", None) is not None:
         N = int(runtime_args.predict_N)
@@ -1137,6 +1099,7 @@ PredictionMetricValue = float | int | str
 PREDICTION_CSV_FIELDS = [
     "sample_id", "k", "relL2", "rmse", "mae", "linf",
     "boundary_max", "pred_flux_resRMSE", "exact_flux_resRMSE",
+    "f_mean", "f_std", "f_min", "f_max", "f_rmse",
 ]
 
 # u_exact-dependent metrics are evaluation-only reporting fields. The training
@@ -1152,6 +1115,16 @@ def _per_sample_rel_l2(diff: torch.Tensor, ref: torch.Tensor, eps: float = 1e-12
     num = torch.linalg.vector_norm(diff, dim=1)
     den = torch.linalg.vector_norm(ref, dim=1).clamp_min(eps)
     return num / den
+
+
+def _write_tensor_csv(values: torch.Tensor, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    values = values.detach().cpu()
+    if values.ndim != 2:
+        raise ValueError("Only 2D tensors can be written as grid CSV files.")
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerows(values.tolist())
 
 
 def _prediction_eval_rows(
@@ -1173,6 +1146,7 @@ def _prediction_eval_rows(
     boundary_error = (error.abs() * boundary_mask).flatten(start_dim=1)
     pred_res_flat = pred_flux_residual.flatten(start_dim=1)
     exact_res_flat = exact_flux_residual.flatten(start_dim=1)
+    f_flat = batch["f"].flatten(start_dim=1)  # type: ignore[union-attr]
 
     rel_l2 = _per_sample_rel_l2(interior_error, interior_exact)
     rmse = _per_sample_rmse(interior_error)
@@ -1181,6 +1155,11 @@ def _prediction_eval_rows(
     boundary_max = boundary_error.amax(dim=1)
     pred_res_rmse = _per_sample_rmse(pred_res_flat)
     exact_res_rmse = _per_sample_rmse(exact_res_flat)
+    f_mean = f_flat.mean(dim=1)
+    f_std = f_flat.std(dim=1, unbiased=False)
+    f_min = f_flat.amin(dim=1)
+    f_max = f_flat.amax(dim=1)
+    f_rmse = _per_sample_rmse(f_flat)
 
     rows: list[dict[str, PredictionMetricValue]] = []
     for sample_id in range(u_pred.shape[0]):
@@ -1195,6 +1174,11 @@ def _prediction_eval_rows(
                 "boundary_max": float(boundary_max[sample_id].detach().cpu()),
                 "pred_flux_resRMSE": float(pred_res_rmse[sample_id].detach().cpu()),
                 "exact_flux_resRMSE": float(exact_res_rmse[sample_id].detach().cpu()),
+                "f_mean": float(f_mean[sample_id].detach().cpu()),
+                "f_std": float(f_std[sample_id].detach().cpu()),
+                "f_min": float(f_min[sample_id].detach().cpu()),
+                "f_max": float(f_max[sample_id].detach().cpu()),
+                "f_rmse": float(f_rmse[sample_id].detach().cpu()),
             }
         )
     return rows
@@ -1245,6 +1229,7 @@ def _eval_figure_title(
 ) -> str:
     return (
         f"sample {sample_id} | N={N} k={float(row['k']):.4g} "
+        f"f_rmse={float(row['f_rmse']):.3e} "
         f"relL2={float(row['relL2']):.3e} "
         f"RMSE={float(row['rmse']):.3e} "
         f"Linf={float(row['linf']):.3e} "
@@ -1467,6 +1452,7 @@ def save_prediction_outputs(
 
         if not is_evaluation:
             figure_path = output_path / f"sample_{sample_id:03d}_panel.png"
+            _write_tensor_csv(f[sample_index, 0], output_path / f"sample_{sample_id:03d}_f.csv")
             _save_prediction_panel(
                 plt,
                 figure_path,
@@ -1485,6 +1471,7 @@ def save_prediction_outputs(
 
         sample_dir = output_path / f"sample_{sample_id:04d}"
         sample_dir.mkdir(parents=True, exist_ok=True)
+        _write_tensor_csv(f[sample_index, 0], sample_dir / "forcing_f.csv")
         pred_res_limits = _symmetric_limits(pred_residual_i)
         exact_res_limits = _symmetric_limits(exact_residual_i)
         metrics_title = _eval_figure_title(sample_id, prediction_config.N, row)  # type: ignore[union-attr]
@@ -1618,6 +1605,7 @@ def _save_prediction_panel(
 def _prediction_panel_title(row: dict[str, PredictionMetricValue]) -> str:
     return (
         f"sample {int(row['sample_id'])} | k={float(row['k']):.4g} "
+        f"f_rmse={float(row['f_rmse']):.3e} "
         f"relL2={float(row['relL2']):.3e} "
         f"RMSE={float(row['rmse']):.3e} "
         f"MAE={float(row['mae']):.3e} "
@@ -1790,8 +1778,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batches", type=int, default=None, help="Compatibility alias for val samples.")
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--base-ch", type=int, default=32)
-    parser.add_argument("--k-min", type=float, default=0.5)
-    parser.add_argument("--k-max", type=float, default=2.5)
+    parser.add_argument("--k-min", type=float, default=2.0)
+    parser.add_argument("--k-max", type=float, default=2.0)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)

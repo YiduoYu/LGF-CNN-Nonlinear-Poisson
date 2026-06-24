@@ -74,8 +74,27 @@ def test_prediction_output_pipeline_writes_requested_demo_columns(tmp_path: Path
     with (tmp_path / "prediction_outputs" / "metrics.csv").open(newline="") as f:
         header = next(csv.reader(f))
     assert header == Baseline.PREDICTION_CSV_FIELDS
+    assert "f_rmse" in header
     assert "exact_flux_resRMSE" in Baseline.EVALUATION_ONLY_METRIC_FIELDS
     assert (tmp_path / "prediction_outputs" / "sample_000_panel.png").exists()
+    assert (tmp_path / "prediction_outputs" / "sample_000_f.csv").exists()
+
+
+def test_prediction_panel_title_places_f_rmse_after_k() -> None:
+    row = {
+        "sample_id": 0,
+        "k": 2.0,
+        "f_rmse": 0.12345,
+        "relL2": 0.01,
+        "rmse": 0.02,
+        "mae": 0.03,
+        "linf": 0.04,
+        "pred_flux_resRMSE": 0.05,
+    }
+
+    title = Baseline._prediction_panel_title(row)
+
+    assert "k=2 f_rmse=1.235e-01" in title
 
 
 def test_oracle_floor_flag_keeps_residual_alias(monkeypatch: pytest.MonkeyPatch) -> None:

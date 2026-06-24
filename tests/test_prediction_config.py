@@ -132,7 +132,7 @@ def test_model_config_comes_from_checkpoint() -> None:
 
     assert config.base_ch == 5
     assert config.normalize_k is False
-    assert config.positive_interior is True
+    assert config.positive_interior is False
 
 
 def test_test_seed_reproduces_prediction_dataset(tmp_path: Path) -> None:
@@ -144,14 +144,12 @@ def test_test_seed_reproduces_prediction_dataset(tmp_path: Path) -> None:
     assert first["prediction_config"]["test_seed"] == 444
 
 
-def test_different_test_seeds_change_prediction_dataset(tmp_path: Path) -> None:
+def test_different_test_seeds_keep_prediction_dataset_deterministic(tmp_path: Path) -> None:
     first = _run_prediction_payload(tmp_path, test_seed=444)
     second = _run_prediction_payload(tmp_path, test_seed=445)
 
-    assert not torch.equal(first["k"], second["k"]) or not torch.equal(
-        first["u_exact"],
-        second["u_exact"],
-    )
+    for key in ["f", "g", "k", "u_exact"]:
+        assert torch.equal(first[key], second[key])
 
 
 def test_legacy_checkpoint_missing_newer_prediction_fields_loads(tmp_path: Path) -> None:

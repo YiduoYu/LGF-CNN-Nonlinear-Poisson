@@ -49,8 +49,8 @@ Recommended run:
 python3 Baseline.py --N 32 --epochs 200
 ```
 
-The data is manufactured continuously: choose analytic `u_exact(x,y)`, sample
-`k`, and compute `f = -div(u_exact^k grad u_exact)` with analytic derivatives.
+The data is manufactured continuously: use fixed `u_exact(x,y)=sin(pi*x)cos(pi*y)`
+and `k=2`, then compute `f = -div(u_exact^k grad u_exact)` with analytic derivatives.
 The training objective is only the normalized conservative flux residual:
 
 ```text

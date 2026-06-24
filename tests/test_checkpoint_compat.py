@@ -40,7 +40,7 @@ class CheckpointCompatibilityTest(unittest.TestCase):
 
         self.assertFalse(model.training)
         self.assertEqual(stats, Baseline.InputStats(1.0, 2.0, 3.0, 4.0))
-        self.assertTrue(args.positive_interior)
+        self.assertFalse(args.positive_interior)
 
     def test_loads_dict_stats_checkpoint(self) -> None:
         path = self._write_checkpoint(
@@ -62,7 +62,7 @@ class CheckpointCompatibilityTest(unittest.TestCase):
         _, stats, args = Baseline.load_model_from_checkpoint(path, torch.device("cpu"))
 
         self.assertEqual(stats, Baseline.InputStats(0.5, 1.5, 2.5, 3.5))
-        self.assertTrue(args.positive_interior)
+        self.assertFalse(args.positive_interior)
 
 
 if __name__ == "__main__":

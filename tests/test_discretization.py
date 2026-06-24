@@ -3,6 +3,14 @@ import torch
 import Baseline
 
 
+def test_manufactured_u_uses_pi_scaled_trig_formula() -> None:
+    x, y, *_ = Baseline.make_grid(4, dtype=torch.float64)
+
+    expected = torch.sin(torch.pi * x) * torch.cos(torch.pi * y)
+
+    assert torch.allclose(Baseline.manufactured_u(x, y), expected)
+
+
 def test_manufactured_problem_uses_continuous_rhs() -> None:
     problem = Baseline.sample_manufactured_problem(
         N=10,

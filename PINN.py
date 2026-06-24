@@ -90,20 +90,22 @@ class MLP(nn.Module):
 # 3. Grid-point extraction (same grid as CNN baseline)
 # ===========================================================================
 
-def get_grid_points(x: torch.Tensor, y: torch.Tensor,
-                    interior: torch.Tensor, boundary: torch.Tensor):
-    """Extract interior and boundary points from the same grid CNN uses.
+def sample_points(n_int: int, n_bnd: int, device: torch.device):
+    """Sample random collocation points each epoch (standard PINN).
 
-    Returns (x_int, y_int, x_bnd, y_bnd) as [N,1] tensors.
-    These are fixed — no random sampling, so both methods see identical data.
+    Interior: uniform in [-1,1]^2. Boundary: equal split among 4 edges.
     """
-    mask_int = interior.bool()
-    mask_bnd = boundary.bool()
+    # interior
+    x_int = torch.rand(n_int, 1, device=device) * 2.0 - 1.0
+    y_int = torch.rand(n_int, 1, device=device) * 2.0 - 1.0
 
-    x_int = x[mask_int].reshape(-1, 1)
-    y_int = y[mask_int].reshape(-1, 1)
-    x_bnd = x[mask_bnd].reshape(-1, 1)
-    y_bnd = y[mask_bnd].reshape(-1, 1)
+    # boundary — equal split among 4 edges
+    n_edge = max(n_bnd // 4, 1)
+    t = torch.rand(n_edge, 1, device=device) * 2.0 - 1.0
+    one = torch.ones(n_edge, 1, device=device)
+
+    x_bnd = torch.cat([t, t, -one, one], dim=0)
+    y_bnd = torch.cat([-one, one, t, t], dim=0)
 
     return x_int, y_int, x_bnd, y_bnd
 
@@ -212,18 +214,15 @@ def train(args: argparse.Namespace):
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
     )
 
-    # ---- fixed grid: identical to CNN baseline's training grid ----
+    # ---- evaluation grid (same as CNN for fair metric comparison) ----
     x_grid, y_grid, boundary, interior, h = make_grid(args.N, device)
     k_grid = torch.full((1, 1), 2.0, device=device)
     f_grid = forcing(x_grid, y_grid).detach()
     g_grid = boundary * u_exact(x_grid, y_grid)
 
-    # extract collocation points from the grid (NOT random sampling)
-    x_int, y_int, x_bnd, y_bnd = get_grid_points(x_grid, y_grid, interior, boundary)
-
     print(f"device={device}  N={args.N}  epochs={args.epochs}  "
-          f"grid_points: interior={x_int.shape[0]}  boundary={x_bnd.shape[0]}  "
-          f"(same grid as CNN baseline)")
+          f"collocation: interior={args.n_int}  boundary={args.n_bnd}  "
+          f"bc_weight={args.bc_weight}")
     print(f"hidden_dim={args.hidden_dim}  n_layers={args.n_layers}")
     print(f"{'epoch':>6s}  {'loss_pde':>10s}  {'loss_bc':>10s}  "
           f"{'relL2':>10s}  {'resRMSE':>10s}  {'time':>8s}")
@@ -234,6 +233,11 @@ def train(args: argparse.Namespace):
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+
+        # sample fresh collocation points each epoch (standard PINN)
+        x_int, y_int, x_bnd, y_bnd = sample_points(
+            args.n_int, args.n_bnd, device,
+        )
 
         loss, loss_pde, loss_bc = pinn_loss(
             model, x_int, y_int, x_bnd, y_bnd, args.bc_weight,
@@ -402,9 +406,13 @@ def parse_args():
 
     # data
     p.add_argument("--N", type=int, default=32,
-                   help="Grid size (same as CNN baseline, N+2 points per side)")
+                   help="Evaluation grid size (same as CNN for metrics)")
     # training
     p.add_argument("--epochs", type=int, default=5000)
+    p.add_argument("--n-int", type=int, default=1024,
+                   help="Interior collocation points per epoch")
+    p.add_argument("--n-bnd", type=int, default=256,
+                   help="Boundary collocation points per epoch")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--bc-weight", type=float, default=50.0,
                    help="Boundary loss weight (higher = stronger BC enforcement)")

@@ -112,13 +112,21 @@ def enforce_dirichlet(u_raw: torch.Tensor, g: torch.Tensor,
 
 def power_coefficient(u: torch.Tensor, k: torch.Tensor,
                       eps: float = 1e-6) -> torch.Tensor:
-    """Compute a(u) = u^k with a small clamp as numerical guard."""
+    """Compute a(u) = u^k.
+
+    For integer k, u^k is well-defined for all real u (including negative),
+    so no clamp is applied. For non-integer k, a small positive clamp guards
+    against NaN gradients from negative bases.
+    """
     if not torch.is_tensor(k):
         k = torch.tensor(k, device=u.device, dtype=u.dtype)
     k = k.to(device=u.device, dtype=u.dtype)
     while k.ndim < 4:
         k = k.unsqueeze(-1)
-    return torch.pow(torch.clamp(u, min=eps), k)
+
+    if torch.allclose(k, k.round(), atol=1e-6, rtol=0.0):
+        return torch.pow(u, k)                     # integer exponent: safe
+    return torch.pow(torch.clamp(u, min=eps), k)   # fractional exponent: guard
 
 
 def flux_divergence(u: torch.Tensor, k: torch.Tensor, h: float,
@@ -530,8 +538,8 @@ def evaluate(model: nn.Module, data: dict, stats: InputStats,
         m = u_pred.shape[0]
         sums["count"] += m
         sums["relL2"] += float(
-            (err.norm(dim=(1, 2, 3))
-             / batch["u_exact"].mul(interior).norm(dim=(1, 2, 3))
+            (err.flatten(1).norm(dim=1)
+             / batch["u_exact"].mul(interior).flatten(1).norm(dim=1)
                                .clamp_min(1e-12)).sum()
         )
         sums["linf"] = max(sums["linf"], float(err.abs().max()))
@@ -548,8 +556,8 @@ def evaluate(model: nn.Module, data: dict, stats: InputStats,
         p_grad = torch.cat([du(u_pred), dv(u_pred)], dim=1)
         t_grad = torch.cat([du(batch["u_exact"]), dv(batch["u_exact"])], dim=1)
         sums["grad_sum"] += float(
-            ((p_grad - t_grad).norm(dim=(1, 2, 3))
-             / t_grad.norm(dim=(1, 2, 3)).clamp_min(1e-12)).sum()
+            ((p_grad - t_grad).flatten(1).norm(dim=1)
+             / t_grad.flatten(1).norm(dim=1).clamp_min(1e-12)).sum()
         )
 
     c = sums["count"]

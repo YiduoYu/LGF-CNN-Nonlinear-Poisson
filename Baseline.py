@@ -105,9 +105,8 @@ def _update_latest_symlink(link_dir: Path, run_id: str) -> None:
 def config_key(N: int, epochs: int, k: float, base_ch: int = 32) -> str:
     """Generate a human-readable config directory name.
 
-    Example: config_key(32, 40, 2.0) -> "N32_e40_k2_c32"
+    Example: config_key(32, 40, 2.0) -> "N32_e40_k2"
     """
-    # Format k to be filesystem-friendly
     k_str = f"k{k:.1f}".rstrip("0").rstrip(".") if k == int(k) else f"k{k:.2f}"
     key = f"N{N}_e{epochs}_{k_str}"
     if base_ch != 32:
@@ -117,11 +116,7 @@ def config_key(N: int, epochs: int, k: float, base_ch: int = 32) -> str:
 
 def resolve_paths(N: int, epochs: int, k: float, base_ch: int = 32,
                   model_type: str = "cnn") -> dict:
-    """Return a dict of resolved paths for a given config.
-
-    Keys: ckpt_dir, best_path, last_path, history_path, convergence_path,
-          run_info_path, figure_dir, results_dir, config_name
-    """
+    """Return a dict of resolved paths for a given config."""
     ckey = config_key(N, epochs, k, base_ch)
     ckpt_dir = Path("checkpoints") / model_type / ckey
     results_dir = Path("results") / model_type / ckey
@@ -698,10 +693,7 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
 # ===========================================================================
 
 def _error_tensors(u_pred: torch.Tensor, batch: dict):
-    """Compute error & residual tensors shared by evaluate and per_sample_metrics.
-
-    Returns (err, res_pred, res_exact, bnd_err_abs, interior, u_exact, h).
-    """
+    """Compute error & residual tensors shared by evaluate and per_sample_metrics."""
     ue = batch["u_exact"]
     interior = batch["interior_mask"].expand_as(u_pred)
     boundary = batch["mask"]

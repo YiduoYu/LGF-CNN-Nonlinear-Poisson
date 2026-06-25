@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -48,6 +49,160 @@ def select_device(name: str) -> torch.device:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def get_run_id() -> str:
+    """Generate a sortable, human-readable run identifier from current time."""
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _write_run_info(path: Path, info: dict) -> None:
+    """Write a human-readable run summary file.
+
+    `info` should contain keys like model, N, epochs, k, metrics dict, etc.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"Run: {info.get('run_id', 'unknown')}",
+             f"Model: {info.get('model', 'unknown')}",
+             f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
+    # key parameters
+    for k in ("N", "epochs", "train_samples", "k"):
+        if k in info:
+            lines.append(f"{k} = {info[k]}")
+    # metrics (if any)
+    metrics = info.get("metrics", {})
+    if metrics:
+        lines.append("")
+        lines.append("Metrics:")
+        for mk, mv in metrics.items():
+            lines.append(f"  {mk}: {mv}")
+    lines.append("")
+    with open(str(path), "w") as f:
+        f.write("\n".join(lines))
+
+
+def _update_latest_symlink(link_dir: Path, run_id: str) -> None:
+    """Create or update `link_dir/latest` to point to `run_id`.
+
+    Example: _update_latest_symlink(Path("checkpoints"), "20260624_143022")
+    creates checkpoints/latest -> 20260624_143022
+    """
+    link_path = link_dir / "latest"
+    link_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if link_path.is_symlink() or link_path.exists():
+            link_path.unlink()
+        link_path.symlink_to(run_id, target_is_directory=True)
+    except OSError:
+        # symlink not available (e.g. Windows without admin) — fallback to text file
+        link_path.with_suffix(".txt").write_text(run_id)
+
+
+# ===========================================================================
+# 1b. Config-key based storage
+# ===========================================================================
+
+def config_key(N: int, epochs: int, k: float, base_ch: int = 32) -> str:
+    """Generate a human-readable config directory name.
+
+    Example: config_key(32, 40, 2.0) -> "N32_e40_k2.0"
+    """
+    # Format k to be filesystem-friendly
+    k_str = f"k{k:.1f}".rstrip("0").rstrip(".") if k == int(k) else f"k{k:.2f}"
+    return f"N{N}_e{epochs}_{k_str}"
+
+
+def resolve_paths(N: int, epochs: int, k: float, base_ch: int = 32,
+                  model_type: str = "cnn") -> dict:
+    """Return a dict of resolved paths for a given config.
+
+    Keys: ckpt_dir, best_path, last_path, history_path, convergence_path,
+          run_info_path, figure_dir, results_dir, config_name
+    """
+    ckey = config_key(N, epochs, k, base_ch)
+    ckpt_dir = Path("checkpoints") / model_type / ckey
+    results_dir = Path("results") / model_type / ckey
+
+    return {
+        "ckpt_dir": ckpt_dir,
+        "best_path": ckpt_dir / "best.pt",
+        "last_path": ckpt_dir / "last.pt",
+        "history_path": ckpt_dir / "history.csv",
+        "convergence_path": ckpt_dir / "convergence.png",
+        "run_info_path": ckpt_dir / "run_info.txt",
+        "figure_dir": results_dir / "figures",
+        "results_dir": results_dir,
+        "config_name": f"{model_type}/{ckey}",
+    }
+
+
+def find_existing(ckpt_dir: Path, N: int, epochs: int) -> Path | None:
+    """Return path to best.pt if it was trained with matching config, else None."""
+    best = ckpt_dir / "best.pt"
+    if not best.exists():
+        return None
+    try:
+        ckpt = torch.load(best, map_location="cpu", weights_only=False)
+        ckpt_args = ckpt.get("args", {})
+        if isinstance(ckpt_args, argparse.Namespace):
+            ckpt_args = vars(ckpt_args)
+        if (ckpt_args.get("N") == N and ckpt_args.get("epochs") == epochs):
+            return best
+    except Exception:
+        pass
+    return None
+
+
+def update_registry(model_type: str, ckey: str, info: dict) -> None:
+    """Update checkpoints/registry.json with run metadata."""
+    import json
+    reg_path = Path("checkpoints") / "registry.json"
+    reg_path.parent.mkdir(parents=True, exist_ok=True)
+
+    registry: dict = {}
+    if reg_path.exists():
+        try:
+            registry = json.loads(reg_path.read_text())
+        except (json.JSONDecodeError, ValueError):
+            registry = {}
+
+    registry.setdefault(model_type, {})[ckey] = {
+        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        **info,
+    }
+    reg_path.write_text(json.dumps(registry, indent=2, ensure_ascii=False))
+
+
+def migrate_legacy_checkpoint(ckpt_dir: Path) -> None:
+    """Migrate root-level demo_best.pt / demo.csv to new config dir if needed.
+
+    Only runs once — if best.pt already exists in the target, do nothing.
+    """
+    best = ckpt_dir / "best.pt"
+    if best.exists():
+        return
+
+    legacy_best = Path("checkpoints") / "demo_best.pt"
+    legacy_csv = Path("checkpoints") / "demo.csv"
+    legacy_conv = Path("checkpoints") / "demo.png"
+
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    migrated = []
+
+    if legacy_best.exists():
+        legacy_best.rename(best)
+        migrated.append("demo_best.pt → best.pt")
+
+    if legacy_csv.exists():
+        legacy_csv.rename(ckpt_dir / "history.csv")
+        migrated.append("demo.csv → history.csv")
+
+    if legacy_conv.exists():
+        legacy_conv.rename(ckpt_dir / "convergence.png")
+        migrated.append("demo.png → convergence.png")
+
+    if migrated:
+        print(f"Migrated legacy files: {', '.join(migrated)}")
 
 
 # ===========================================================================
@@ -110,23 +265,31 @@ def enforce_dirichlet(u_raw: torch.Tensor, g: torch.Tensor,
 # 3. Flux-form PDE residual
 # ===========================================================================
 
-def power_coefficient(u: torch.Tensor, k: torch.Tensor,
-                      eps: float = 1e-6) -> torch.Tensor:
-    """Compute a(u) = u^k.
+K_DEFAULT = 2.0
 
-    For integer k, u^k is well-defined for all real u (including negative),
-    so no clamp is applied. For non-integer k, a small positive clamp guards
-    against NaN gradients from negative bases.
+
+def _safe_pow(u: torch.Tensor, k: torch.Tensor, eps: float = 1e-6
+              ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (u^k, k * u^{k-1}) handling integer vs fractional k.
+
+    For integer k, no clamp — safe for negative u.
+    For fractional k, clamps u > 0 to prevent NaN.
     """
-    if not torch.is_tensor(k):
-        k = torch.tensor(k, device=u.device, dtype=u.dtype)
     k = k.to(device=u.device, dtype=u.dtype)
     while k.ndim < 4:
         k = k.unsqueeze(-1)
 
     if torch.allclose(k, k.round(), atol=1e-6, rtol=0.0):
-        return torch.pow(u, k)                     # integer exponent: safe
-    return torch.pow(torch.clamp(u, min=eps), k)   # fractional exponent: guard
+        return torch.pow(u, k), k * torch.pow(u, k - 1.0)
+    return (torch.pow(torch.clamp(u, min=eps), k),
+            k * torch.pow(torch.clamp(u, min=eps), k - 1.0))
+
+
+def power_coefficient(u: torch.Tensor, k: torch.Tensor,
+                      eps: float = 1e-6) -> torch.Tensor:
+    """Compute a(u) = u^k.  See _safe_pow for integer/fractional handling."""
+    a, _ = _safe_pow(u, k, eps)
+    return a
 
 
 def flux_divergence(u: torch.Tensor, k: torch.Tensor, h: float,
@@ -302,22 +465,12 @@ def forcing(x: torch.Tensor, y: torch.Tensor, k: torch.Tensor,
     laplacian = -2.0 * pi * pi * u
     grad_sq = u_x * u_x + u_y * u_y
 
-    k = k.to(device=u.device, dtype=u.dtype)
-    while k.ndim < 4:
-        k = k.unsqueeze(-1)
-
-    if torch.allclose(k, k.round(), atol=1e-6, rtol=0.0):
-        a = torch.pow(u, k)                    # integer k: safe for all u
-        da = k * torch.pow(u, k - 1.0)
-    else:
-        a = torch.pow(torch.clamp(u, min=eps), k)      # fractional k: guard
-        da = k * torch.pow(torch.clamp(u, min=eps), k - 1.0)
-
+    a, da = _safe_pow(u, k, eps)
     return -(da * grad_sq + a * laplacian)
 
 
 def generate_dataset(N: int, n_samples: int, device: torch.device,
-                     k_val: float = 2.0):
+                     k_val: float = K_DEFAULT):
     """Return a batch of manufactured-problem instances as a dict.
 
     Keys: f, g, mask, interior_mask, x, y, k, u_exact, h.
@@ -391,7 +544,8 @@ def _forward(model: nn.Module, batch: dict, stats: InputStats,
     return enforce_dirichlet(model(inp), batch["g"], batch["mask"])
 
 
-def train(args: argparse.Namespace) -> nn.Module:
+def train(args: argparse.Namespace, best_path: Path, last_path: Path,
+          history_path: Path, convergence_path: Path) -> tuple[nn.Module, float]:
     set_seed(args.seed)
     device = select_device(args.device)
     t0 = time.time()
@@ -436,9 +590,6 @@ def train(args: argparse.Namespace) -> nn.Module:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
 
     # ---- io ----
-    save_path = Path(args.save_path) if args.save_path else None
-    best_path = (save_path.with_stem(save_path.stem + "_best")
-                 if save_path else None)
     best_val_relL2 = math.inf
     eval_bs = args.eval_batch_size or args.batch_size
 
@@ -484,7 +635,7 @@ def train(args: argparse.Namespace) -> nn.Module:
             val_m = evaluate(model, val_data, stats, eval_bs, args.normalize_k)
 
             # save best
-            if best_path and val_m["relL2"] < best_val_relL2:
+            if val_m["relL2"] < best_val_relL2:
                 best_val_relL2 = val_m["relL2"]
                 best_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save({
@@ -520,27 +671,23 @@ def train(args: argparse.Namespace) -> nn.Module:
             })
 
     # ---- save final ----
-    if save_path:
-        sp = Path(save_path)
-        sp.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "model_state_dict": model.state_dict(),
-            "input_stats": vars(stats),
-            "args": vars(args),
-        }, sp)
-        print(f"saved checkpoint: {sp}")
+    last_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "input_stats": vars(stats),
+        "args": vars(args),
+    }, last_path)
+    print(f"saved final checkpoint: {last_path}")
 
-        # training history CSV
-        hist_path = sp.with_suffix(".csv")
-        _write_csv(history, hist_path)
-        print(f"saved training history: {hist_path}")
+    # training history CSV
+    _write_csv(history, history_path)
+    print(f"saved training history: {history_path}")
 
-        # convergence plot
-        plot_path = sp.with_suffix(".png")
-        _save_convergence_plot(history, plot_path, oracle_floor)
-        print(f"saved convergence plot: {plot_path}")
+    # convergence plot
+    _save_convergence_plot(history, convergence_path, oracle_floor)
+    print(f"saved convergence plot: {convergence_path}")
 
-    return model
+    return model, oracle_floor
 
 
 # ===========================================================================
@@ -870,10 +1017,6 @@ def run_prediction(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
 
-    # modes
-    p.add_argument("--demo", action="store_true",
-                   help="Run a complete train→predict demo")
-
     # data
     p.add_argument("--N", type=int, default=32, help="Interior grid size")
     p.add_argument("--train-samples", type=int, default=2048)
@@ -898,7 +1041,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=1234)
 
     # io
-    p.add_argument("--save-path", default="")
+    p.add_argument("--save-path", default="",
+                   help="Deprecated: paths are auto-generated from config")
+    p.add_argument("--retrain", action="store_true",
+                   help="Force retraining even if a matching checkpoint exists")
     p.add_argument("--load-path", default="")
 
     # prediction
@@ -926,57 +1072,97 @@ def main() -> None:
     if len(sys.argv) == 1:
         args.demo = True
 
+    # ── Resolve config and paths ──
+    model_type = "cnn"
+
     if args.demo:
-        checkpoint = Path("checkpoints/demo.pt")
-        best_checkpoint = Path("checkpoints/demo_best.pt")
-        figure_dir = Path("results/demo_figures")
+        args.N = 32
+        args.epochs = 40
+        args.train_samples = 2048
+        args.val_samples = 128
+        args.batch_size = 16
+        args.eval_batch_size = 0
+        args.eval_every = 1
 
-        # --- train (skip if checkpoint exists) ---
-        if checkpoint.exists():
-            print("=" * 60)
-            print("  Checkpoint found — skipping training.")
-            print(f"  Delete {checkpoint} to force retraining.")
-            print("=" * 60)
-        else:
-            print("=" * 60)
-            print("  Demo: train → predict pipeline")
-            print("=" * 60)
-            train_args = argparse.Namespace(**vars(args))
-            train_args.N = 32
-            train_args.train_samples = 2048
-            train_args.val_samples = 128
-            train_args.epochs = 40
-            train_args.batch_size = 16
-            train_args.eval_batch_size = 0
-            train_args.eval_every = 1
-            train_args.save_path = str(checkpoint)
-            train(train_args)
+    paths = resolve_paths(args.N, args.epochs, K_DEFAULT,
+                          args.base_ch, model_type)
 
-        # --- predict ---
-        pred_ckpt = best_checkpoint if best_checkpoint.exists() else checkpoint
+    # ── Migrate legacy files on first run ──
+    migrate_legacy_checkpoint(paths["ckpt_dir"])
+
+    # ── Check for existing trained model ──
+    existing = find_existing(paths["ckpt_dir"], args.N, args.epochs)
+
+    ckey = config_key(args.N, args.epochs, K_DEFAULT, args.base_ch)
+
+    if existing and not args.retrain:
+        print("=" * 60)
+        print(f"  Config:  {paths['config_name']}")
+        print(f"  ✓ Found trained model: {existing}")
+        print(f"  Skipping training. Use --retrain to force retraining.")
+        print("=" * 60)
+        # Still update registry with existing run info
+        update_registry(model_type, ckey, {
+            "N": args.N, "epochs": args.epochs, "k": K_DEFAULT,
+        })
+    else:
+        if args.retrain and existing:
+            print(f"⟳ Retraining requested for {paths['config_name']}")
+
+        print("=" * 60)
+        print(f"  Config:  {paths['config_name']}")
+        print(f"  Output:  {paths['ckpt_dir']}")
+        print("=" * 60)
+
+        train_args = argparse.Namespace(**vars(args))
+        model, oracle_floor = train(
+            train_args,
+            paths["best_path"],
+            paths["last_path"],
+            paths["history_path"],
+            paths["convergence_path"],
+        )
+        existing = paths["best_path"]
+
+        # ── Update registry ──
+        update_registry(model_type, ckey, {
+            "N": args.N,
+            "epochs": args.epochs,
+            "k": K_DEFAULT,
+            "oracle_floor": oracle_floor,
+        })
+
+    # ── Predict ──
+    if args.demo or args.plot or args.predict:
+        pred_ckpt = existing if existing else paths["best_path"]
         print(f"\nPredicting from: {pred_ckpt}")
 
         pred_args = argparse.Namespace(**vars(args))
         pred_args.load_path = str(pred_ckpt)
-        pred_args.predict_samples = 1
+        pred_args.predict_samples = 1 if args.demo else args.predict_samples
         pred_args.predict_save = ""
         pred_args.plot = True
-        pred_args.plot_dir = str(figure_dir)
+        pred_args.plot_dir = str(paths["figure_dir"])
         pred_args.predict_N = None
-        pred_args.test_seed = 1234
+        pred_args.test_seed = args.seed
         run_prediction(pred_args)
 
-        print(f"\nDone. Checkpoint: {checkpoint}")
-        print(f"Best checkpoint: {best_checkpoint}")
-        print(f"Figures: {figure_dir}")
-        return
+    # ── Run summary ──
+    run_params = {
+        "run_id": get_run_id(), "model": "U-Net (Baseline)",
+        "N": args.N, "epochs": args.epochs,
+        "train_samples": args.train_samples,
+        "k": K_DEFAULT,
+    }
+    _write_run_info(paths["run_info_path"], run_params)
+    _update_latest_symlink(Path("checkpoints") / model_type, ckey)
+    _update_latest_symlink(Path("results") / model_type, ckey)
 
-    # predict mode
-    if args.predict or args.load_path:
-        return run_prediction(args)
-
-    # train mode
-    train(args)
+    print(f"\nDone. Config: {paths['config_name']}")
+    print(f"Checkpoints: {paths['ckpt_dir']}")
+    print(f"Figures:     {paths['figure_dir']}")
+    print(f"Latest:      checkpoints/{model_type}/latest -> {ckey}")
+    return
 
 
 if __name__ == "__main__":

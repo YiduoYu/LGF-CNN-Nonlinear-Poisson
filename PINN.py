@@ -1,72 +1,179 @@
 """
 PINN solver for nonlinear Poisson equation.
 
+Follows Raissi et al. (2017) design:
+  - MLP with Tanh, Xavier init, input normalised to [-1,1]
+  - Adam + L-BFGS fine-tuning
+  - PDE residual via autodiff (strong form)
+  - Boundary conditions via penalty (soft constraint)
+
 Same PDE as Baseline.py:
     -div(u^k grad u) = f,  a(u) = u^k,  u = g on boundary
     Manufactured solution: u = sin(pi*x)*cos(pi*y),  k = 2
-
-Uses the SAME fixed grid as Baseline.py for training + Adam + L-BFGS
-fine-tuning (per Raissi et al. 2017). High bc_weight (default 50) to
-prevent boundary condition underfitting.
 
 Recommended:
     python PINN.py --N 32 --epochs 5000
     python PINN.py --N 32 --epochs 5000 --bc-weight 100  # stronger BC
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
+import json
 import math
 import os
-import random
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-# Shared with Baseline.py for fair metric comparison
+# Minimal shared utilities for fair metric comparison
 from Baseline import (
     set_seed, select_device, make_grid,
     pde_residual as fd_residual,
 )
 
+K_DEFAULT = 2.0
+
+
 # ===========================================================================
-# 1. Manufactured solution (scalar version for PINN collocation points)
+# 0. Utilities
+# ===========================================================================
+
+def get_run_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _write_run_info(path: Path, info: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"Run: {info.get('run_id', 'unknown')}",
+             f"Model: {info.get('model', 'unknown')}",
+             f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
+    for k in ("N", "epochs", "hidden_dim", "n_layers", "lr", "bc_weight", "k"):
+        if k in info:
+            lines.append(f"{k} = {info[k]}")
+    metrics = info.get("metrics", {})
+    if metrics:
+        lines.append("")
+        lines.append("Metrics:")
+        for mk, mv in metrics.items():
+            lines.append(f"  {mk}: {mv}")
+    lines.append("")
+    with open(str(path), "w") as f:
+        f.write("\n".join(lines))
+
+
+def _update_latest_symlink(link_dir: Path, run_id: str) -> None:
+    link_path = link_dir / "latest"
+    link_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if link_path.is_symlink() or link_path.exists():
+            link_path.unlink()
+        link_path.symlink_to(run_id, target_is_directory=True)
+    except OSError:
+        link_path.with_suffix(".txt").write_text(run_id)
+
+
+def _get_plt():
+    cache = Path(tempfile.gettempdir())
+    os.environ.setdefault("MPLCONFIGDIR", str(cache / "matplotlib"))
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
+
+
+# ===========================================================================
+# 0b. Config-key storage
+# ===========================================================================
+
+def config_key(N: int, epochs: int, hidden_dim: int, n_layers: int,
+               bc_weight: float) -> str:
+    bc_str = f"bc{bc_weight:.0f}" if bc_weight == int(bc_weight) else f"bc{bc_weight:.1f}"
+    return f"N{N}_e{epochs}_h{hidden_dim}_l{n_layers}_{bc_str}"
+
+
+def resolve_paths(N: int, epochs: int, hidden_dim: int, n_layers: int,
+                  bc_weight: float, model_type: str = "pinn") -> dict:
+    ckey = config_key(N, epochs, hidden_dim, n_layers, bc_weight)
+    ckpt_dir = Path("checkpoints") / model_type / ckey
+    results_dir = Path("results") / model_type / ckey
+    return {
+        "ckpt_dir": ckpt_dir,
+        "best_path": ckpt_dir / "best.pt",
+        "last_path": ckpt_dir / "last.pt",
+        "history_path": ckpt_dir / "history.csv",
+        "run_info_path": ckpt_dir / "run_info.txt",
+        "figure_dir": results_dir / "figures",
+        "results_dir": results_dir,
+        "config_name": f"{model_type}/{ckey}",
+    }
+
+
+def find_existing(ckpt_dir: Path, N: int, epochs: int) -> Path | None:
+    best = ckpt_dir / "best.pt"
+    if not best.exists():
+        return None
+    try:
+        ckpt = torch.load(best, map_location="cpu", weights_only=False)
+        ckpt_args = ckpt.get("args", {})
+        if isinstance(ckpt_args, argparse.Namespace):
+            ckpt_args = vars(ckpt_args)
+        if ckpt_args.get("N") == N and ckpt_args.get("epochs") == epochs:
+            return best
+    except Exception:
+        pass
+    return None
+
+
+def update_registry(model_type: str, ckey: str, info: dict) -> None:
+    reg_path = Path("checkpoints") / "registry.json"
+    reg_path.parent.mkdir(parents=True, exist_ok=True)
+    registry: dict = {}
+    if reg_path.exists():
+        try:
+            registry = json.loads(reg_path.read_text())
+        except (json.JSONDecodeError, ValueError):
+            registry = {}
+    registry.setdefault(model_type, {})[ckey] = {
+        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        **info,
+    }
+    reg_path.write_text(json.dumps(registry, indent=2, ensure_ascii=False))
+
+
+# ===========================================================================
+# 1. Manufactured solution
 # ===========================================================================
 
 def u_exact(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """u(x,y) = sin(pi*x) * cos(pi*y) — scalar (N,1) version."""
+    """u(x,y) = sin(pi*x) * cos(pi*y)."""
     return torch.sin(math.pi * x) * torch.cos(math.pi * y)
 
 
 def forcing(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Analytic f = -div(u^2 grad u) for u = sin(pi*x)*cos(pi*y).
-
-    f = -(2*u*|grad u|^2 + u^2 * laplacian_u)
-      = 2*pi^2 * sin(pi*x)*cos(pi*y) * (cos^2(pi*x)*cos^2(pi*y) + sin^2(pi*x)*sin^2(pi*y))
-        + 2*pi^2 * sin^2(pi*x)*cos^2(pi*y) * sin(pi*x)*cos(pi*y)
-    """
+    """Analytic f = -div(u^2 grad u) for u = sin(pi*x)*cos(pi*y)."""
     pi = math.pi
     u = u_exact(x, y)
     u_x = pi * torch.cos(pi * x) * torch.cos(pi * y)
     u_y = -pi * torch.sin(pi * x) * torch.sin(pi * y)
     laplacian = -2.0 * pi * pi * u
     grad_sq = u_x * u_x + u_y * u_y
-
     # a(u) = u^2,  a'(u) = 2u
-    # -div(u^2 grad u) = -(a'(u)*|grad u|^2 + a(u)*laplacian)
     return -(2.0 * u * grad_sq + u * u * laplacian)
 
 
 # ===========================================================================
-# 2. MLP model
+# 2. MLP model  (Raissi-style: Tanh, Xavier init)
 # ===========================================================================
 
 class MLP(nn.Module):
-    """Fully-connected network for PINN: (x,y) -> u(x,y)."""
+    """Fully-connected network: (x,y) -> u(x,y)."""
     def __init__(self, hidden_dim: int = 64, n_layers: int = 4):
         super().__init__()
         layers = [nn.Linear(2, hidden_dim), nn.Tanh()]
@@ -87,7 +194,7 @@ class MLP(nn.Module):
 
 
 # ===========================================================================
-# 3. Grid-point extraction (same grid as CNN baseline)
+# 3. Collocation point sampling
 # ===========================================================================
 
 def sample_points(n_int: int, n_bnd: int, device: torch.device):
@@ -95,11 +202,9 @@ def sample_points(n_int: int, n_bnd: int, device: torch.device):
 
     Interior: uniform in [-1,1]^2. Boundary: equal split among 4 edges.
     """
-    # interior
     x_int = torch.rand(n_int, 1, device=device) * 2.0 - 1.0
     y_int = torch.rand(n_int, 1, device=device) * 2.0 - 1.0
 
-    # boundary — equal split among 4 edges
     n_edge = max(n_bnd // 4, 1)
     t = torch.rand(n_edge, 1, device=device) * 2.0 - 1.0
     one = torch.ones(n_edge, 1, device=device)
@@ -120,9 +225,6 @@ def pinn_loss(model: nn.Module,
               bc_weight: float = 1.0):
     """Compute physics-informed loss.
 
-    PDE residual:  R = -div(u^2 grad u) - f   (autodiff, strong form)
-    Boundary:      (u - g)^2                  (penalty)
-
     Returns (total_loss, pde_loss, bc_loss) — all scalars.
     """
     # ---- PDE residual on interior ----
@@ -132,15 +234,12 @@ def pinn_loss(model: nn.Module,
     u = model(x, y)
     ones = torch.ones_like(u)
 
-    # first derivatives
     u_x = torch.autograd.grad(u, x, grad_outputs=ones, create_graph=True)[0]
     u_y = torch.autograd.grad(u, y, grad_outputs=ones, create_graph=True)[0]
 
-    # second derivatives
     u_xx = torch.autograd.grad(u_x, x, grad_outputs=ones, create_graph=True)[0]
     u_yy = torch.autograd.grad(u_y, y, grad_outputs=ones, create_graph=True)[0]
 
-    # strong form: -div(u^2 grad u) = -(2u*(u_x^2+u_y^2) + u^2*(u_xx+u_yy))
     laplacian = u_xx + u_yy
     grad_sq = u_x * u_x + u_y * u_y
     residual = -(2.0 * u * grad_sq + u * u * laplacian) - forcing(x, y)
@@ -156,16 +255,11 @@ def pinn_loss(model: nn.Module,
 
 
 # ===========================================================================
-# 5. Grid evaluation helper (shared by training and final eval)
+# 5. Grid evaluation  (shared by training and final eval)
 # ===========================================================================
 
 @torch.no_grad()
 def _eval_grid(model, x, y, boundary, interior, h, f, k, g, need_gradient=False):
-    """Evaluate PINN on a pre-computed grid. Returns (metrics_dict, u_pred).
-
-    Called both during training (need_gradient=False) and at final
-    evaluation (need_gradient=True for gradRelL2).
-    """
     xp = x.reshape(-1, 1)
     yp = y.reshape(-1, 1)
     u_pred_flat = model(xp, yp)
@@ -200,10 +294,11 @@ def _eval_grid(model, x, y, boundary, interior, h, f, k, g, need_gradient=False)
 
 
 # ===========================================================================
-# 6. Training
+# 6. Training  (Adam + L-BFGS, per Raissi et al. 2017)
 # ===========================================================================
 
-def train(args: argparse.Namespace):
+def train(args: argparse.Namespace, best_path: Path, last_path: Path,
+          history_path: Path) -> tuple[nn.Module, list[dict], float]:
     set_seed(args.seed)
     device = select_device(args.device)
     t0 = time.time()
@@ -216,7 +311,7 @@ def train(args: argparse.Namespace):
 
     # ---- evaluation grid (same as CNN for fair metric comparison) ----
     x_grid, y_grid, boundary, interior, h = make_grid(args.N, device)
-    k_grid = torch.full((1, 1), 2.0, device=device)
+    k_grid = torch.full((1, 1), K_DEFAULT, device=device)
     f_grid = forcing(x_grid, y_grid).detach()
     g_grid = boundary * u_exact(x_grid, y_grid)
 
@@ -234,7 +329,6 @@ def train(args: argparse.Namespace):
     for epoch in range(1, args.epochs + 1):
         model.train()
 
-        # sample fresh collocation points each epoch (standard PINN)
         x_int, y_int, x_bnd, y_bnd = sample_points(
             args.n_int, args.n_bnd, device,
         )
@@ -258,6 +352,13 @@ def train(args: argparse.Namespace):
             if relL2 < best_relL2:
                 best_relL2 = relL2
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                best_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({
+                    "model_state_dict": best_state,
+                    "args": vars(args),
+                    "epoch": epoch,
+                    "best_val_relL2": best_relL2,
+                }, best_path)
 
             elapsed = time.time() - t0
             print(f"{epoch:6d}  {float(loss_pde):10.3e}  {float(loss_bc):10.3e}  "
@@ -313,6 +414,12 @@ def train(args: argparse.Namespace):
                 if vm["relL2"] < best_relL2:
                     best_relL2 = vm["relL2"]
                     best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    best_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save({
+                        "model_state_dict": best_state,
+                        "args": vars(args),
+                        "best_val_relL2": best_relL2,
+                    }, best_path)
                     history.append({
                         "epoch": f"lbfgs_{i+1}",
                         "loss_pde": 0, "loss_bc": 0,
@@ -325,7 +432,7 @@ def train(args: argparse.Namespace):
             model.load_state_dict(best_state)
             print(f"best overall model (val relL2={best_relL2:.4e})")
 
-    return model, history
+    return model, history, best_relL2
 
 
 # ===========================================================================
@@ -334,9 +441,8 @@ def train(args: argparse.Namespace):
 
 @torch.no_grad()
 def evaluate_final(model: nn.Module, N: int, device: torch.device):
-    """Full evaluation on uniform grid. Returns (data_dict, metrics_dict)."""
     x, y, boundary, interior, h = make_grid(N, device)
-    k = torch.full((1, 1), 2.0, device=device)
+    k = torch.full((1, 1), K_DEFAULT, device=device)
     f = forcing(x, y)
     g = boundary * u_exact(x, y)
 
@@ -352,18 +458,9 @@ def evaluate_final(model: nn.Module, N: int, device: torch.device):
 # 8. Visualization
 # ===========================================================================
 
-def _get_plt():
-    cache = Path(tempfile.gettempdir())
-    os.environ.setdefault("MPLCONFIGDIR", str(cache / "matplotlib"))
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    return plt
-
-
 def _save_panel(u_true, u_pred, error, f_map, res_pred, res_exact,
                 path, title, full_ext, resid_ext, dpi=200):
-    """2×3 panel: true u | pred | error || forcing f | pred residual | exact residual."""
+    """2×3 panel: true u | PINN pred | error || forcing | pred residual | exact residual."""
     plt = _get_plt()
 
     def _sym(v):
@@ -427,8 +524,12 @@ def parse_args():
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=1234)
     # output
-    p.add_argument("--save-path", default="checkpoints/pinn_demo.pt")
-    p.add_argument("--plot-dir", default="results/pinn_demo")
+    p.add_argument("--save-path", default="",
+                   help="Deprecated: paths are auto-generated from config")
+    p.add_argument("--retrain", action="store_true",
+                   help="Force retraining even if a matching checkpoint exists")
+    p.add_argument("--plot-dir", default="",
+                   help="Deprecated: paths are auto-generated from config")
     p.add_argument("--no-plot", action="store_true")
 
     return p.parse_args()
@@ -437,27 +538,66 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # train
-    model, history = train(args)
+    model_type = "pinn"
+    paths = resolve_paths(args.N, args.epochs, args.hidden_dim,
+                          args.n_layers, args.bc_weight, model_type)
 
-    # save checkpoint
-    save_path = Path(args.save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "args": vars(args),
-    }, save_path)
-    print(f"saved: {save_path}")
+    ckey = config_key(args.N, args.epochs, args.hidden_dim,
+                      args.n_layers, args.bc_weight)
 
-    # save training history CSV
-    hist_path = save_path.with_suffix(".csv")
-    with open(str(hist_path), "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(history[0].keys()))
-        w.writeheader()
-        w.writerows(history)
-    print(f"saved history: {hist_path}")
+    # ── Check for existing trained model ──
+    existing = find_existing(paths["ckpt_dir"], args.N, args.epochs)
 
-    # evaluate & plot
+    if existing and not args.retrain:
+        print("=" * 60)
+        print(f"  PINN Config:  {paths['config_name']}")
+        print(f"  ✓ Found trained model: {existing}")
+        print(f"  Skipping training. Use --retrain to force retraining.")
+        print("=" * 60)
+        update_registry(model_type, ckey, {
+            "N": args.N, "epochs": args.epochs,
+            "hidden_dim": args.hidden_dim, "n_layers": args.n_layers,
+            "bc_weight": args.bc_weight, "k": K_DEFAULT,
+        })
+        ckpt = torch.load(existing, map_location="cpu", weights_only=False)
+        model = MLP(hidden_dim=args.hidden_dim, n_layers=args.n_layers)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.to(select_device(args.device))
+        model.eval()
+    else:
+        if args.retrain and existing:
+            print(f"⟳ Retraining requested for {paths['config_name']}")
+
+        print("=" * 60)
+        print(f"  PINN Config:  {paths['config_name']}")
+        print(f"  Output:       {paths['ckpt_dir']}")
+        print("=" * 60)
+
+        model, history, best_relL2 = train(
+            args, paths["best_path"], paths["last_path"], paths["history_path"],
+        )
+
+        paths["last_path"].parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "args": vars(args),
+        }, paths["last_path"])
+        print(f"saved final: {paths['last_path']}")
+
+        with open(str(paths["history_path"]), "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+            w.writeheader()
+            w.writerows(history)
+        print(f"saved history: {paths['history_path']}")
+
+        update_registry(model_type, ckey, {
+            "N": args.N, "epochs": args.epochs,
+            "hidden_dim": args.hidden_dim, "n_layers": args.n_layers,
+            "bc_weight": args.bc_weight, "k": K_DEFAULT,
+            "best_val_relL2": best_relL2,
+        })
+
+    # ── Evaluate & plot ──
     device = select_device(args.device)
     data, metrics = evaluate_final(model, args.N, device)
 
@@ -465,8 +605,19 @@ def main():
     for k, v in metrics.items():
         print(f"  {k}: {v:.4e}")
 
+    run_params = {
+        "run_id": get_run_id(), "model": "PINN (MLP)",
+        "N": args.N, "epochs": args.epochs,
+        "hidden_dim": args.hidden_dim, "n_layers": args.n_layers,
+        "lr": args.lr, "bc_weight": args.bc_weight, "k": K_DEFAULT,
+        "metrics": {k: f"{v:.4e}" for k, v in metrics.items()},
+    }
+    _write_run_info(paths["run_info_path"], run_params)
+    _update_latest_symlink(Path("checkpoints") / model_type, ckey)
+    _update_latest_symlink(Path("results") / model_type, ckey)
+
     if not args.no_plot:
-        out = Path(args.plot_dir)
+        out = paths["figure_dir"]
         out.mkdir(parents=True, exist_ok=True)
         h = float(data["h"])
         full_ext = [-1.0, 1.0, -1.0, 1.0]
@@ -477,11 +628,11 @@ def main():
         err = up - ui
         res_pred = fd_residual(
             data["u_pred"], data["f"],
-            torch.full((1, 1), 2.0, device=device), h,
+            torch.full((1, 1), K_DEFAULT, device=device), h,
         )[0, 0]
         res_exact = fd_residual(
             data["u_exact"], data["f"],
-            torch.full((1, 1), 2.0, device=device), h,
+            torch.full((1, 1), K_DEFAULT, device=device), h,
         )[0, 0]
 
         title = (f"PINN | relL2={metrics['relL2']:.3e}  "
@@ -492,13 +643,17 @@ def main():
         _save_panel(ui, up, err, data["f"][0, 0], res_pred, res_exact,
                     out / "pinn_panel.png", title, full_ext, resid_ext)
 
-        # metrics CSV
         csv_path = out / "metrics.csv"
         with open(str(csv_path), "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(metrics.keys()))
             w.writeheader()
             w.writerow(metrics)
         print(f"saved panel + metrics: {out}")
+
+    print(f"\nDone. Config: {paths['config_name']}")
+    print(f"Checkpoints: {paths['ckpt_dir']}")
+    print(f"Figures:     {paths['figure_dir']}")
+    print(f"Latest:      checkpoints/{model_type}/latest -> {ckey}")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ __pycache__/
 
 # Local experiment outputs
 checkpoints/
+results/
 runs/
 outputs/
 *.pt

@@ -105,11 +105,14 @@ def _update_latest_symlink(link_dir: Path, run_id: str) -> None:
 def config_key(N: int, epochs: int, k: float, base_ch: int = 32) -> str:
     """Generate a human-readable config directory name.
 
-    Example: config_key(32, 40, 2.0) -> "N32_e40_k2.0"
+    Example: config_key(32, 40, 2.0) -> "N32_e40_k2_c32"
     """
     # Format k to be filesystem-friendly
     k_str = f"k{k:.1f}".rstrip("0").rstrip(".") if k == int(k) else f"k{k:.2f}"
-    return f"N{N}_e{epochs}_{k_str}"
+    key = f"N{N}_e{epochs}_{k_str}"
+    if base_ch != 32:
+        key += f"_c{base_ch}"
+    return key
 
 
 def resolve_paths(N: int, epochs: int, k: float, base_ch: int = 32,
@@ -1068,9 +1071,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    # predict-only mode (no training logic needed)
+    if args.predict or args.load_path:
+        return run_prediction(args)
+
     # default with no arguments: demo mode
-    if len(sys.argv) == 1:
-        args.demo = True
+    args.demo = len(sys.argv) == 1
 
     # ── Resolve config and paths ──
     model_type = "cnn"
@@ -1133,7 +1139,7 @@ def main() -> None:
         })
 
     # ── Predict ──
-    if args.demo or args.plot or args.predict:
+    if args.demo or args.plot:
         pred_ckpt = existing if existing else paths["best_path"]
         print(f"\nPredicting from: {pred_ckpt}")
 

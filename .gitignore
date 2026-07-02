@@ -16,4 +16,5 @@ Paper/
 
 # Draft reports (local only, not for distribution)
 report_draft.*
+report.docx
 ~$*.docx

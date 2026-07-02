@@ -13,3 +13,10 @@ outputs/
 # Reference papers are kept locally and are not committed.
 Paper/
 *.pdf
+
+# Individual experiment reports (not for distribution)
+实验报告_*.md
+实验报告_*.docx
+
+# Word temp files
+~$*.docx

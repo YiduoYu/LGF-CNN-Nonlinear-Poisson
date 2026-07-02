@@ -14,9 +14,6 @@ outputs/
 Paper/
 *.pdf
 
-# Individual experiment reports (not for distribution)
-实验报告_*.md
-实验报告_*.docx
-
-# Word temp files
+# Draft reports (local only, not for distribution)
+report_draft.*
 ~$*.docx

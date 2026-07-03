@@ -1,4 +1,4 @@
-# Nonlinear Poisson — CNN / TransUNet vs PINN
+# Nonlinear Poisson — CNN vs PINN
 
 求解通量形式非线性 Poisson 方程的神经网络方法：
 
@@ -35,12 +35,7 @@ f 通过 autograd 精确计算（--rhs-mode continuous）或 FD 模板反算（-
 
 ## 模型架构
 
-| | Baseline (CNN) | TransUNet |
-|---|---|---|
-| 结构 | SimpleCNN：n 层 Conv3×3 + GroupNorm + GELU | SimpleCNN → Transformer bottleneck → SimpleCNN |
-| 参数量 (N=32) | ~48k | ~107k |
-
-SimpleCNN：无池化、无上采样、无跳跃连接的纯前馈卷积。
+SimpleCNN：n 层 Conv3×3 + GroupNorm + GELU → 1×1 Conv 输出。无池化、无上采样、无跳跃连接，~48k 参数（N=32）。
 
 ---
 
@@ -49,9 +44,6 @@ SimpleCNN：无池化、无上采样、无跳跃连接的纯前馈卷积。
 ```bash
 # CNN baseline（主实验）
 python Baseline.py --N 32 --epochs 40 --train-samples 2048 --val-samples 128 --rhs-mode continuous --retrain
-
-# TransUNet
-python TransUNet.py --N 32 --epochs 40 --retrain
 
 # debug 模式（验证残差代码：R_h(u_exact) = 0）
 python Baseline.py --N 32 --epochs 5 --train-samples 128 --val-samples 32 --rhs-mode discrete --retrain
@@ -72,7 +64,6 @@ checkpoints/
 ├── cnn/N32_e40_krand/               # CNN (physics mode)
 │   ├── best.pt / last.pt / history.csv / convergence.png / run_info.txt
 ├── cnn/N32_e40_krand_discrete/      # CNN (debug/discrete mode)
-├── transunet/N32_e40_krand/         # TransUNet
 ├── pinn/N32_e5000_h64_l4_bc50/       # PINN
 └── registry.json
 
@@ -113,5 +104,4 @@ Best checkpoint 按 val resRMSE 选择，relL2 仅作为评估指标报告。
 
 1. CNN + FD 的精度上限由 FD 截断误差决定（N=32 时最优 relL2 ~ 0.316）
 2. 加密网格、增大模型、高阶 FD、延长训练——均无法突破天花板
-3. Transformer bottleneck 不能突破 FD 天花板（全局注意力破坏局部算子偏置）
-4. PINN autodiff 精确导数是决定性优势（relL2 = 0.004 vs CNN 最优 0.316）
+3. PINN autodiff 精确导数是决定性优势（relL2 = 0.004 vs CNN 最优 0.316）

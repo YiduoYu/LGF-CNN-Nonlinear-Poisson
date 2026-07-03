@@ -18,6 +18,7 @@ import csv
 import math
 import os
 import random
+import shutil
 import sys
 import tempfile
 import time
@@ -102,7 +103,8 @@ def _update_latest_symlink(link_dir: Path, run_id: str) -> None:
 # 1b. Config-key based storage
 # ===========================================================================
 
-def config_key(N: int, epochs: int, k: float, base_ch: int = 32) -> str:
+def config_key(N: int, epochs: int, k: float, base_ch: int = 32,
+               random_u: bool = False, train_mode: str = "physics") -> str:
     """Generate a human-readable config directory name.
 
     Example: config_key(32, 40, 2.0) -> "N32_e40_k2"
@@ -111,13 +113,18 @@ def config_key(N: int, epochs: int, k: float, base_ch: int = 32) -> str:
     key = f"N{N}_e{epochs}_{k_str}"
     if base_ch != 32:
         key += f"_c{base_ch}"
+    if random_u:
+        key += "_rand"
+    if train_mode != "physics":
+        key += f"_{train_mode}"
     return key
 
 
 def resolve_paths(N: int, epochs: int, k: float, base_ch: int = 32,
+                  random_u: bool = False, train_mode: str = "physics",
                   model_type: str = "cnn") -> dict:
     """Return a dict of resolved paths for a given config."""
-    ckey = config_key(N, epochs, k, base_ch)
+    ckey = config_key(N, epochs, k, base_ch, random_u, train_mode)
     ckpt_dir = Path("checkpoints") / model_type / ckey
     results_dir = Path("results") / model_type / ckey
 
@@ -443,59 +450,199 @@ class UNet(nn.Module):
 # 5. Manufactured solution & dataset
 # ===========================================================================
 
+# ---- legacy fixed manufactured solution (kept for backward compat) ----
+
 def u_exact(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Manufactured solution: u(x,y) = sin(pi*x) * cos(pi*y)."""
+    """Legacy fixed solution: u(x,y) = sin(pi*x) * cos(pi*y)."""
     return torch.sin(math.pi * x) * torch.cos(math.pi * y)
 
 
 def forcing(x: torch.Tensor, y: torch.Tensor, k: torch.Tensor,
             eps: float = 1e-6) -> torch.Tensor:
-    """Analytic f = -div(u^k grad u) for u = sin(pi*x)*cos(pi*y).
-
-    For integer k (e.g. k=2), u^k is well-defined for negative u, so no
-    clamp is applied. For fractional k, a small positive clamp prevents
-    NaN gradients from negative bases.
-    """
+    """Legacy: analytic f for the fixed sin*cos manufactured solution."""
     pi = math.pi
     u = u_exact(x, y)
     u_x = pi * torch.cos(pi * x) * torch.cos(pi * y)
     u_y = -pi * torch.sin(pi * x) * torch.sin(pi * y)
     laplacian = -2.0 * pi * pi * u
     grad_sq = u_x * u_x + u_y * u_y
-
     a, da = _safe_pow(u, k, eps)
     return -(da * grad_sq + a * laplacian)
 
 
 def generate_dataset(N: int, n_samples: int, device: torch.device,
                      k_val: float = K_DEFAULT):
-    """Return a batch of manufactured-problem instances as a dict.
-
-    Keys: f, g, mask, interior_mask, x, y, k, u_exact, h.
-    f, u_exact, g have shape [n_samples, 1, N+2, N+2].
-    k has shape [n_samples, 1].
-    mask, interior_mask, x, y have shape [1, 1, N+2, N+2] (shared).
-    h is a float.
-    """
+    """Legacy: fixed-PDE dataset. All samples are copies of the same PDE."""
     x, y, boundary, interior, h = make_grid(N, device)
-
-    # u_exact and f are the same for all samples (k is fixed)
-    ue = u_exact(x, y)                        # [1, 1, H, W]
+    ue = u_exact(x, y)
     k = torch.full((1, 1), k_val, device=device)
-    f = forcing(x, y, k)                      # [1, 1, H, W]
-
-    # replicate to batch
+    f = forcing(x, y, k)
     f = f.expand(n_samples, -1, -1, -1)
     ue = ue.expand(n_samples, -1, -1, -1)
     k = torch.full((n_samples, 1), k_val, device=device)
     g = boundary * ue
+    return {"f": f, "g": g, "mask": boundary, "interior_mask": interior,
+            "x": x, "y": y, "k": k, "u_exact": ue, "h": h}
 
-    return {
-        "f": f, "g": g,
-        "mask": boundary, "interior_mask": interior,
-        "x": x, "y": y, "k": k,
-        "u_exact": ue, "h": h,
+
+# =========================================================================
+# 5b. Random manufactured-solution family (operator-learning style)
+# =========================================================================
+
+def _random_u_params(device: torch.device,
+                     k_range: tuple[float, float] = (0.5, 2.5),
+                     positive_floor: float = 0.2):
+    """Generate random parameters for one manufactured solution.
+
+    Returns (params_dict, k) where params_dict contains:
+        c0..c3  – boundary polynomial b(x,y) = c0 + c1*x + c2*y + c3*x*y
+        a1, a2  – Fourier-mode amplitudes for interior modulation
+    """
+    params = {
+        "c0": torch.empty(1, device=device).uniform_(1.2, 1.8),
+        "c1": torch.empty(1, device=device).uniform_(-0.15, 0.15),
+        "c2": torch.empty(1, device=device).uniform_(-0.15, 0.15),
+        "c3": torch.empty(1, device=device).uniform_(-0.10, 0.10),
+        "a1": torch.empty(1, device=device).uniform_(-0.20, 0.20),
+        "a2": torch.empty(1, device=device).uniform_(-0.20, 0.20),
     }
+    k = torch.empty(1, device=device).uniform_(k_range[0], k_range[1])
+    return params, k
+
+
+def manufactured_u(x: torch.Tensor, y: torch.Tensor,
+                   params: dict) -> torch.Tensor:
+    """Compute u = b(x,y) + (1-x^2)(1-y^2) * s(x,y).
+
+    The factor (1-x^2)(1-y^2) vanishes on the entire boundary, so
+    u|_boundary = b|_boundary – the boundary values are fully controlled
+    by the polynomial b(x,y).
+    """
+    phi = (1.0 - x**2) * (1.0 - y**2)
+    b = (params["c0"] + params["c1"] * x + params["c2"] * y
+         + params["c3"] * x * y)
+    s = (params["a1"] * torch.sin(math.pi * x) * torch.sin(math.pi * y)
+         + params["a2"] * torch.cos(2.0 * math.pi * x) * torch.cos(math.pi * y))
+    return b + phi * s
+
+
+def continuous_rhs_from_u(u: torch.Tensor, x: torch.Tensor, y: torch.Tensor,
+                          k: torch.Tensor):
+    """Compute exact f = -div(u^k * grad(u)) via autograd.
+
+    u, x, y must have requires_grad=True (or at least x, y must).
+    Returns f.detach().
+    """
+    k4 = k.view(1, 1, 1, 1) if k.ndim <= 1 else k
+    while k4.ndim < 4:
+        k4 = k4.unsqueeze(-1)
+    a_coeff = torch.pow(u, k4)
+
+    ones = torch.ones_like(u)
+    du_dx = torch.autograd.grad(u, x, grad_outputs=ones,
+                                create_graph=True, retain_graph=True)[0]
+    du_dy = torch.autograd.grad(u, y, grad_outputs=ones,
+                                create_graph=True, retain_graph=True)[0]
+    qx = a_coeff * du_dx
+    qy = a_coeff * du_dy
+    dqx_dx = torch.autograd.grad(qx, x, grad_outputs=ones,
+                                 create_graph=False, retain_graph=True)[0]
+    dqy_dy = torch.autograd.grad(qy, y, grad_outputs=ones,
+                                 create_graph=False, retain_graph=False)[0]
+    return -(dqx_dx + dqy_dy)
+
+
+def discrete_rhs_from_u(u: torch.Tensor, k: torch.Tensor,
+                        h: float) -> torch.Tensor:
+    """Build f such that u_exact satisfies the SAME FD stencil as the loss.
+
+    f = -div_h(a(u) * grad_h(u)) on interior nodes → R_h(u_exact) = 0.
+    This is the gold-standard code-verification / debug mode.
+    """
+    f = torch.zeros_like(u)
+    # flux_divergence returns -div_h(a(u) * grad_h(u)) on interior nodes
+    div_h = flux_divergence(u, k, h)
+    f[:, :, 1:-1, 1:-1] = div_h
+    return f
+
+
+def sample_random_problem(N: int, device: torch.device,
+                          k_range: tuple[float, float] = (0.5, 2.5),
+                          rhs_mode: str = "continuous",
+                          positive_floor: float = 0.2):
+    """Generate ONE random PDE instance.
+
+    Args:
+        N: interior grid size
+        device: torch device
+        k_range: (min, max) for uniform sampling of k
+        rhs_mode: "continuous" → autograd exact f
+                  "discrete"   → FD-stencil f (R_h(u_exact) = 0)
+        positive_floor: minimum allowed u value (ensures u^k is real)
+
+    Returns a dict with keys f, g, mask, interior_mask, x, y, k, u_exact, h.
+    All field tensors have shape [1, 1, N+2, N+2]; k has shape [1].
+    """
+    # grid without grad for storage
+    x0, y0, boundary, interior, h = make_grid(N, device)
+
+    # autograd-enabled copies for continuous RHS
+    x = x0.clone().detach().requires_grad_(rhs_mode == "continuous")
+    y = y0.clone().detach().requires_grad_(rhs_mode == "continuous")
+
+    params, k = _random_u_params(device, k_range, positive_floor)
+
+    u = manufactured_u(x, y, params)
+
+    # enforce positivity
+    if positive_floor > 0:
+        margin = positive_floor - u.detach().min()
+        if margin.item() > 0:
+            params["c0"] = params["c0"] + margin
+            u = manufactured_u(x, y, params)
+
+    if rhs_mode == "continuous":
+        f = continuous_rhs_from_u(u, x, y, k)
+    elif rhs_mode == "discrete":
+        f = discrete_rhs_from_u(u.detach(), k, h)
+    else:
+        raise ValueError(f"rhs_mode must be 'continuous' or 'discrete', "
+                         f"got '{rhs_mode}'")
+
+    u = u.detach()
+    f = f.detach()
+    g = boundary * u
+
+    return {"f": f, "g": g, "mask": boundary.detach(),
+            "interior_mask": interior.detach(),
+            "x": x0.detach(), "y": y0.detach(),
+            "k": k.detach(), "u_exact": u, "h": h}
+
+
+def collate_problems(problems: list[dict]) -> dict:
+    """Stack a list of single-sample problem dicts into a batch dict."""
+    batch = {}
+    for key in ["f", "g", "mask", "interior_mask", "x", "y", "u_exact"]:
+        batch[key] = torch.cat([p[key] for p in problems], dim=0)
+    batch["k"] = torch.cat([p["k"] for p in problems], dim=0)
+    batch["h"] = problems[0]["h"]
+    return batch
+
+
+def generate_random_dataset(N: int, n_samples: int, device: torch.device,
+                            k_range: tuple[float, float] = (0.5, 2.5),
+                            rhs_mode: str = "continuous",
+                            positive_floor: float = 0.2):
+    """Generate a batch of DIVERSE PDE instances (operator-learning style).
+
+    Every sample has a different manufactured solution u_i, a different k_i,
+    and therefore a different source term f_i.  The CNN learns the operator
+    (f, g, k) → u instead of memorising one PDE.
+    """
+    problems = [sample_random_problem(N, device, k_range, rhs_mode,
+                                      positive_floor)
+                for _ in range(n_samples)]
+    return collate_problems(problems)
 
 
 @dataclass
@@ -549,10 +696,29 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
     t0 = time.time()
 
     # ---- datasets ----
-    print(f"generating {args.train_samples} train samples (N={args.N})", flush=True)
-    train_data = generate_dataset(args.N, args.train_samples, device)
-    print(f"generating {args.val_samples} val samples", flush=True)
-    val_data = generate_dataset(args.N, args.val_samples, device)
+    random_u = getattr(args, "random_u", False)
+    rhs_mode = getattr(args, "rhs_mode", "continuous")
+    train_mode = getattr(args, "train_mode", "physics")
+    pretrain_epochs = getattr(args, "pretrain_epochs", 0)
+    k_range = getattr(args, "k_range", (0.5, 2.5))
+
+    if random_u:
+        print(f"generating {args.train_samples} RANDOM PDE train samples "
+              f"(N={args.N}, k~U{k_range}, rhs={rhs_mode})", flush=True)
+        train_data = generate_random_dataset(
+            args.N, args.train_samples, device,
+            k_range=k_range, rhs_mode=rhs_mode)
+        print(f"generating {args.val_samples} RANDOM PDE val samples", flush=True)
+        val_data = generate_random_dataset(
+            args.N, args.val_samples, device,
+            k_range=k_range, rhs_mode=rhs_mode)
+    else:
+        print(f"generating {args.train_samples} train samples (N={args.N})",
+              flush=True)
+        train_data = generate_dataset(args.N, args.train_samples, device)
+        print(f"generating {args.val_samples} val samples", flush=True)
+        val_data = generate_dataset(args.N, args.val_samples, device)
+
     stats = compute_stats(train_data)
 
     # oracle floor: PDE residual of the exact solution (truncation error)
@@ -597,6 +763,13 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
     print(f"f stats: mean={stats.f_mean:.3f}  std={stats.f_std:.3f}")
     print(f"oracle resRMSE (FD truncation floor): {oracle_floor:.4f}")
     print(f"steps/epoch={steps_per_epoch}  total_steps={total_steps}")
+    print(f"random_u={random_u}  rhs_mode={rhs_mode}  "
+          f"train_mode={train_mode}  pretrain_epochs={pretrain_epochs}")
+
+    def _supervised_loss(u_pred: torch.Tensor, batch: dict) -> torch.Tensor:
+        """MSE between u_pred and u_exact on interior nodes."""
+        interior = batch["interior_mask"].expand_as(u_pred)
+        return ((u_pred - batch["u_exact"]) * interior).pow(2).mean()
 
     # ---- training loop ----
     history: list[dict] = []
@@ -615,7 +788,21 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
             f_int = batch["f"][:, :, 1:-1, 1:-1]
             denom = f_int.pow(2).mean(dim=(1, 2, 3), keepdim=True) \
                            .sqrt().clamp_min(1e-3)
-            loss = (res / denom).pow(2).mean()
+            loss_pde = (res / denom).pow(2).mean()
+            loss_sup = _supervised_loss(u_pred, batch)
+
+            # ---- training mode ----
+            if train_mode == "physics":
+                loss = loss_pde
+            elif train_mode == "supervised":
+                loss = loss_sup
+            elif train_mode == "hybrid":
+                if epoch < pretrain_epochs:
+                    loss = loss_sup                            # warm-up
+                else:
+                    loss = 0.1 * loss_sup + 1.0 * loss_pde     # fine-tune
+            else:
+                raise ValueError(f"Unknown train_mode: {train_mode}")
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -649,18 +836,20 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
                 f"epoch={epoch:03d}  step={step:05d}  "
                 f"lr={scheduler.get_last_lr()[0]:.2e}  "
                 f"loss={float(loss):.3e}  "
-                f"train_resRMSE={train_res_rmse:.4f}  "
+                f"loss_pde={float(loss_pde):.3e}  "
+                f"loss_sup={float(loss_sup):.3e}  "
                 f"bmax={train_bmax:.2e} | "
                 f"val relL2={val_m['relL2']:.4e}  "
                 f"linf={val_m['linf']:.4e}  "
                 f"resRMSE={val_m['resRMSE']:.4f}  "
-                f"resLinf={val_m['resLinf']:.4e}  "
                 f"gradRelL2={val_m['gradRelL2']:.4e}"
             )
             history.append({
                 "epoch": epoch, "step": step,
                 "lr": float(scheduler.get_last_lr()[0]),
                 "loss": float(loss),
+                "loss_pde": float(loss_pde),
+                "loss_sup": float(loss_sup),
                 "train_resRMSE": train_res_rmse,
                 "val_relL2": val_m["relL2"],
                 "val_resRMSE": val_m["resRMSE"],
@@ -935,6 +1124,25 @@ def _panel_title(row: dict) -> str:
             f"exact_resRMSE={row['exact_flux_resRMSE']:.3e}")
 
 
+def archive_existing_results(out_dir: Path) -> Path | None:
+    """Archive previous results to a timestamped history subfolder.
+
+    If out_dir already contains .png or .csv files from a previous run,
+    move them into out_dir/history/<run_id>/ so they are preserved for
+    comparison and the new run can write fresh files.
+    """
+    existing = list(out_dir.glob("*.png")) + list(out_dir.glob("*.csv"))
+    if not existing:
+        return None
+    ts = get_run_id()
+    archive_dir = out_dir / "history" / ts
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for f in existing:
+        shutil.move(str(f), str(archive_dir / f.name))
+    print(f"Archived previous results -> {archive_dir}")
+    return archive_dir
+
+
 def run_prediction(args: argparse.Namespace) -> None:
     """Load checkpoint, run prediction, save metrics and figures."""
     if not args.load_path:
@@ -982,6 +1190,7 @@ def run_prediction(args: argparse.Namespace) -> None:
     # ---- prediction panels ----
     if args.plot:
         out = Path(args.plot_dir)
+        archive_existing_results(out)
         h = float(batch["h"])
         full_ext = [-1.0, 1.0, -1.0, 1.0]
         resid_ext = [-1.0 + h, 1.0 - h, -1.0 + h, 1.0 - h]
@@ -1030,6 +1239,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--normalize-k", action=argparse.BooleanOptionalAction,
                    default=True)
+
+    # data generation mode
+    p.add_argument("--random-u", action="store_true",
+                   help="Use random manufactured-solution family "
+                        "(operator-learning style, one PDE per sample)")
+    p.add_argument("--rhs-mode", default="continuous",
+                   choices=["continuous", "discrete"],
+                   help="continuous = autograd exact f; "
+                        "discrete = FD-stencil f (R_h=0, for debugging)")
+    p.add_argument("--k-min", type=float, default=0.5,
+                   help="Min k for random PDE family (default 0.5)")
+    p.add_argument("--k-max", type=float, default=2.5,
+                   help="Max k for random PDE family (default 2.5)")
+
+    # training strategy
+    p.add_argument("--train-mode", default="physics",
+                   choices=["physics", "supervised", "hybrid"],
+                   help="physics = PDE residual only; "
+                        "supervised = MSE on u_exact; "
+                        "hybrid = supervised warm-up + physics fine-tune")
+    p.add_argument("--pretrain-epochs", type=int, default=0,
+                   help="Number of pure supervised epochs before physics "
+                        "kick in (only used with --train-mode hybrid)")
 
     # system
     p.add_argument("--device", default="auto")
@@ -1083,7 +1315,10 @@ def main() -> None:
         args.eval_every = 1
 
     paths = resolve_paths(args.N, args.epochs, K_DEFAULT,
-                          args.base_ch, model_type)
+                          args.base_ch,
+                          getattr(args, "random_u", False),
+                          getattr(args, "train_mode", "physics"),
+                          model_type)
 
     # ── Migrate legacy files on first run ──
     migrate_legacy_checkpoint(paths["ckpt_dir"])
@@ -1091,7 +1326,9 @@ def main() -> None:
     # ── Check for existing trained model ──
     existing = find_existing(paths["ckpt_dir"], args.N, args.epochs)
 
-    ckey = config_key(args.N, args.epochs, K_DEFAULT, args.base_ch)
+    ckey = config_key(args.N, args.epochs, K_DEFAULT, args.base_ch,
+                      getattr(args, "random_u", False),
+                      getattr(args, "train_mode", "physics"))
 
     if existing and not args.retrain:
         print("=" * 60)
@@ -1113,6 +1350,17 @@ def main() -> None:
         print("=" * 60)
 
         train_args = argparse.Namespace(**vars(args))
+        if not hasattr(train_args, "random_u"):
+            train_args.random_u = False
+        if not hasattr(train_args, "rhs_mode"):
+            train_args.rhs_mode = "continuous"
+        if not hasattr(train_args, "train_mode"):
+            train_args.train_mode = "physics"
+        if not hasattr(train_args, "pretrain_epochs"):
+            train_args.pretrain_epochs = 0
+        if not hasattr(train_args, "k_range"):
+            train_args.k_range = (getattr(args, "k_min", 0.5),
+                                  getattr(args, "k_max", 2.5))
         model, oracle_floor = train(
             train_args,
             paths["best_path"],

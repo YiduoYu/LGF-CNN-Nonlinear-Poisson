@@ -38,11 +38,13 @@ from Baseline import (
     make_grid, build_input, enforce_dirichlet,
     _safe_pow, power_coefficient, flux_divergence, pde_residual,
     K_DEFAULT,
-    u_exact, forcing, generate_dataset, compute_stats, InputStats,
+    u_exact, forcing, generate_dataset, generate_random_dataset,
+    compute_stats, InputStats,
     _take_batch, _forward, _error_tensors,
     evaluate, per_sample_metrics,
     _write_run_info, _update_latest_symlink, migrate_legacy_checkpoint,
     _write_csv, _save_convergence_plot, _save_panel, _get_plt,
+    archive_existing_results,
 )
 
 # =========================================================================
@@ -247,17 +249,24 @@ class TransUNet(nn.Module):
 
 
 def config_key(N: int, epochs: int, k: float, base_ch: int = 32,
-               tf_layers: int = 4) -> str:
+               tf_layers: int = 4, random_u: bool = False,
+               train_mode: str = "physics") -> str:
     k_str = f"k{k:.1f}".rstrip("0").rstrip(".") if k == int(k) else f"k{k:.2f}"
     key = f"N{N}_e{epochs}_{k_str}_tf{tf_layers}"
     if base_ch != 32:
         key += f"_c{base_ch}"
+    if random_u:
+        key += "_rand"
+    if train_mode != "physics":
+        key += f"_{train_mode}"
     return key
 
 
 def resolve_paths(N: int, epochs: int, k: float, base_ch: int = 32,
-                  tf_layers: int = 4, model_type: str = "transunet") -> dict:
-    ckey = config_key(N, epochs, k, base_ch, tf_layers)
+                  tf_layers: int = 4, random_u: bool = False,
+                  train_mode: str = "physics",
+                  model_type: str = "transunet") -> dict:
+    ckey = config_key(N, epochs, k, base_ch, tf_layers, random_u, train_mode)
     ckpt_dir = Path("checkpoints") / model_type / ckey
     results_dir = Path("results") / model_type / ckey
     return {
@@ -315,11 +324,31 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
     device = select_device(args.device)
     t0 = time.time()
 
-    print(f"generating {args.train_samples} train samples (N={args.N})",
-          flush=True)
-    train_data = generate_dataset(args.N, args.train_samples, device)
-    print(f"generating {args.val_samples} val samples", flush=True)
-    val_data = generate_dataset(args.N, args.val_samples, device)
+    # ---- datasets ----
+    random_u = getattr(args, "random_u", False)
+    rhs_mode = getattr(args, "rhs_mode", "continuous")
+    train_mode = getattr(args, "train_mode", "physics")
+    pretrain_epochs = getattr(args, "pretrain_epochs", 0)
+    k_range = getattr(args, "k_range", (0.5, 2.5))
+
+    if random_u:
+        print(f"generating {args.train_samples} RANDOM PDE train samples "
+              f"(N={args.N}, k~U{k_range}, rhs={rhs_mode})", flush=True)
+        train_data = generate_random_dataset(
+            args.N, args.train_samples, device,
+            k_range=k_range, rhs_mode=rhs_mode)
+        print(f"generating {args.val_samples} RANDOM PDE val samples",
+              flush=True)
+        val_data = generate_random_dataset(
+            args.N, args.val_samples, device,
+            k_range=k_range, rhs_mode=rhs_mode)
+    else:
+        print(f"generating {args.train_samples} train samples (N={args.N})",
+              flush=True)
+        train_data = generate_dataset(args.N, args.train_samples, device)
+        print(f"generating {args.val_samples} val samples", flush=True)
+        val_data = generate_dataset(args.N, args.val_samples, device)
+
     stats = compute_stats(train_data)
 
     with torch.no_grad():
@@ -366,6 +395,12 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
           f"steps/epoch={steps_per_epoch}  total_steps={total_steps}")
     print(f"tf_layers={args.tf_layers}  tf_heads={args.tf_heads}  "
           f"tf_dropout={args.tf_dropout}")
+    print(f"random_u={random_u}  rhs_mode={rhs_mode}  "
+          f"train_mode={train_mode}  pretrain_epochs={pretrain_epochs}")
+
+    def _supervised_loss(u_pred: torch.Tensor, batch: dict) -> torch.Tensor:
+        interior = batch["interior_mask"].expand_as(u_pred)
+        return ((u_pred - batch["u_exact"]) * interior).pow(2).mean()
 
     history: list[dict] = []
     step = 0
@@ -382,7 +417,20 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
             f_int = batch["f"][:, :, 1:-1, 1:-1]
             denom = f_int.pow(2).mean(dim=(1, 2, 3), keepdim=True) \
                            .sqrt().clamp_min(1e-3)
-            loss = (res / denom).pow(2).mean()
+            loss_pde = (res / denom).pow(2).mean()
+            loss_sup = _supervised_loss(u_pred, batch)
+
+            if train_mode == "physics":
+                loss = loss_pde
+            elif train_mode == "supervised":
+                loss = loss_sup
+            elif train_mode == "hybrid":
+                if epoch < pretrain_epochs:
+                    loss = loss_sup
+                else:
+                    loss = 0.1 * loss_sup + 1.0 * loss_pde
+            else:
+                raise ValueError(f"Unknown train_mode: {train_mode}")
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -410,7 +458,8 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
                 }, best_path)
 
             print(f"epoch={epoch:03d}  loss={float(loss):.3e}  "
-                  f"train_resRMSE={train_res_rmse:.4f}  "
+                  f"loss_pde={float(loss_pde):.3e}  "
+                  f"loss_sup={float(loss_sup):.3e}  "
                   f"bmax={train_bmax:.2e} | "
                   f"val relL2={val_m['relL2']:.4e}  "
                   f"linf={val_m['linf']:.4e}  "
@@ -497,6 +546,7 @@ def run_prediction(args: argparse.Namespace) -> None:
 
     if args.plot:
         out = Path(args.plot_dir)
+        archive_existing_results(out)
         h = float(batch["h"])
         full_ext = [-1.0, 1.0, -1.0, 1.0]
         resid_ext = [-1.0 + h, 1.0 - h, -1.0 + h, 1.0 - h]
@@ -544,6 +594,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--normalize-k", action=argparse.BooleanOptionalAction,
                    default=True)
+    # data generation mode
+    p.add_argument("--random-u", action="store_true",
+                   help="Use random manufactured-solution family")
+    p.add_argument("--rhs-mode", default="continuous",
+                   choices=["continuous", "discrete"])
+    p.add_argument("--k-min", type=float, default=0.5)
+    p.add_argument("--k-max", type=float, default=2.5)
+    # training strategy
+    p.add_argument("--train-mode", default="physics",
+                   choices=["physics", "supervised", "hybrid"])
+    p.add_argument("--pretrain-epochs", type=int, default=0)
     # transformer
     p.add_argument("--tf-layers", type=int, default=4)
     p.add_argument("--tf-heads", type=int, default=8)
@@ -585,11 +646,16 @@ def main() -> None:
         args.eval_every = 1
 
     paths = resolve_paths(args.N, args.epochs, K_DEFAULT,
-                          args.base_ch, args.tf_layers, model_type)
+                          args.base_ch, args.tf_layers,
+                          getattr(args, "random_u", False),
+                          getattr(args, "train_mode", "physics"),
+                          model_type)
     migrate_legacy_checkpoint(paths["ckpt_dir"])
     existing = find_existing(paths["ckpt_dir"], args.N, args.epochs)
     ckey = config_key(args.N, args.epochs, K_DEFAULT,
-                      args.base_ch, args.tf_layers)
+                      args.base_ch, args.tf_layers,
+                      getattr(args, "random_u", False),
+                      getattr(args, "train_mode", "physics"))
 
     if existing and not args.retrain:
         print("=" * 60)
@@ -607,6 +673,17 @@ def main() -> None:
         print(f"  Config:  {paths['config_name']}")
         print("=" * 60)
         train_args = argparse.Namespace(**vars(args))
+        if not hasattr(train_args, "random_u"):
+            train_args.random_u = False
+        if not hasattr(train_args, "rhs_mode"):
+            train_args.rhs_mode = "continuous"
+        if not hasattr(train_args, "train_mode"):
+            train_args.train_mode = "physics"
+        if not hasattr(train_args, "pretrain_epochs"):
+            train_args.pretrain_epochs = 0
+        if not hasattr(train_args, "k_range"):
+            train_args.k_range = (getattr(args, "k_min", 0.5),
+                                  getattr(args, "k_max", 2.5))
         model, oracle_floor = train(
             train_args, paths["best_path"], paths["last_path"],
             paths["history_path"], paths["convergence_path"])

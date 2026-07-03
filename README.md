@@ -1,12 +1,12 @@
-# Darcy PDE — CNN Solver
+# Darcy-like PDE — CNN Solver
 
-求解 Darcy 型椭圆 PDE：
+求解 Darcy 型椭圆 PDE（variable-coefficient Poisson equation）：
 
 ```text
 -div(a(x,y) grad u) = f,   u = g on boundary,   Omega = [-1,1]^2
 ```
 
-a(x,y) 为正系数场，u 允许正负值。
+a(x,y) 为正系数场，u 允许正负值。纯物理驱动训练，不使用 reference solution 作为监督信号。
 
 ---
 
@@ -36,7 +36,7 @@ loss = mean((R / RMS(f))^2)
 
 ## 模型架构
 
-SimpleCNN：n 层 Conv3×3 + GroupNorm + GELU → 1×1 Conv 输出。6 通道输入：`[f, g, boundary_mask, a, x, y]`。
+SimpleCNN：n 层 Conv3×3 + GroupNorm + GELU → 1×1 Conv 输出。6 通道输入（f 和 a 经过 z-score 归一化）：`[f_norm, g, boundary_mask, a_norm, x, y]`。
 
 ---
 
@@ -83,7 +83,7 @@ python Baseline.py --N 8 --epochs 2 --train-samples 32 --val-samples 8 --batch-s
 ```
 checkpoints/
 └── cnn/N32_e40_darcy_ab1.5_as0.5_am0.1_fs3_gs0.5_tr2048/
-    ├── best.pt / last.pt / history.csv / convergence.png / run_info.txt
+    ├── best.pt / last.pt / history.csv / convergence.png
 
 results/
 └── cnn/<key>/figures/
@@ -108,8 +108,11 @@ results/
 
 ## 关键设计
 
-- Hard Dirichlet BC：边界点直接替换
-- u 允许正负：无 softplus 约束
-- Conservative FD residual：交界面系数算术平均
-- 6-channel input：`[f_norm, g, boundary_mask, a_norm, x, y]`
-- 线性 FD solver：直接 spsolve，无需 Picard 迭代
+- Hard Dirichlet BC：边界点直接替换，`u_pred = bnd * g + (1-bnd) * u_raw`
+- u 允许正负：无 softplus / positivity 约束
+- Conservative FD residual：交界面系数取相邻两点的算术平均 `a_face = 0.5 * (a_c + a_neighbor)`
+- 6-channel input：`[f_norm, g, boundary_mask, a_norm, x, y]`，其中 f、a 用训练集统计量做 z-score 归一化
+- 线性 FD solver：直接 `scipy.sparse.linalg.spsolve`，无需 Picard 迭代
+- 优化器：AdamW（weight_decay=1e-4 bias/1D参数除外）+ gradient clipping（max_norm=1.0）
+- 学习率调度：5% warmup → cosine annealing
+- 每个样本独立归一化 loss：denom 为单样本 f 的 RMS，避免不同 PDE 之间 forcing 幅度差异影响训练

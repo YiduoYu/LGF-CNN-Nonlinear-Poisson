@@ -47,26 +47,13 @@ def enforce_dirichlet(u_raw, g, bnd):
 
 # -- nonlinear flux-form operator -------------------------------------------
 
-def power_coefficient(u, k, eps=1e-6):
-    """Compute a = u^k.  k may be scalar or shape [B].  u assumed positive."""
+def nonlinear_flux_divergence(u, k, h, eps=1e-6):
+    """5-point flux-form FD: -div(u^k grad u)."""
     if isinstance(k, (int, float)):
         k = torch.tensor([k], device=u.device)
     if k.ndim == 1:
         k = k.view(-1, 1, 1, 1)
-    return torch.clamp(u, min=eps).pow(k)
-
-
-def nonlinear_flux_divergence(u, k, h, eps=1e-6):
-    """5-point flux-form FD: -div(u^k grad u).
-    Interface coefficient = arithmetic average of neighbour values.
-    Args:
-        u: [B, 1, H, W]  solution field
-        k: [B] or scalar   exponent
-        h: grid spacing
-    Returns:
-        [B, 1, H-2, W-2]  -div_h(u^k grad_h u) on interior
-    """
-    a = power_coefficient(u, k, eps)
+    a = torch.clamp(u, min=eps).pow(k)
 
     uc = u[:, :, 1:-1, 1:-1]
     ac = a[:, :, 1:-1, 1:-1]
@@ -114,10 +101,7 @@ class SimpleCNN(nn.Module):
 
 # -- smooth field generator -------------------------------------------------
 
-def _smooth_field(N, seed=None):
-    """Random smooth field on (N+2)x(N+2) grid."""
-    if seed is not None:
-        np.random.seed(seed)
+def _smooth_field(N):
     xs = np.linspace(-1, 1, N + 2)
     ys = np.linspace(-1, 1, N + 2)
     xx, yy = np.meshgrid(xs, ys)
@@ -159,38 +143,8 @@ def _random_positive_g(N, g_base=1.0, g_scale=0.05):
 
 # -- linear Darcy solver (for Picard inner loop) ----------------------------
 
-def _assemble_darcy_system_slow_reference(a, g, f, h):
-    """Sparse 5-point flux-form system for -div(a grad u) = f, Dirichlet BC u=g.
-    Reference implementation: Python for-loop + lil_matrix. Keep for testing."""
-    N = a.shape[0] - 2
-    n = N * N
-
-    A = sp.lil_matrix((n, n))
-    b = np.zeros(n)
-    h2 = 1.0 / (h * h)
-
-    for i in range(1, N + 1):
-        for j in range(1, N + 1):
-            row = (i - 1) * N + (j - 1)
-            ac = a[i, j]
-
-            for di, dj in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                ni, nj = i + di, j + dj
-                coeff = 0.5 * (ac + a[ni, nj])
-                A[row, row] += coeff * h2
-                if 1 <= ni <= N and 1 <= nj <= N:
-                    A[row, (ni - 1) * N + (nj - 1)] -= coeff * h2
-                else:
-                    b[row] += coeff * h2 * g[ni, nj]
-
-            b[row] += f[i, j]
-
-    return A.tocsr(), b
-
-
 def _assemble_darcy_system(a, g, f, h):
-    """Vectorized 5-point flux-form assembly using COO matrix.
-    Discretisation identical to _assemble_darcy_system_slow_reference."""
+    """Vectorized 5-point flux-form assembly using COO matrix."""
     N = a.shape[0] - 2
     n = N * N
     h2 = 1.0 / (h * h)
@@ -255,80 +209,42 @@ def solve_darcy_fd(f, g, a, h):
 # -- Picard solver ----------------------------------------------------------
 
 def initial_guess_from_boundary(g, h):
-    """Solve -div(1 * grad u0) = 0 with boundary g.  Harmonic, smooth, positive."""
-    f0 = np.zeros_like(g)
-    a0 = np.ones_like(g)
-    return solve_darcy_fd(f0, g, a0, h)
+    return solve_darcy_fd(np.zeros_like(g), g, np.ones_like(g), h)
 
 
 def solve_nonlinear_picard(f, g, k, h, args):
-    """Solve -div(u^k grad u) = f via Picard iteration.
-
-    Args:
-        f, g: numpy arrays [H, W]
-        k: scalar float  exponent
-        h: grid spacing
-        args: CLI args with picard params
-
-    Returns:
-        u: numpy array [H, W]  converged solution
-        info: dict with converged, num_iter, rel_change, u_min, u_max, residual_rmse
-    """
     u = initial_guess_from_boundary(g, h)
-
+    eps = args.coeff_eps
     converged = False
-    info = {
-        "converged": False,
-        "num_iter": 0,
-        "rel_change": math.inf,
-        "u_min": 0.,
-        "u_max": 0.,
-        "residual_rmse": math.inf,
-    }
+    n_iter = args.picard_max_iter
 
     for it in range(args.picard_max_iter):
-        a_eff = np.maximum(u, args.coeff_eps) ** k
-
-        u_lin = solve_darcy_fd(f, g, a_eff, h)
-
-        u_new = args.picard_damping * u_lin + (1. - args.picard_damping) * u
-
-        u_norm = np.linalg.norm(u_new)
-        rel_change = np.linalg.norm(u_new - u) / max(u_norm, 1e-12)
-
+        u_old = u
+        u_lin = solve_darcy_fd(f, g, np.maximum(u_old, eps) ** k, h)
+        u_new = args.picard_damping * u_lin + (1. - args.picard_damping) * u_old
+        rel_change = np.linalg.norm(u_new - u_old) / max(np.linalg.norm(u_new), 1e-12)
         u = u_new
-
         if rel_change < args.picard_tol:
             converged = True
-            info["num_iter"] = it + 1
-            info["rel_change"] = rel_change
+            n_iter = it + 1
             break
 
-    if not converged:
-        info["num_iter"] = args.picard_max_iter
-
-    info["converged"] = converged
-    info["u_min"] = float(u.min())
-    info["u_max"] = float(u.max())
-
-    # Compute residual via torch (reuse operator)
     u_t = torch.tensor(u, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
     f_t = torch.tensor(f, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
     k_t = torch.tensor([k], dtype=torch.float32)
     with torch.no_grad():
-        res = nonlinear_pde_residual(u_t, f_t, k_t, h, eps=args.coeff_eps)
-        info["residual_rmse"] = float(res.pow(2).mean().sqrt())
+        res_rmse = float(nonlinear_pde_residual(
+            u_t, f_t, k_t, h, eps=eps).pow(2).mean().sqrt())
 
-    return u, info
+    return u, {"num_iter": n_iter, "converged": converged,
+               "u_min": float(u.min()), "u_max": float(u.max()),
+               "residual_rmse": res_rmse}
 
 
 # -- Picard dataset ---------------------------------------------------------
 
 def make_picard_dataset(N, n_samples, device, args):
-    """Generate dataset by sampling f,g,k and solving nonlinear PDE via Picard.
-
-    Returns dict with same keys as make_mms_dataset, plus "solver_info".
-    """
+    """Generate dataset: random f, g, k -> Picard solver -> (f, g, k, u_ref)."""
     x_t, y_t, bnd, interior, h_grid = make_grid(N, device)
 
     f_list, g_list, k_list, u_list, info_list = [], [], [], [], []
@@ -379,17 +295,13 @@ def make_picard_dataset(N, n_samples, device, args):
             "larger --picard-max-iter, or looser --max-residual-rmse."
         )
 
-    # Summary
-    iterations = [x["num_iter"] for x in info_list]
-    residuals = [x["residual_rmse"] for x in info_list]
-    u_mins = [x["u_min"] for x in info_list]
-    u_maxs = [x["u_max"] for x in info_list]
-
+    iters = [x["num_iter"] for x in info_list]
+    res_list = [x["residual_rmse"] for x in info_list]
     print(f"  acceptance: {accepted}/{attempts} ({100*accepted/max(1,attempts):.1f}%)")
-    print(f"  Picard iterations: mean={np.mean(iterations):.1f}  max={np.max(iterations)}")
-    print(f"  solver residual:   mean={np.mean(residuals):.4e}  "
-          f"max={np.max(residuals):.4e}")
-    print(f"  u range: [{min(u_mins):.4f}, {max(u_maxs):.4f}]")
+    print(f"  Picard iterations: mean={np.mean(iters):.1f}  max={np.max(iters)}")
+    print(f"  solver residual:   mean={np.mean(res_list):.4e}  max={np.max(res_list):.4e}")
+    print(f"  u range: [{min(x['u_min'] for x in info_list):.4f}, "
+          f"{max(x['u_max'] for x in info_list):.4f}]")
 
     if accepted < n_samples:
         raise RuntimeError(
@@ -415,40 +327,25 @@ def make_picard_dataset(N, n_samples, device, args):
 # -- input / stats / batching ------------------------------------------------
 
 def build_input(f_norm, g, bnd, k_norm, x, y):
-    """Build 6-channel CNN input: [f_norm, g, boundary_mask, k_channel, x, y]."""
     B = f_norm.shape[0]
-    if bnd.shape[0] == 1:
-        bnd = bnd.expand(B, -1, -1, -1)
-    if x.shape[0] == 1:
-        x = x.expand(B, -1, -1, -1)
-        y = y.expand(B, -1, -1, -1)
-    if k_norm.ndim == 1:
-        k_ch = k_norm.view(-1, 1, 1, 1).expand(B, 1, *bnd.shape[-2:])
-    else:
-        k_ch = torch.full(
-            (B, 1, *bnd.shape[-2:]), float(k_norm),
-            device=bnd.device, dtype=bnd.dtype)
+    bnd = bnd.expand(B, -1, -1, -1) if bnd.shape[0] == 1 else bnd
+    x = x.expand(B, -1, -1, -1) if x.shape[0] == 1 else x
+    y = y.expand(B, -1, -1, -1) if y.shape[0] == 1 else y
+    k_ch = k_norm.view(B, 1, 1, 1).expand(-1, 1, *bnd.shape[-2:])
     return torch.cat([f_norm, g, bnd, k_ch, x, y], dim=1)
 
 
 def compute_stats(data):
-    """Compute z-score stats for f (interior) and k.
-    Uses unbiased=False to avoid NaN on single-sample datasets."""
     fi = data["f"][:, :, 1:-1, 1:-1]
     k = data["k"]
-    return (
-        float(fi.mean()),
-        float(fi.std(unbiased=False).clamp_min(1e-8)),
-        float(k.mean()),
-        float(k.std(unbiased=False).clamp_min(1e-8)),
-    )
+    return (fi.mean().item(), fi.std(unbiased=False).clamp_min(1e-8).item(),
+            k.mean().item(), k.std(unbiased=False).clamp_min(1e-8).item())
 
 
 def _take_batch(data, idx):
-    batch = {k: data[k][idx] for k in ("f", "g", "k", "u_ref")}
-    batch.update({k: data[k][:1] for k in ("mask", "interior_mask", "x", "y")})
-    batch["h"] = data["h"]
-    return batch
+    return {"h": data["h"],
+            **{k: data[k][idx] for k in ("f", "g", "k", "u_ref")},
+            **{k: data[k][:1] for k in ("mask", "interior_mask", "x", "y")}}
 
 
 def _forward(model, batch, stats):
@@ -539,7 +436,6 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
     n_train = train_data["f"].shape[0]
     n_val = val_data["f"].shape[0]
     print(f"device={device}  oracle={oracle:.4e}  "
-          f"lambda_sup={args.lambda_sup}  lambda_pde={args.lambda_pde}  "
           f"steps/epoch={steps_per_ep}  total={total_steps}  "
           f"n_train={n_train}  n_val={n_val}")
 
@@ -555,16 +451,16 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
             batch = _take_batch(train_data, perm[start:start + args.batch_size])
             u_pred = _forward(model, batch, stats)
 
-            interior = batch["interior_mask"].expand_as(u_pred)
-            err = (u_pred - batch["u_ref"]) * interior
-            loss_sup = err.pow(2).mean()
-
-            res = nonlinear_pde_residual(
-                u_pred, batch["f"], batch["k"], batch["h"], eps=args.coeff_eps)
-            h = batch["h"]
-            loss_pde = (h * h * res).pow(2).mean()
-
-            loss = args.lambda_sup * loss_sup + args.lambda_pde * loss_pde
+            if args.loss == "supervised":
+                interior = batch["interior_mask"].expand_as(u_pred)
+                err = (u_pred - batch["u_ref"]) * interior
+                loss = err.pow(2).mean()
+            else:  # physics
+                res = nonlinear_pde_residual(
+                    u_pred, batch["f"], batch["k"], batch["h"], eps=args.coeff_eps)
+                denom = (batch["f"][:, :, 1:-1, 1:-1]
+                         .pow(2).mean(dim=(1, 2, 3)).sqrt().clamp_min(1e-3))
+                loss = (res / denom.view(-1, 1, 1, 1)).pow(2).mean()
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -574,31 +470,28 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
 
         if epoch % args.eval_every == 0 or epoch == args.epochs - 1:
             val_m = evaluate(model, val_data, stats, eval_bs, args)
-            if val_m["relL2"] < best_metric:
-                best_metric = val_m["relL2"]
+            val_key = "relL2" if args.loss == "supervised" else "resRMSE"
+            if val_m[val_key] < best_metric:
+                best_metric = val_m[val_key]
                 best_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save({
                     "model_state_dict": model.state_dict(),
                     "stats": stats,
                     "args": vars(args),
                     "epoch": epoch,
-                    "best_val_relL2": best_metric,
+                    f"best_val_{val_key}": best_metric,
                 }, best_path)
 
             print(f"epoch {epoch:03d}  loss={loss.detach():.3e}  "
-                  f"sup={loss_sup.detach():.3e}  pde={loss_pde.detach():.3e}  "
-                  f"relL2={val_m['relL2']:.4e}  linf={val_m['linf']:.4e}  "
                   f"resRMSE={val_m['resRMSE']:.4f}  "
-                  f"refRMSE={val_m['refResRMSE']:.4e}  "
+                  f"relL2={val_m['relL2']:.4e}  linf={val_m['linf']:.4e}  "
                   f"gradRelL2={val_m['gradRelL2']:.4e}")
 
             history.append({
                 "epoch": epoch,
                 "loss": loss.detach().item(),
-                "loss_sup": loss_sup.detach().item(),
-                "loss_pde": loss_pde.detach().item(),
-                "val_relL2": val_m["relL2"],
                 "val_resRMSE": val_m["resRMSE"],
+                "val_relL2": val_m["relL2"],
                 "val_linf": val_m["linf"],
                 "val_gradRelL2": val_m["gradRelL2"],
                 "val_refResRMSE": val_m["refResRMSE"],
@@ -615,7 +508,7 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
             torch.save(d, p)
 
     _write_csv(history, history_path)
-    _save_convergence_plot(history, convergence_path, oracle)
+    _save_convergence_plot(history, convergence_path, oracle, args.loss)
     return model, oracle, best_metric
 
 
@@ -626,90 +519,65 @@ def evaluate(model, data, stats, batch_size, args):
     model.eval()
     n = data["f"].shape[0]
     dev = data["f"].device
-    H, W = data["f"].shape[-2], data["f"].shape[-1]
-    ac = {"rl2": 0., "li": 0., "rs": 0., "rli": 0., "bm": 0., "gs": 0.,
-          "ers": 0., "c": 0}
+    H, W = data["f"].shape[-2:]
+    eps = args.coeff_eps
+    sum_rl2 = sum_rs = sum_ers = sum_gs = 0.
+    max_li = max_rli = max_bm = 0.
+    count = 0
 
     for start in range(0, n, batch_size):
         idx = torch.arange(start, min(start + batch_size, n), device=dev)
         b = _take_batch(data, idx)
-
         up = _forward(model, b, stats)
         ue = b["u_ref"]
         interior = b["interior_mask"].expand_as(up)
         h = float(b["h"])
 
         err = (up - ue) * interior
-        res = nonlinear_pde_residual(up, b["f"], b["k"], b["h"], eps=args.coeff_eps)
-        res_e = nonlinear_pde_residual(ue, b["f"], b["k"], b["h"], eps=args.coeff_eps)
+        res = nonlinear_pde_residual(up, b["f"], b["k"], b["h"], eps=eps)
+        res_e = nonlinear_pde_residual(ue, b["f"], b["k"], b["h"], eps=eps)
 
-        m = up.shape[0]
-        ac["c"] += m
-
-        ac["rl2"] += float(
-            (err.flatten(1).norm(dim=1)
-             / ue.mul(interior).flatten(1).norm(dim=1).clamp_min(1e-12)).sum())
-        ac["li"] = max(ac["li"], float(err.abs().max()))
-        ac["rs"] += float(res.pow(2).sum())
-        ac["ers"] += float(res_e.pow(2).sum())
-        ac["rli"] = max(ac["rli"], float(res.abs().max()))
-        ac["bm"] = max(ac["bm"],
-                       float(((up - b["g"]).abs()
-                              * b["mask"].expand_as(up)).max()))
+        count += up.shape[0]
+        sum_rl2 += (err.flatten(1).norm(dim=1)
+                    / ue.mul(interior).flatten(1).norm(dim=1).clamp_min(1e-12)).sum().item()
+        max_li = max(max_li, err.abs().max().item())
+        sum_rs += res.pow(2).sum().item()
+        sum_ers += res_e.pow(2).sum().item()
+        max_rli = max(max_rli, res.abs().max().item())
+        max_bm = max(max_bm, ((up - b["g"]).abs() * b["mask"].expand_as(up)).max().item())
 
         du = lambda v: (v[:, :, 1:-1, 2:] - v[:, :, 1:-1, :-2]) / (2. * h)
         dv = lambda v: (v[:, :, 2:, 1:-1] - v[:, :, :-2, 1:-1]) / (2. * h)
         pg = torch.cat([du(up), dv(up)], 1)
         tg = torch.cat([du(ue), dv(ue)], 1)
-        ac["gs"] += float(
-            ((pg - tg).flatten(1).norm(dim=1)
-             / tg.flatten(1).norm(dim=1).clamp_min(1e-12)).sum())
+        sum_gs += ((pg - tg).flatten(1).norm(dim=1)
+                   / tg.flatten(1).norm(dim=1).clamp_min(1e-12)).sum().item()
 
-    c = ac["c"]
-    ni = c * (H - 2) * (W - 2)
-    return {
-        "relL2": ac["rl2"] / c,
-        "linf": ac["li"],
-        "resRMSE": math.sqrt(ac["rs"] / ni),
-        "refResRMSE": math.sqrt(ac["ers"] / ni),
-        "resLinf": ac["rli"],
-        "bmax": ac["bm"],
-        "gradRelL2": ac["gs"] / c,
-    }
+    ni = count * (H - 2) * (W - 2)
+    return {"relL2": sum_rl2 / count, "linf": max_li,
+            "resRMSE": math.sqrt(sum_rs / ni), "refResRMSE": math.sqrt(sum_ers / ni),
+            "resLinf": max_rli, "bmax": max_bm, "gradRelL2": sum_gs / count}
 
 
 def per_sample_metrics(u_pred, batch, eps):
     ue = batch["u_ref"]
-    interior = batch["interior_mask"].expand_as(u_pred)
-    err = (u_pred - ue) * interior
-
+    err = (u_pred - ue) * batch["interior_mask"].expand_as(u_pred)
     res = nonlinear_pde_residual(u_pred, batch["f"], batch["k"], batch["h"], eps=eps)
     res_e = nonlinear_pde_residual(ue, batch["f"], batch["k"], batch["h"], eps=eps)
 
     ie = err[:, :, 1:-1, 1:-1].flatten(1)
     iu = ue[:, :, 1:-1, 1:-1].flatten(1)
-    rf = res.flatten(1)
-    ref = res_e.flatten(1)
+    rf, ref = res.flatten(1), res_e.flatten(1)
     fi = batch["f"][:, :, 1:-1, 1:-1].flatten(1)
     rl2 = ie.norm(dim=1) / iu.norm(dim=1).clamp_min(1e-12)
 
-    rows = []
-    for i in range(u_pred.shape[0]):
-        k_i = batch["k"][i].item()
-        rows.append({
-            "sample_id": i,
-            "k": float(k_i),
-            "u_min": float(ue[i].min()),
-            "u_max": float(ue[i].max()),
-            "relL2": float(rl2[i]),
-            "RMSE": float(ie[i].pow(2).mean().sqrt()),
-            "MAE": float(ie[i].abs().mean()),
-            "Linf": float(ie[i].abs().max()),
-            "pred_flux_resRMSE": float(rf[i].pow(2).mean().sqrt()),
-            "ref_flux_resRMSE": float(ref[i].pow(2).mean().sqrt()),
-            "f_RMSE": float(fi[i].pow(2).mean().sqrt()),
-        })
-    return rows
+    return [{"sample_id": i, "k": batch["k"][i].item(),
+             "relL2": rl2[i].item(), "RMSE": ie[i].pow(2).mean().sqrt().item(),
+             "MAE": ie[i].abs().mean().item(), "Linf": ie[i].abs().max().item(),
+             "pred_flux_resRMSE": rf[i].pow(2).mean().sqrt().item(),
+             "ref_flux_resRMSE": ref[i].pow(2).mean().sqrt().item(),
+             "f_RMSE": fi[i].pow(2).mean().sqrt().item()}
+            for i in range(u_pred.shape[0])]
 
 
 # -- visualization ----------------------------------------------------------
@@ -719,43 +587,40 @@ def _write_csv(rows, path):
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
 
 
 def _save_panel(ue, up, err, fm, rp, re, path, title, fext, rext, dpi=200):
-    os.environ.setdefault("MPLCONFIGDIR",
-                          str(Path(tempfile.gettempdir()) / "matplotlib"))
+    os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     def sym(v):
-        mx = max(float(v.abs().max().cpu()), 1e-12)
-        return -mx, mx
+        m = max(v.abs().max().cpu().item(), 1e-12)
+        return -m, m
 
-    umin = min(float(ue.min()), float(up.min()))
-    umax = max(float(ue.max()), float(up.max()))
+    umin = min(ue.min().item(), up.min().item())
+    umax = max(ue.max().item(), up.max().item())
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
     fig.suptitle(title)
 
     panels = [
-        (0, 0, ue,  "reference u",            "viridis",  fext, umin, umax),
-        (0, 1, up,  "CNN prediction",          "viridis",  fext, umin, umax),
-        (0, 2, err, "signed error",            "coolwarm", fext, *sym(err)),
-        (1, 0, fm,  "forcing f",               "coolwarm", fext, *sym(fm)),
-        (1, 1, rp,  "pred PDE residual",       "coolwarm", rext, *sym(rp)),
-        (1, 2, re,  "FD residual of ref u",    "coolwarm", rext, *sym(re)),
+        (0, 0, ue,  "u_ref",          "viridis",  fext, umin, umax),
+        (0, 1, up,  "CNN prediction",  "viridis",  fext, umin, umax),
+        (0, 2, err, "signed error",    "coolwarm", fext, *sym(err)),
+        (1, 0, fm,  "forcing f",       "coolwarm", fext, *sym(fm)),
+        (1, 1, rp,  "pred PDE res",    "coolwarm", rext, *sym(rp)),
+        (1, 2, re,  "ref PDE res",     "coolwarm", rext, *sym(re)),
     ]
     for r, c, v, label, cmap, ext, v0, v1 in panels:
         ax = axes[r][c]
         im = ax.imshow(v.detach().cpu().numpy(), origin="lower", extent=ext,
                        cmap=cmap, vmin=v0, vmax=v1, aspect="equal")
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_title(label)
+        ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_title(label)
         fig.colorbar(im, ax=ax, fraction=.046, pad=.04)
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -763,54 +628,32 @@ def _save_panel(ue, up, err, fm, rp, re, path, title, fext, rext, dpi=200):
     plt.close(fig)
 
 
-def _save_convergence_plot(history, path, oracle=0.):
+def _save_convergence_plot(history, path, oracle=0., loss_type="physics"):
     if len(history) < 2:
         return
 
-    os.environ.setdefault("MPLCONFIGDIR",
-                          str(Path(tempfile.gettempdir()) / "matplotlib"))
+    os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     epochs_list = [h["epoch"] for h in history]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
-    fig.suptitle("Training convergence — Nonlinear Picard")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+    fig.suptitle(f"Training convergence — {loss_type}")
 
-    ax1 = axes[0]
-    ax1.plot(epochs_list, [h["loss"] for h in history], "b-", label="total")
-    ax1.plot(epochs_list, [h["loss_sup"] for h in history], "r--", label="sup")
-    ax1.plot(epochs_list, [h["loss_pde"] for h in history], "g--", label="pde")
-    ax1.set_xlabel("epoch")
-    ax1.set_yscale("log")
-    ax1.legend(loc="upper right")
-    ax1.grid(True, alpha=.3)
-    ax1.set_title("Training loss")
+    ax1.plot(epochs_list, [h["loss"] for h in history], "b-")
+    ax1.set_xlabel("epoch"); ax1.set_yscale("log")
+    ax1.set_title("Loss"); ax1.grid(True, alpha=.3)
 
-    ax2 = axes[1]
     ax2b = ax2.twinx()
-    l3, = ax2.plot(epochs_list, [h["val_relL2"] for h in history],
-                   "g-", label="val relL2")
-    l4, = ax2b.plot(epochs_list, [h["val_resRMSE"] for h in history],
-                    "m--", label="val resRMSE")
-    handles = [l3, l4]
+    l1, = ax2.plot(epochs_list, [h["val_relL2"] for h in history], "g-", label="relL2")
+    l2, = ax2b.plot(epochs_list, [h["val_resRMSE"] for h in history], "m--", label="resRMSE")
+    handles = [l1, l2]
     if oracle > 0:
-        l5 = ax2b.axhline(oracle, color="gray", ls=":",
-                          label=f"oracle ({oracle:.4f})")
-        handles.append(l5)
-    ax2.set_xlabel("epoch")
-    ax2.legend(handles=handles, loc="upper right")
-    ax2.grid(True, alpha=.3)
-    ax2.set_title("Validation metrics")
-
-    ax3 = axes[2]
-    ax3.plot(epochs_list, [h["val_linf"] for h in history], "c-", label="linf")
-    ax3.set_xlabel("epoch")
-    ax3.set_yscale("log")
-    ax3.legend(loc="upper right")
-    ax3.grid(True, alpha=.3)
-    ax3.set_title("Max error")
+        handles.append(ax2b.axhline(oracle, color="gray", ls=":", label=f"oracle {oracle:.1e}"))
+    ax2.set_xlabel("epoch"); ax2.legend(handles=handles, loc="upper right")
+    ax2.grid(True, alpha=.3); ax2.set_title("Validation")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -840,21 +683,28 @@ def run_prediction(args):
     stats = ckpt["stats"]
 
     N = args.predict_N or ckpt_args.N
-    print(f"prediction (picard): N={N}  samples={args.predict_samples}")
-
-    # Use training data distribution; only override prediction-specific params
     data_args = argparse.Namespace(**vars(ckpt_args))
     data_args.device = args.device
     data_args.seed = args.test_seed
 
     random.seed(args.test_seed)
     np.random.seed(args.test_seed)
-    batch = make_picard_dataset(N, args.predict_samples, device, data_args)
+
+    pred_case = getattr(args, "predict_case", "random")
+    if pred_case == "sincos":
+        k_range = (getattr(ckpt_args, "k_min", 1.0), getattr(ckpt_args, "k_max", 3.0))
+        print(f"prediction (sincos): N={N}  u_ref = sin(πx)·cos(πy)")
+        batch = _make_sincos_dataset(N, args.predict_samples, device,
+                                     k_range, ckpt_args.coeff_eps,
+                                     getattr(args, "predict_k", None))
+    else:
+        print(f"prediction (picard): N={N}  samples={args.predict_samples}")
+        batch = make_picard_dataset(N, args.predict_samples, device, data_args)
 
     with torch.no_grad():
         u_pred = _forward(model, batch, stats)
 
-    vm = evaluate(model, batch, stats, args.predict_samples, args)
+    vm = evaluate(model, batch, stats, args.predict_samples, data_args)
     print(f"relL2={vm['relL2']:.4e}  linf={vm['linf']:.4e}  "
           f"resRMSE={vm['resRMSE']:.4f}  refRMSE={vm['refResRMSE']:.4e}  "
           f"gradRelL2={vm['gradRelL2']:.4e}")
@@ -863,25 +713,21 @@ def run_prediction(args):
         p = Path(args.predict_save)
         p.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
-            "f": batch["f"].cpu(),
-            "g": batch["g"].cpu(),
-            "k": batch["k"].cpu(),
-            "u_ref": batch["u_ref"].cpu(),
-            "u_pred": u_pred.cpu(),
-            "h": float(batch["h"]),
-            "metrics": vm,
+            "f": batch["f"].cpu(), "g": batch["g"].cpu(),
+            "k": batch["k"].cpu(), "u_ref": batch["u_ref"].cpu(),
+            "u_pred": u_pred.cpu(), "h": float(batch["h"]), "metrics": vm,
         }, p)
         print(f"saved predictions → {p}")
 
     rows = per_sample_metrics(u_pred, batch, eps=data_args.coeff_eps)
-
     if args.plot:
         out = Path(args.plot_dir)
         out.mkdir(parents=True, exist_ok=True)
 
         h = float(batch["h"])
         fext = [-1., 1., -1., 1.]
-        res_extent = [-1. + h, 1. - h, -1. + h, 1. - h]
+        rext = [-1. + h, 1. - h, -1. + h, 1. - h]
+        eps = data_args.coeff_eps
 
         for i, row in enumerate(rows):
             ui = batch["u_ref"][i, 0]
@@ -889,55 +735,82 @@ def run_prediction(args):
 
             pr = nonlinear_pde_residual(
                 u_pred[i:i+1], batch["f"][i:i+1],
-                batch["k"][i:i+1], h, eps=data_args.coeff_eps)[0, 0]
+                batch["k"][i:i+1], h, eps=eps)[0, 0]
             er = nonlinear_pde_residual(
                 batch["u_ref"][i:i+1], batch["f"][i:i+1],
-                batch["k"][i:i+1], h, eps=data_args.coeff_eps)[0, 0]
+                batch["k"][i:i+1], h, eps=eps)[0, 0]
 
-            title = (f"sample {row['sample_id']}  k={row['k']:.2f}  "
-                     f"relL2={row['relL2']:.3e}  "
-                     f"pred_res={row['pred_flux_resRMSE']:.3e}")
-            _save_panel(ui, up, up - ui, batch["f"][i, 0],
-                        pr, er,
-                        out / f"sample_{row['sample_id']:03d}_panel.png",
-                        title, fext, res_extent)
+            _save_panel(ui, up, up - ui, batch["f"][i, 0], pr, er,
+                        out / f"sample_{i:03d}_panel.png",
+                        f"sample {i}  k={row['k']:.2f}  relL2={row['relL2']:.3e}",
+                        fext, rext)
 
         _write_csv(rows, out / "metrics.csv")
-        print(f"saved -> {out}")
+        print(f"saved → {out}")
+
+
+# -- sincos test dataset -----------------------------------------------------
+
+def _sincos_u_ref(x, y):
+    return torch.sin(math.pi * x) * torch.cos(math.pi * y)
+
+
+def _make_sincos_dataset(N, n_samples, device, k_range, eps, pred_k=None):
+    x_t, y_t, bnd, interior, h = make_grid(N, device)
+    f_list, g_list, k_list, u_list = [], [], [], []
+
+    for _ in range(n_samples):
+        k_val = pred_k if pred_k is not None else np.random.uniform(*k_range)
+        k_t = torch.tensor([k_val], dtype=torch.float32, device=device)
+
+        u_ref = _sincos_u_ref(x_t[0, 0], y_t[0, 0])
+        u_ref = u_ref.unsqueeze(0).unsqueeze(0)
+
+        f = torch.zeros_like(u_ref)
+        f[:, :, 1:-1, 1:-1] = nonlinear_flux_divergence(u_ref, k_t, h, eps)
+
+        f_list.append(f)
+        g_list.append(bnd * u_ref)
+        k_list.append(k_t)
+        u_list.append(u_ref)
+
+    return {
+        "f": torch.cat(f_list), "g": torch.cat(g_list),
+        "k": torch.cat(k_list), "u_ref": torch.cat(u_list),
+        "mask": bnd, "interior_mask": interior,
+        "x": x_t, "y": y_t, "h": h,
+    }
 
 
 # -- CLI --------------------------------------------------------------------
 
 def ckpt_key(args):
-    """Generate compact experiment key: N{N}_e{epochs}_k{k} or N{N}_e{epochs}_k{min}-{max}."""
+    """Experiment key encoding all data/model parameters that affect results."""
     if getattr(args, "random_k", False):
         k_str = f"k{args.k_min:g}-{args.k_max:g}"
     else:
         k_str = f"k{args.k:g}"
-    return f"N{args.N}_e{args.epochs}_{k_str}"
+    n_layers = getattr(args, "n_layers", 6)
+    loss_suffix = "_sup" if getattr(args, "loss", "physics") == "supervised" else ""
+    return (f"N{args.N}_e{args.epochs}_tr{args.train_samples}"
+            f"_{k_str}_fs{args.f_scale:g}_gs{args.g_scale:g}"
+            f"_ch{args.base_ch}_L{n_layers}{loss_suffix}")
 
 
 def _write_run_info(path, args, best_metric, oracle):
-    """Write human-readable run metadata."""
-    path.write_text("\n".join([
-        f"Experiment: CNN Nonlinear Poisson (Picard, physics mode)",
-        f"Key: {ckpt_key(args)}",
-        f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"N: {args.N}",
-        f"Epochs: {args.epochs}",
-        f"k: {args.k_min:.4g}–{args.k_max:.4g}" if getattr(args, "random_k", False)
-        else f"k: {args.k:.4g}",
-        f"Train samples: {args.train_samples}",
-        f"Val samples: {args.val_samples}",
-        f"Base channels: {args.base_ch}",
-        f"Layers: {getattr(args, 'n_layers', 6)}",
-        f"f_scale: {args.f_scale:.4g}",
-        f"g_base: {args.g_base:.4g}  g_scale: {args.g_scale:.4g}",
-        f"Picard damping: {args.picard_damping}  tol: {args.picard_tol:.1e}",
-        f"Best val relL2: {best_metric:.4e}",
-        f"Oracle residual: {oracle:.4e}",
-        f"Seed: {args.seed}",
-    ]) + "\n")
+    k_str = (f"{args.k_min:.4g}–{args.k_max:.4g}" if getattr(args, "random_k", False)
+             else f"{args.k:.4g}")
+    metric_name = "relL2" if args.loss == "supervised" else "resRMSE"
+    path.write_text(
+        f"Experiment: CNN Nonlinear Poisson (Picard, loss={args.loss})\n"
+        f"Key: {ckpt_key(args)}\n"
+        f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"N: {args.N}  Epochs: {args.epochs}  k: {k_str}  Seed: {args.seed}\n"
+        f"Train: {args.train_samples}  Val: {args.val_samples}\n"
+        f"ch={args.base_ch}  L={getattr(args, 'n_layers', 6)}\n"
+        f"f_scale={args.f_scale:.4g}  g_base={args.g_base:.4g}  g_scale={args.g_scale:.4g}\n"
+        f"Picard: damping={args.picard_damping}  tol={args.picard_tol:.1e}\n"
+        f"Best val {metric_name}: {best_metric:.4e}  Oracle: {oracle:.4e}\n")
 
 
 def _update_registry(base_dir, key, args, best_metric, oracle):
@@ -947,13 +820,15 @@ def _update_registry(base_dir, key, args, best_metric, oracle):
         reg = json.loads(reg_path.read_text()) if reg_path.exists() else {}
     except json.JSONDecodeError:
         reg = {}
+    metric_key = "best_val_relL2" if args.loss == "supervised" else "best_val_resRMSE"
     reg.setdefault("cnn", {})[key] = {
         "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "N": args.N,
         "epochs": args.epochs,
         "k": [args.k_min, args.k_max] if getattr(args, "random_k", False) else args.k,
         "train_samples": args.train_samples,
-        "best_val_relL2": best_metric,
+        "loss": args.loss,
+        metric_key: best_metric,
         "oracle": oracle,
     }
     reg_path.write_text(json.dumps(reg, indent=2, ensure_ascii=False) + "\n")
@@ -1028,11 +903,12 @@ def parse_args():
 
     # Picard sanity
     p.add_argument("--picard-sanity", action="store_true",
-                   help="generate data and print solver stats, then exit if epochs==0")
+                   help="generate data, print solver stats, and exit")
 
     # Loss
-    p.add_argument("--lambda-sup", type=float, default=1.0)
-    p.add_argument("--lambda-pde", type=float, default=0.1)
+    p.add_argument("--loss", default="physics",
+                   choices=["physics", "supervised"],
+                   help="physics: PDE residual only | supervised: |u_pred - u_ref|^2")
 
     # Training control
     p.add_argument("--retrain", action="store_true")
@@ -1045,8 +921,11 @@ def parse_args():
     p.add_argument("--test-seed", type=int, default=1234)
     p.add_argument("--plot", action="store_true")
     p.add_argument("--plot-dir", default="results/figures")
-    p.add_argument("--check-assembly", action="store_true",
-                   help="compare fast vs slow assembly and exit")
+    p.add_argument("--predict-case", default="random",
+                   choices=["random", "sincos"],
+                   help="prediction test case")
+    p.add_argument("--predict-k", type=float, default=None,
+                   help="fixed k for sincos prediction")
     return p.parse_args()
 
 
@@ -1055,35 +934,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    if args.check_assembly:
-        print("=== assembly check: fast (COO) vs slow (lil) ===")
-        N = 32
-        h = 2.0 / (N + 1)
-        rng = np.random.RandomState(42)
-        a = 0.5 + rng.rand(N + 2, N + 2)
-        g = 0.5 + rng.rand(N + 2, N + 2)
-        f = rng.randn(N + 2, N + 2) * 0.1
-        # Zero out interior of g (only boundary matters) and boundary of f
-        g[1:-1, 1:-1] = 0.
-        f[0, :] = f[-1, :] = f[:, 0] = f[:, -1] = 0.
-
-        A_fast, b_fast = _assemble_darcy_system(a, g, f, h)
-        A_slow, b_slow = _assemble_darcy_system_slow_reference(a, g, f, h)
-
-        A_err = abs(A_fast - A_slow).max()
-        b_err = abs(b_fast - b_slow).max()
-        print(f"  |A_fast - A_slow|_max = {A_err:.2e}")
-        print(f"  |b_fast - b_slow|_max = {b_err:.2e}")
-
-        u_fast = spla.spsolve(A_fast, b_fast)
-        u_slow = spla.spsolve(A_slow, b_slow)
-        u_err = abs(u_fast - u_slow).max()
-        print(f"  |u_fast - u_slow|_max = {u_err:.2e}")
-
-        tol = 1e-9
-        ok = A_err < tol and b_err < tol and u_err < tol
-        print(f"  {'PASS' if ok else 'FAIL'}  (threshold {tol:.0e})")
-        return
+    if args.picard_sanity:
         print("=" * 60)
         print("PICARD SANITY CHECK")
         print("=" * 60)
@@ -1136,6 +987,10 @@ def main():
 
     if args.predict:
         return run_prediction(args)
+
+    if args.epochs == 0:
+        print("epochs=0, nothing to train.")
+        return
 
     key = ckpt_key(args)
     base_dir = Path("checkpoints")

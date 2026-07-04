@@ -1,12 +1,12 @@
 # Nonlinear Poisson Equation — CNN Solver
 
-求解非线性通量形式 Poisson 方程（flux-form）：
+求解非线性通量形式 Poisson 方程：
 
 ```text
 -div(u^k grad u) = f,   u = g on boundary,   Omega = [-1,1]^2
 ```
 
-扩散系数为 u^k 本身（无外部 a(x,y) 场），u > 0，k > 0。物理驱动 + 监督联合训练。
+扩散系数为 u^k 本身（无外部 a(x,y) 场），u > 0，k > 0。
 
 ---
 
@@ -14,66 +14,71 @@
 
 | 文件 | 路线 | 用途 |
 |------|------|------|
-| `Baseline_nonlinear_picard.py` | **Route B: Picard** | 随机 PDE 数据生成 + 训练 + 预测（主力脚本） |
-| `Baseline_nonlinear_mms.py` | **Route A: MMS** | 人造精确解验证 / 过拟合 debug（辅助脚本） |
+| `Baseline_nonlinear_picard.py` | **Route B: Picard** | 随机 PDE 生成 + 训练 + 预测（主力） |
+| `Baseline_nonlinear_mms.py` | **Route A: MMS** | 人造解验证 / 过拟合 debug（辅助） |
 
-### Route B — Picard（主力）
+### Route B — Picard
 
-随机采样 f, g, k，用 Picard 迭代（冻结系数线性求解）得到参考解 u_ref，训练 CNN 学习 (f, g, k) → u_ref。
+随机采样 f, g, k → Picard 迭代求解 u_ref → CNN 学习 (f, g, k) → u_ref。
 
-### Route A — MMS（辅助）
+### Route A — MMS
 
-构造正的人造精确解 u_exact(x,y)，用离散 FD 算子反算 f，验证残差 ≈ 0，然后在极小数据集上过拟合，用于检查 CNN 实现是否正确。
+构造 `u_ref = 1 + c1*x + c2*y + 0.15*(1-x²)(1-y²)*smooth`，FD 反算 f（oracle = 0），小数据集过拟合验证。
 
 ---
 
-## Quick Start（Picard）
+## Quick Start
 
 ```bash
-# 参数预检（不训练）
+# 参数预检
 python Baseline_nonlinear_picard.py --picard-sanity --N 32 --train-samples 16 --k 2
 
-# 训练（固定 k）
+# 训练（physics-only）
 python Baseline_nonlinear_picard.py --N 32 --epochs 40 --train-samples 128 --k 2 --retrain --plot
 
-# 训练（随机 k ∈ [1,3]）
+# 训练（supervised）
+python Baseline_nonlinear_picard.py --N 32 --epochs 40 --train-samples 128 --k 2 --loss supervised --retrain --plot
+
+# 训练（随机 k）
 python Baseline_nonlinear_picard.py --N 32 --epochs 40 --random-k --k-min 1 --k-max 3 --retrain --plot
 
-# 从 checkpoint 预测
-python Baseline_nonlinear_picard.py --predict --predict-from checkpoints/cnn/N32_e40_k2/best.pt --plot
+# 预测（随机 PDE）
+python Baseline_nonlinear_picard.py --predict --predict-from checkpoints/cnn/<key>/best.pt --plot
 
-# 小规模调试
-python Baseline_nonlinear_picard.py --N 8 --epochs 2 --train-samples 16 --val-samples 4 --k 2 --device cpu --retrain --plot
+# 预测（sincos 泛化测试）
+python Baseline_nonlinear_picard.py --predict --predict-from checkpoints/cnn/<key>/best.pt --predict-case sincos --plot
 
-# 汇编验证（fast vs slow）
-python Baseline_nonlinear_picard.py --check-assembly
+# MMS 验证
+python Baseline_nonlinear_mms.py --mms-sanity --N 32 --train-samples 8 --k 2
+python Baseline_nonlinear_mms.py --N 32 --epochs 200 --train-samples 32 --k 2 --retrain --plot
 ```
 
 ---
 
-## 主要 CLI 参数（Picard）
+## 主要 CLI 参数
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--N` | 32 | 内部网格点数 |
-| `--epochs` | 100 | 训练轮数 |
-| `--train-samples` | 128 | 训练样本数 |
+| `--epochs` | 100 | 训练轮数（MMS 默认 200） |
+| `--train-samples` | 128 | 训练样本数（MMS 默认 32） |
 | `--batch-size` | 8 | 批大小 |
 | `--lr` | 1e-3 | 学习率 |
 | `--base-ch` | 32 | 隐藏通道数 |
 | `--n-layers` | 6 | 卷积层数 |
-| `--k` | 2.0 | 扩散系数指数 |
+| `--k` | 2.0 | 扩散系数指数（MMS 默认 k∈[0.5,3.0]） |
 | `--random-k` | False | 随机采样 k ∈ [k_min, k_max] |
 | `--f-scale` | 0.1 | forcing 幅度 |
 | `--g-base` | 1.0 | 边界基准值 |
 | `--g-scale` | 0.05 | 边界随机波动 |
-| `--picard-damping` | 0.5 | Picard 阻尼系数 |
-| `--picard-tol` | 1e-8 | Picard 收敛容差 |
-| `--lambda-sup` | 1.0 | 监督 loss 权重 |
-| `--lambda-pde` | 0.1 | PDE 残差 loss 权重 |
+| `--loss` | physics | 训练模式：`physics`（PDE 残差）或 `supervised`（\|u-u_ref\|²） |
+| `--coeff-eps` | 1e-4 | u^k 的 clamp 下界 |
+| `--picard-damping` | 0.5 | Picard 阻尼系数（仅 Picard） |
+| `--picard-tol` | 1e-8 | Picard 收敛容差（仅 Picard） |
 | `--predict-from` | — | 加载 checkpoint 进行预测 |
+| `--predict-case` | random | 预测模式：`random` 或 `sincos`（仅 Picard） |
 | `--retrain` | False | 覆盖已有 checkpoint |
-| `--picard-sanity` | False | 参数预检后退出 |
+| `--picard-sanity` / `--mms-sanity` | False | 参数预检后退出 |
 
 ---
 
@@ -81,20 +86,18 @@ python Baseline_nonlinear_picard.py --check-assembly
 
 ```
 checkpoints/
-├── cnn/N32_e40_k2/                    # 实验运行目录
-│   ├── best.pt                        # 最佳模型（val relL2）
-│   ├── last.pt                        # 最后一轮模型
-│   ├── history.csv                    # 训练曲线
-│   ├── convergence.png                # 收敛图
-│   └── run_info.txt                   # 运行元数据
-├── cnn/latest -> N32_e40_k2           # 指向最近运行
-└── registry.json                      # 实验索引（自动维护）
+├── cnn/N32_e100_tr128_k2_fs0.1_gs0.05_ch32_L6/   # Picard
+│   ├── best.pt, last.pt, history.csv, convergence.png, run_info.txt
+├── cnn_mms/N32_e200_tr32_k2_ch32_L6_mms/          # MMS
+│   ├── best.pt, last.pt, history.csv, convergence.png, run_info.txt
+├── cnn/latest -> N32_e100_tr128_k2_...
+├── cnn_mms/latest -> N32_e200_tr32_k2_...
+└── registry.json                                   # 实验索引（自动维护）
 
 results/
-└── cnn/N32_e40_k2/figures/
-    ├── history/2026-07-04_113800/     # 旧结果自动归档
-    ├── sample_000_panel.png           # 最新结果面板
-    └── metrics.csv
+└── cnn/<key>/figures/
+    ├── history/2026-07-04_113800/                  # 旧结果自动归档
+    ├── sample_000_panel.png, metrics.csv
 ```
 
 ---
@@ -103,24 +106,23 @@ results/
 
 | Metric | 含义 |
 |--------|------|
-| relL2 | u_pred vs u_ref 相对 L2 误差（内部点） |
-| resRMSE | u_pred 的 PDE 残差 RMS |
-| refResRMSE | u_ref 的 PDE 残差 RMS（oracle） |
-| linf | 内部节点最大绝对误差 |
-| gradRelL2 | 梯度的相对 L2 误差 |
-| bmax | 边界最大误差（硬边界下 = 0） |
+| relL2 | u_pred vs u_ref 相对 L2 误差 |
+| resRMSE | u_pred PDE 残差 RMS |
+| refResRMSE | u_ref PDE 残差 RMS（oracle 下限） |
+| linf | 最大绝对误差 |
+| gradRelL2 | 梯度相对 L2 误差 |
 
 ---
 
 ## 关键设计
 
-- **非线性扩散**：系数为 u^k，扩散随解变化；Picard 迭代冻结系数，每步求解线性 Darcy 问题
-- **向量化组装**：scipy.sparse.coo_matrix 快速构建 5 点差分矩阵，`--check-assembly` 可验证
+- **向量化组装**：5 点差分矩阵用 `scipy.sparse.coo_matrix` 构建，无 Python 循环
+- **physics-only 或 supervised**：`--loss` 选训练目标，默认 PDE 残差，每个样本独立按 f 的 RMS 归一化
+- **Picard 收敛判断**：比较 `∥u_new − u_old∥ / ∥u_new∥`，damping=1 时不会假收敛
+- **预测复用训练分布**：`--predict` 自动从 checkpoint 继承 k、f_scale、coeff_eps 等参数
 - **Hard Dirichlet BC**：`u_pred = bnd * g + (1-bnd) * u_raw`
-- **Conservative FD**：交界面上系数取相邻点算术平均 `a_face = 0.5 * (u_c^k + u_neighbor^k)`
-- **Hybrid loss**：`loss = λ_sup * L_sup + λ_pde * L_pde`，其中 PDE 残差为 `(h² * R)²` 的均值
+- **Conservative FD**：交界面系数 = 相邻点算术平均
 - **6 通道输入**：`[f_norm, g, boundary_mask, k_channel, x, y]`，f 和 k 用 z-score 归一化
-- **Picard 收敛**：相对变化 < `picard_tol`，最大迭代 `picard_max_iter`，带阻尼
-- **预测复用训练分布**：`--predict` 自动继承 checkpoint 的数据生成参数
-- **优化器**：AdamW + gradient clipping (max_norm=1.0) + warmup → cosine annealing
-- **MMS 用于验证**：人造精确解确保 FD 算子和 Picard 求解器实现正确
+- **sincos 泛化测试**：`u_ref = sin(πx)·cos(πy)`，FD 反算 f（oracle = 0），测试模型泛化
+- **MMS 对齐 Picard**：两文件共享相同的 loss 选项、命名规范、存储系统
+- **优化器**：AdamW + gradient clipping + warmup → cosine annealing

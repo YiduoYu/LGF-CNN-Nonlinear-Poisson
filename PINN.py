@@ -74,7 +74,7 @@ def make_grid(N: int, device="cpu", dtype=torch.float32):
     return x, y, bnd, 1. - bnd, h
 
 
-def _flux_div(u, k, h, eps=1e-4):
+def _flux_div(u, k, h):
     """5-point flux-form FD: -div(u^k grad u)."""
     if isinstance(k, (int, float)):
         k = torch.tensor([k], device=u.device)
@@ -100,9 +100,9 @@ def _flux_div(u, k, h, eps=1e-4):
     return -(fe - fw + fn - fs) / h
 
 
-def fd_residual(u, f, k, h, eps=1e-4):
+def fd_residual(u, f, k, h):
     """R(u) = -div_h(u^k grad_h u) - f on interior nodes."""
-    return _flux_div(u, k, h, eps) - f[:, :, 1:-1, 1:-1]
+    return _flux_div(u, k, h) - f[:, :, 1:-1, 1:-1]
 
 
 def _solve_linear_poisson(f, g, h):
@@ -639,6 +639,54 @@ def _save_panel(u_true, u_pred, error, f_map, res_pred, res_exact,
     plt.close(fig)
 
 
+def _save_training_curve(history, path, title, dpi=150):
+    """2-panel training curve: losses (log) | relL2 + resRMSE with best checkpoint."""
+    if len(history) < 2:
+        return
+    plt = _get_plt()
+
+    epochs = [h["epoch"] for h in history]
+    # Find best checkpoint by val_loss (same criterion as model selection)
+    val_losses = [h.get("val_loss", float("inf")) for h in history]
+    best_idx = min(range(len(val_losses)), key=lambda i: val_losses[i])
+    best_epoch = epochs[best_idx]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+    fig.suptitle(title)
+
+    # -- Left: loss curves (log scale) --
+    ax1.plot(epochs, [h["loss_pde"] for h in history], "b-", alpha=0.7, label="PDE loss")
+    ax1.plot(epochs, [h["loss_bc"] for h in history], "c-", alpha=0.7, label="BC loss")
+    ax1.plot(epochs, val_losses, "r-", label="val loss")
+    ax1.axvline(best_epoch, color="gray", ls=":", lw=1,
+                label=f"best (epoch {best_epoch})")
+    ax1.set_xlabel("epoch")
+    ax1.set_ylabel("loss")
+    ax1.set_yscale("log")
+    ax1.set_title("Training & validation loss")
+    ax1.legend(fontsize="small")
+    ax1.grid(True, alpha=0.3)
+
+    # -- Right: relL2 + resRMSE --
+    ax2b = ax2.twinx()
+    l1, = ax2.plot(epochs, [h["relL2"] for h in history], "g-", label="relL2")
+    l2, = ax2b.plot(epochs, [h["resRMSE"] for h in history], "m--", label="resRMSE")
+    ax2.scatter(best_epoch, history[best_idx]["relL2"],
+                color="gray", s=60, zorder=5, marker="o",
+                label=f"best (epoch {best_epoch})")
+    ax2.set_xlabel("epoch")
+    ax2.set_ylabel("relL2")
+    ax2b.set_ylabel("resRMSE")
+    handles = [l1, l2, ax2.collections[0]] if ax2.collections else [l1, l2]
+    ax2.legend(handles=handles, loc="upper right", fontsize="small")
+    ax2.grid(True, alpha=0.3)
+    ax2.set_title("Validation metrics (monitoring only)")
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ===========================================================================
 # 9. CLI & main
 # ===========================================================================
@@ -730,6 +778,15 @@ def main():
             w.writeheader()
             w.writerows(history)
         print(f"saved history: {paths['history_path']}")
+
+        if not args.no_plot:
+            out_dir = paths["figure_dir"]
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ckey_short = config_key(args.N, args.epochs, args.hidden_dim,
+                                    args.n_layers, args.bc_weight)
+            _save_training_curve(history, out_dir / "training_curve.png",
+                                 f"PINN training — {ckey_short}")
+            print(f"saved training curve: {out_dir / 'training_curve.png'}")
 
         update_registry(model_type, ckey, {
             "N": args.N, "epochs": args.epochs,

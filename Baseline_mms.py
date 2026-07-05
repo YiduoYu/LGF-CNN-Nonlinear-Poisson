@@ -1,8 +1,6 @@
 """
 CNN solver for -div(u^k grad u) = f on [-1,1]^2, Dirichlet BC u=g.
-
-Manufactured-solution (MMS): generate u_ref -> compute f = -div_h(u_ref^k grad_h u_ref).
-Reference residual is machine zero (same discrete FD operator for u->f and residual).
+MMS data: u_ref -> f = -div_h(u_ref^k grad_h u_ref). k integer >= 0, signed u.
 Supports --loss {supervised, physics}.
 """
 
@@ -14,7 +12,6 @@ import numpy as np
 import torch, torch.nn as nn
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
-
 
 # -- grid -------------------------------------------------------------------
 
@@ -34,59 +31,34 @@ def make_grid(N, device="cpu", dtype=torch.float32):
     bnd[:, :,  :, -1] = 1.
     return x, y, bnd, 1. - bnd, h
 
-
 def enforce_dirichlet(u_raw, g, bnd):
     """Hard Dirichlet projection: u = bnd * g + (1-bnd) * u_raw."""
     return bnd * g + (1. - bnd) * u_raw
 
-
 # -- nonlinear flux-form operator -------------------------------------------
 
-def _coeff(u, k, eps, raw_power):
-    """a(u) for the flux operator.
-
-    Default (training): a = clamp(u,eps)^k — k ~ U(0,5) may be non-integer,
-    so negative bases must be clamped to avoid NaN.
-    raw_power (integer-k test mode): a = u^k exactly, signed u allowed.
-    Implemented as |u|^k * sign(u)^k so it is backend-safe (MPS pow returns
-    NaN for negative float bases)."""
-    if raw_power:
-        k_int = k.round()
-        a = u.abs().pow(k_int)
-        odd = (k_int.long() % 2 == 1)
-        return torch.where(odd & (u < 0), -a, a)
-    return torch.clamp(u, min=eps).pow(k)
-
-
-def nonlinear_flux_divergence(u, k, h, eps=1e-4, raw_power=False):
-    """5-point flux-form FD: -div(u^k grad u) with arithmetic-mean interface coefficients."""
+def _int_pow(x, k):
     if isinstance(k, (int, float)):
-        k = torch.tensor([k], device=u.device)
-    if k.ndim == 1:
-        k = k.view(-1, 1, 1, 1)
-    a = _coeff(u, k, eps, raw_power)
+        ki = int(k)
+        if ki == 0: return torch.ones_like(x)
+        return x.sign().pow(ki) * x.abs().pow(ki)
+    while k.ndim < x.ndim: k = k.unsqueeze(-1)
+    a = x.abs().pow(k.float()); odd = (k.long() % 2 == 1)
+    return torch.where(k == 0, torch.ones_like(x), torch.where(odd & (x < 0), -a, a))
 
-    uc = u[:, :, 1:-1, 1:-1]
-    ac = a[:, :, 1:-1, 1:-1]
+def nonlinear_flux_divergence(u, k, h):
+    if isinstance(k, (int, float)): k = torch.tensor([k], device=u.device)
+    if k.ndim == 1: k = k.view(-1, 1, 1, 1)
+    a = _int_pow(u, k)
+    uc, ac = u[:,:,1:-1,1:-1], a[:,:,1:-1,1:-1]
+    ae=0.5*(ac+a[:,:,1:-1,2:]); aw=0.5*(ac+a[:,:,1:-1,:-2])
+    an=0.5*(ac+a[:,:,2:,1:-1]); as_=0.5*(ac+a[:,:,:-2,1:-1])
+    fe=ae*(u[:,:,1:-1,2:]-uc)/h; fw=aw*(uc-u[:,:,1:-1,:-2])/h
+    fn=an*(u[:,:,2:,1:-1]-uc)/h; fs=as_*(uc-u[:,:,:-2,1:-1])/h
+    return -(fe-fw+fn-fs)/h
 
-    ae = 0.5 * (ac + a[:, :, 1:-1, 2:])
-    aw = 0.5 * (ac + a[:, :, 1:-1, :-2])
-    an = 0.5 * (ac + a[:, :, 2:, 1:-1])
-    as_ = 0.5 * (ac + a[:, :, :-2, 1:-1])
-
-    fe = ae * (u[:, :, 1:-1, 2:] - uc) / h
-    fw = aw * (uc - u[:, :, 1:-1, :-2]) / h
-    fn = an * (u[:, :, 2:, 1:-1] - uc) / h
-    fs = as_ * (uc - u[:, :, :-2, 1:-1]) / h
-
-    return -(fe - fw + fn - fs) / h
-
-
-def nonlinear_pde_residual(u, f, k, h, eps=1e-4, raw_power=False):
-    """PDE residual R = -div_h(u^k grad_h u) - f, interior only."""
-    return (nonlinear_flux_divergence(u, k, h, eps, raw_power)
-            - f[:, :, 1:-1, 1:-1])
-
+def nonlinear_pde_residual(u, f, k, h):
+    return nonlinear_flux_divergence(u, k, h) - f[:,:,1:-1,1:-1]
 
 # -- CNN --------------------------------------------------------------------
 
@@ -109,7 +81,6 @@ class SimpleCNN(nn.Module):
 
     def forward(self, x):
         return self.head(self.body(x))
-
 
 # -- Fourier field generator ------------------------------------------------
 
@@ -134,11 +105,10 @@ def random_fourier_field(N, M, rng=np.random, normalize=True):
         field /= denom
     return field
 
-
 # -- manufactured solution --------------------------------------------------
 
 def manufactured_u(x, y, M, rng=np.random):
-    """u = b(x,y) + (1-x^2)(1-y^2) * q(x,y), shifted positive.  M = Fourier modes."""
+    """u = b(x,y) + (1-x^2)(1-y^2)*q(x,y), signed."""
     x_np = x.cpu().numpy() if isinstance(x, torch.Tensor) else x
     y_np = y.cpu().numpy() if isinstance(y, torch.Tensor) else y
     N = x_np.shape[-1] - 2
@@ -146,7 +116,7 @@ def manufactured_u(x, y, M, rng=np.random):
     phi = (1. - x_np ** 2) * (1. - y_np ** 2)
 
     # Boundary polynomial: b(x,y) = b0 + b1*x + b2*y + b3*x*y
-    b0 = rng.uniform(0.5, 1.5)
+    b0 = rng.uniform(-0.5, 0.5)
     b1, b2 = rng.uniform(-0.3, 0.3, 2)
     b3 = rng.uniform(-0.2, 0.2)
 
@@ -162,15 +132,9 @@ def manufactured_u(x, y, M, rng=np.random):
 
     u = boundary_part + 0.15 * phi * interior_field
 
-    # Global shift to enforce positivity (no clamp — stays smooth)
-    margin = 0.3 - u.min()
-    if margin > 0:
-        u = u + margin
-
     if isinstance(x, torch.Tensor):
         return torch.from_numpy(u)      # CPU float64; caller casts for training
     return u
-
 
 # -- MMS dataset ------------------------------------------------------------
 
@@ -182,23 +146,22 @@ def make_mms_dataset(N, n_samples, device, args, seed):
     f_list, g_list, k_list, u_list = [], [], [], []
     res64_sq = 0.
 
-    eps = getattr(args, "coeff_eps", 1e-4)
     M = getattr(args, "fourier_m", 6)
     for _ in range(n_samples):
         if getattr(args, "random_k", False):
-            k_i = float(rng.uniform(args.k_min, args.k_max))
+            k_i = int(rng.randint(args.k_min, args.k_max + 1))
         else:
-            k_i = float(args.k)
+            k_i = int(args.k)
 
         u64 = manufactured_u(x64[0, 0], y64[0, 0], M, rng)
         u64 = u64.unsqueeze(0).unsqueeze(0)          # CPU float64
         k64 = torch.tensor([k_i], dtype=torch.float64)
         f64 = torch.zeros_like(u64)
-        f64[:, :, 1:-1, 1:-1] = nonlinear_flux_divergence(u64, k64, h, eps)
+        f64[:, :, 1:-1, 1:-1] = nonlinear_flux_divergence(u64, k64, h)
         g64 = u64.clone()
         g64[:, :, 1:-1, 1:-1] = 0.
         res64_sq += float(nonlinear_pde_residual(
-            u64, f64, k64, h, eps=eps).pow(2).sum())
+            u64, f64, k64, h).pow(2).sum())
 
         f_list.append(f64.float().to(device))
         g_list.append(g64.float().to(device))
@@ -213,17 +176,15 @@ def make_mms_dataset(N, n_samples, device, args, seed):
         "ref_res64": math.sqrt(res64_sq / (n_samples * N * N)),
     }
 
-
-def ref_residual_rmse64(data, eps):
+def ref_residual_rmse64(data):
     """Residual RMSE of the stored (float32) reference data, computed in
     float64, so the ~h^-2*eps32 rounding floor is measured, not hidden.
     Training itself stays float32."""
     u = data["u_ref"].detach().cpu().double()
     f = data["f"].detach().cpu().double()
     k = data["k"].detach().cpu().double()
-    return float(nonlinear_pde_residual(u, f, k, data["h"], eps=eps)
+    return float(nonlinear_pde_residual(u, f, k, data["h"])
                  .pow(2).mean().sqrt())
-
 
 # -- sparse linear FD solver / trivial baseline ------------------------------
 
@@ -264,7 +225,6 @@ def _assemble_linear_system(a, g, f, h):
     A = sp.coo_matrix((data, (rows, cols)), shape=(n, n)).tocsr()
     return A, b
 
-
 def solve_linear_fd(f, g, a, h):
     """Direct solve: -div(a grad u) = f, Dirichlet BC u = g.
     Inputs/outputs are numpy arrays [H,W]."""
@@ -273,7 +233,6 @@ def solve_linear_fd(f, g, a, h):
     u = g.copy()
     u[1:-1, 1:-1] = u_int.reshape(a.shape[0] - 2, a.shape[1] - 2)
     return u
-
 
 def trivial_linear_baseline(data):
     """Mean relL2 of a≡1 linear solve vs nonlinear u_ref.  CNN must beat this."""
@@ -290,7 +249,6 @@ def trivial_linear_baseline(data):
         rl2.append(np.linalg.norm(err) / max(np.linalg.norm(ref), 1e-12))
     return float(np.mean(rl2))
 
-
 # -- input / stats / batching ------------------------------------------------
 
 def build_input(f_norm, g, bnd, k_norm, x, y):
@@ -301,19 +259,16 @@ def build_input(f_norm, g, bnd, k_norm, x, y):
     k_ch = k_norm.view(B, 1, 1, 1).expand(-1, 1, *bnd.shape[-2:])
     return torch.cat([f_norm, g, _expand(bnd), k_ch, _expand(x), _expand(y)], dim=1)
 
-
 def compute_stats(data):
     fi = data["f"][:, :, 1:-1, 1:-1]
     k = data["k"]
     return (fi.mean().item(), fi.std(unbiased=False).clamp_min(1e-8).item(),
             k.mean().item(), k.std(unbiased=False).clamp_min(1e-8).item())
 
-
 def _take_batch(data, idx):
     return {"h": data["h"],
             **{k: data[k][idx] for k in ("f", "g", "k", "u_ref")},
             **{k: data[k][:1] for k in ("mask", "interior_mask", "x", "y")}}
-
 
 def _forward(model, batch, stats):
     f_mean, f_std, k_mean, k_std = stats
@@ -321,7 +276,6 @@ def _forward(model, batch, stats):
     kn = (batch["k"] - k_mean) / k_std
     inp = build_input(fn, batch["g"], batch["mask"], kn, batch["x"], batch["y"])
     return enforce_dirichlet(model(inp), batch["g"], batch["mask"])
-
 
 def _select_device(name):
     if name != "auto":
@@ -331,7 +285,6 @@ def _select_device(name):
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
 
 # -- training ---------------------------------------------------------------
 
@@ -357,7 +310,6 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
     print(f"f stats: mean={stats[0]:.4e}  std={stats[1]:.4e}  "
           f"k stats: mean={stats[2]:.4e}  std={stats[3]:.4e}")
 
-    eps = getattr(args, "coeff_eps", 1e-4)
     # Reference residual, reported in float64 (float32 rounding floor
     # ~h^-2*eps32 must not be mistaken for solver accuracy)
     ref_res = val_data["ref_res64"]
@@ -430,7 +382,7 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
             else:
                 # physics: per-sample normalized PDE residual
                 res = nonlinear_pde_residual(
-                    u_pred, batch["f"], batch["k"], batch["h"], eps=eps)
+                    u_pred, batch["f"], batch["k"], batch["h"])
                 f_int = batch["f"][:, :, 1:-1, 1:-1]
                 scale = f_int.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt().clamp_min(1.0)
                 loss = ((res / scale) ** 2).mean()
@@ -486,7 +438,6 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
     _save_convergence_plot(history, convergence_path, oracle, args.loss)
     return model, oracle, best_metric
 
-
 # -- evaluation -------------------------------------------------------------
 
 @torch.no_grad()
@@ -495,14 +446,13 @@ def evaluate(model, data, stats, batch_size, args):
     n = data["f"].shape[0]
     dev = data["f"].device
     H, W = data["f"].shape[-2:]
-    eps = getattr(args, "coeff_eps", 1e-4)
     all_rows = []
 
     for start in range(0, n, batch_size):
         idx = torch.arange(start, min(start + batch_size, n), device=dev)
         b = _take_batch(data, idx)
         up = _forward(model, b, stats)
-        rows, _ = per_sample_metrics(up, b, eps)
+        rows, _ = per_sample_metrics(up, b, start_id=start)
         all_rows.extend(rows)
 
     n_total = len(all_rows)
@@ -525,8 +475,7 @@ def evaluate(model, data, stats, batch_size, args):
             "constBaselineRelL2": sum(r["constBaselineRelL2"] for r in all_rows) / n_total,
             "per_sample": all_rows}
 
-
-def per_sample_metrics(u_pred, batch, eps):
+def per_sample_metrics(u_pred, batch, start_id=0):
     """Per-sample metrics: all 12 quantities computed sample-by-sample then averaged.
 
     Returns (list_of_dicts, summary_dict) where summary = {metric: {mean, std, min, max}}."""
@@ -535,13 +484,10 @@ def per_sample_metrics(u_pred, batch, eps):
     bnd_mask = batch["mask"].expand_as(u_pred)
     h = float(batch["h"])
     n_samples = u_pred.shape[0]
-    raw = bool(batch.get("raw_power", False))
 
     err = (u_pred - ue) * interior
-    res = nonlinear_pde_residual(u_pred, batch["f"], batch["k"], batch["h"],
-                                 eps=eps, raw_power=raw)
-    res_ref = nonlinear_pde_residual(ue, batch["f"], batch["k"], batch["h"],
-                                     eps=eps, raw_power=raw)
+    res = nonlinear_pde_residual(u_pred, batch["f"], batch["k"], batch["h"])
+    res_ref = nonlinear_pde_residual(ue, batch["f"], batch["k"], batch["h"])
 
     err_flat = err[:, :, 1:-1, 1:-1].flatten(1)
     u_flat = ue[:, :, 1:-1, 1:-1].flatten(1)
@@ -566,7 +512,7 @@ def per_sample_metrics(u_pred, batch, eps):
         const_rl2 = (const_err[0].norm() / u_flat[i].norm().clamp_min(1e-12)).item()
 
         rows.append({
-            "sample_id": i,
+            "sample_id": start_id + i,
             "k": batch["k"][i].item(),
             "relL2": rl2,
             "RMSE": err_flat[i].pow(2).mean().sqrt().item(),
@@ -607,12 +553,10 @@ def per_sample_metrics(u_pred, batch, eps):
 
     return rows, summary
 
-
 def save_summary_json(summary, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
-
 
 # -- visualization ----------------------------------------------------------
 
@@ -622,7 +566,6 @@ def _setup_plot():
     import matplotlib.pyplot as plt
     return plt
 
-
 def _write_csv(rows, path):
     if not rows:
         return
@@ -631,7 +574,6 @@ def _write_csv(rows, path):
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
-
 
 def _save_panel(ue, up, err, fm, rp, re, path, title, fext, rext, dpi=200):
     plt = _setup_plot()
@@ -666,7 +608,6 @@ def _save_panel(ue, up, err, fm, rp, re, path, title, fext, rext, dpi=200):
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
-
 def _save_centerline(ue, up, path, title, dpi=150):
     """1D cut along y≈0: u_ref vs u_pred."""
     plt = _setup_plot()
@@ -686,7 +627,6 @@ def _save_centerline(ue, up, path, title, dpi=150):
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
-
 
 def _save_convergence_plot(history, path, oracle=0., loss_type="physics"):
     if len(history) < 2:
@@ -715,9 +655,7 @@ def _save_convergence_plot(history, path, oracle=0., loss_type="physics"):
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-
 # -- analytic test suite ----------------------------------------------------
-
 
 # Signed test functions; analytic suite uses a = u^k exactly (raw_power=True),
 # so --predict-k must be 2.
@@ -728,15 +666,9 @@ ANALYTIC_CASES = {
     "u4": lambda x, y: x ** 2 * (1. - y) + np.sin(np.pi * x) * y,
 }
 
-
-def make_analytic_dataset(N, case, k_val, device, eps):
-    """Build a test dataset from an analytic u(x,y).
-
-    Signed u allowed; uses a(u)=u^k exactly (raw_power=True), so k must be 2."""
-    k_val = float(k_val)
-    if abs(k_val - 2.0) > 1e-12:
-        raise ValueError(
-            f"analytic suite requires k=2 (signed u, raw u^k), got {k_val}")
+def make_analytic_dataset(N, case, k_val, device):
+    """Build a test dataset from an analytic u(x,y). k integer."""
+    k_val = int(k_val)
     x_t, y_t, bnd, interior, h = make_grid(N, device)
     x_np = x_t[0, 0].cpu().numpy()
     y_np = y_t[0, 0].cpu().numpy()
@@ -747,7 +679,7 @@ def make_analytic_dataset(N, case, k_val, device, eps):
     k64 = torch.tensor([k_val], dtype=torch.float64)
     f64 = torch.zeros_like(u64)
     f64[:, :, 1:-1, 1:-1] = nonlinear_flux_divergence(
-        u64, k64, h, eps, raw_power=True)
+        u64, k64, h)
     g_np = u_np.copy()
     g_np[1:-1, 1:-1] = 0.
 
@@ -755,16 +687,13 @@ def make_analytic_dataset(N, case, k_val, device, eps):
         "f": f64.float().to(device), "g": torch.from_numpy(g_np).float()[None, None].to(device),
         "k": torch.tensor([k_val], dtype=torch.float32, device=device),
         "u_ref": u64.float().to(device),
-        "raw_power": True,
         "mask": bnd, "interior_mask": interior,
         "x": x_t, "y": y_t, "h": h,
         "ref_res64": 0.,   # analytic ref residual computed on-demand
     }
 
-
 def run_analytic_suite(model, stats, device, args, ckpt_args, out_dir):
     """Run all 4 analytic test cases, save metrics + figures."""
-    eps = getattr(ckpt_args, "coeff_eps", 1e-4)
     N = ckpt_args.N
     all_rows = []
     out_dir = Path(out_dir)
@@ -776,10 +705,10 @@ def run_analytic_suite(model, stats, device, args, ckpt_args, out_dir):
     k_test = float(getattr(args, "predict_k", 2.0))
     for case_name in ["u1", "u2", "u3", "u4"]:
         print(f"\n  --- analytic case: {case_name}  (k={k_test:g}) ---")
-        batch = make_analytic_dataset(N, case_name, k_test, device, eps)
+        batch = make_analytic_dataset(N, case_name, k_test, device)
         with torch.no_grad():
             u_pred = _forward(model, batch, stats)
-        rows, summary = per_sample_metrics(u_pred, batch, eps)
+        rows, summary = per_sample_metrics(u_pred, batch)
         for r in rows:
             r["case"] = case_name
         all_rows.extend(rows)
@@ -792,11 +721,9 @@ def run_analytic_suite(model, stats, device, args, ckpt_args, out_dir):
             ui = batch["u_ref"][0, 0]
             up = u_pred[0, 0]
             pr = nonlinear_pde_residual(
-                u_pred[0:1], batch["f"][0:1], batch["k"][0:1], batch["h"],
-                eps=eps, raw_power=True)[0, 0]
+                u_pred[0:1], batch["f"][0:1], batch["k"][0:1], batch["h"])[0, 0]
             er = nonlinear_pde_residual(
-                batch["u_ref"][0:1], batch["f"][0:1], batch["k"][0:1], batch["h"],
-                eps=eps, raw_power=True)[0, 0]
+                batch["u_ref"][0:1], batch["f"][0:1], batch["k"][0:1], batch["h"])[0, 0]
             _save_panel(ui, up, up - ui, batch["f"][0, 0], pr, er,
                         out_dir / f"analytic_{case_name}_panel.png",
                         f"analytic {case_name}  k={rows[0]['k']:.2f}  "
@@ -817,7 +744,6 @@ def run_analytic_suite(model, stats, device, args, ckpt_args, out_dir):
     save_summary_json(summary_all, out_dir / "analytic_summary.json")
     print(f"  analytic suite saved → {out_dir}")
     return all_rows
-
 
 # -- prediction -------------------------------------------------------------
 
@@ -897,8 +823,7 @@ def run_prediction(args):
         }, p)
         print(f"saved predictions → {p}")
 
-    eps = getattr(data_args, "coeff_eps", 1e-4)
-    rows, summary = per_sample_metrics(u_pred, batch, eps=eps)
+    rows, summary = per_sample_metrics(u_pred, batch)
 
     # Always save metrics — use save dir parent, plot-dir, or default
     if args.predict_save:
@@ -922,10 +847,10 @@ def run_prediction(args):
 
             pr = nonlinear_pde_residual(
                 u_pred[i:i+1], batch["f"][i:i+1],
-                batch["k"][i:i+1], h, eps=eps)[0, 0]
+                batch["k"][i:i+1], h)[0, 0]
             er = nonlinear_pde_residual(
                 batch["u_ref"][i:i+1], batch["f"][i:i+1],
-                batch["k"][i:i+1], h, eps=eps)[0, 0]
+                batch["k"][i:i+1], h)[0, 0]
 
             _save_panel(ui, up, up - ui, batch["f"][i, 0], pr, er,
                         out / f"sample_{i:03d}_panel.png",
@@ -936,7 +861,6 @@ def run_prediction(args):
                              f"relL2={row['relL2']:.3e}")
 
         print(f"saved → {out}")
-
 
 # -- CLI --------------------------------------------------------------------
 
@@ -951,7 +875,6 @@ def ckpt_key(args):
             f"_{k_str}_M{getattr(args, 'fourier_m', 6)}"
             f"_ch{args.base_ch}_L{n_layers}{loss_suffix}_mms")
 
-
 def _write_run_info(path, args, best_metric, oracle):
     k_str = (f"{args.k_min:.4g}–{args.k_max:.4g}" if getattr(args, "random_k", False)
              else f"{args.k:.4g}")
@@ -964,7 +887,6 @@ def _write_run_info(path, args, best_metric, oracle):
         f"Train: {args.train_samples}  Val: {args.val_samples}\n"
         f"ch={args.base_ch}  L={getattr(args, 'n_layers', 6)}\n"
         f"Best val {metric_name}: {best_metric:.4e}  Oracle: {oracle:.4e}\n")
-
 
 def _update_registry(base_dir, key, args, best_metric, oracle):
     reg_path = base_dir / "registry.json"
@@ -982,12 +904,10 @@ def _update_registry(base_dir, key, args, best_metric, oracle):
     }
     reg_path.write_text(json.dumps(reg, indent=2, ensure_ascii=False) + "\n")
 
-
 def _link_latest(base_dir, key):
     latest = base_dir / "cnn_mms" / "latest"
     latest.unlink(missing_ok=True)
     latest.symlink_to(key)
-
 
 def _archive_old_figures(figures_dir):
     if not figures_dir.exists():
@@ -1000,7 +920,6 @@ def _archive_old_figures(figures_dir):
     for p in old:
         p.rename(archive / p.name)
     print(f"  archived {len(old)} files → {archive}")
-
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
@@ -1020,12 +939,11 @@ def parse_args():
     p.add_argument("--seed", type=int, default=1234)
 
     # Nonlinear PDE
-    p.add_argument("--k", type=float, default=2.0)
+    p.add_argument("--k", type=int, default=2)
     p.add_argument("--random-k", action=argparse.BooleanOptionalAction, default=True,
                    help="sample k uniformly from [k_min, k_max] (default: True; use --no-random-k to fix)")
-    p.add_argument("--k-min", type=float, default=0.0)
-    p.add_argument("--k-max", type=float, default=5.0)
-    p.add_argument("--coeff-eps", type=float, default=1e-4)
+    p.add_argument("--k-min", type=int, default=0)
+    p.add_argument("--k-max", type=int, default=5)
     p.add_argument("--fourier-m", type=int, default=6,
                    help="number of Fourier modes per dimension for random fields")
 
@@ -1049,12 +967,11 @@ def parse_args():
     p.add_argument("--predict-case", default="data",
                    choices=["data", "analytic"],
                    help="'data': same MMS family | 'analytic': 4 signed analytic test cases, requires k=2")
-    p.add_argument("--predict-k", type=float, default=2.0,
-                   help="fixed k for prediction (--predict-case analytic requires k=2)")
+    p.add_argument("--predict-k", type=int, default=2,
+                   help="fixed integer k for prediction")
     p.add_argument("--plot-dir", default="",
                    help="directory for output figures and metrics CSVs")
     return p.parse_args()
-
 
 # -- main -------------------------------------------------------------------
 
@@ -1078,9 +995,8 @@ def main():
         data = make_mms_dataset(args.N, args.train_samples, device, args,
                                 seed=args.seed)
 
-        eps = getattr(args, "coeff_eps", 1e-4)
         exact_rmse = data["ref_res64"]
-        ref32in64 = ref_residual_rmse64(data, eps)
+        ref32in64 = ref_residual_rmse64(data)
         with torch.no_grad():
             u_ex = data["u_ref"]
             bnd_err = float(
@@ -1093,7 +1009,7 @@ def main():
         print(f"  float32 data residual   = {ref32in64:.4e}  "
               f"(~h^-2·eps32 rounding floor)")
         print(f"  boundary error  = {bnd_err:.2e}  (should be 0)")
-        print(f"  u_ref range     = [{u_min:.4f}, {u_max:.4f}]  (should be > 0.3)")
+        print(f"  u_ref range     = [{u_min:.4f}, {u_max:.4f}]  )")
         print(f"  f range         = [{float(fi.min()):.4e}, {float(fi.max()):.4e}]")
         print(f"  trivial baseline (a≡1) relL2 = {trivial_linear_baseline(data):.4e}")
 
@@ -1142,7 +1058,6 @@ def main():
         run_prediction(pa)
 
     print(f"done: checkpoints/cnn_mms/{key}")
-
 
 if __name__ == "__main__":
     main()

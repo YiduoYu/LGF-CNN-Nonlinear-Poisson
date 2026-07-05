@@ -1,11 +1,10 @@
 """
-CNN solver for -div(u^k grad u) = f on [-1,1]^2, Dirichlet BC u=g.
-MMS data: u_ref -> f = -div_h(u_ref^k grad_h u_ref). k integer >= 0, signed u.
-Supports --loss {supervised, physics}.
+CNN solver for -div(|u|^k grad u) = f on [-1,1]^2, Dirichlet BC u=g.
+a(u,k) = |u|^k.  MMS data: u_ref -> f = -div_h(a grad_h u_ref).
+k integer >= 0, signed u. Supports --loss {supervised, physics}.
 """
 
-import argparse, csv, json, math, os, random, tempfile
-from datetime import datetime
+import argparse, csv, json, math, os, random, tempfile, time
 from pathlib import Path
 
 import numpy as np
@@ -37,28 +36,57 @@ def enforce_dirichlet(u_raw, g, bnd):
 
 # -- nonlinear flux-form operator -------------------------------------------
 
-def _int_pow(x, k):
+def _abs_pow(x, k):
+    """a(u,k) = |u|^k.
+
+    k == 0  →  a = 1  (constant diffusivity)
+    k >= 1  →  a = |u|^k
+    Batched k: each sample can have a different k, broadcast to x shape.
+    """
     if isinstance(k, (int, float)):
         ki = int(k)
-        if ki == 0: return torch.ones_like(x)
-        return x.sign().pow(ki) * x.abs().pow(ki)
-    while k.ndim < x.ndim: k = k.unsqueeze(-1)
-    a = x.abs().pow(k.float()); odd = (k.long() % 2 == 1)
-    return torch.where(k == 0, torch.ones_like(x), torch.where(odd & (x < 0), -a, a))
+        if ki == 0:
+            return torch.ones_like(x)
+        return x.abs().pow(ki)
+
+    # batched k: one k per sample, broadcast to u shape
+    while k.ndim < x.ndim:
+        k = k.unsqueeze(-1)
+    return x.abs().pow(k.float())
+
 
 def nonlinear_flux_divergence(u, k, h):
-    if isinstance(k, (int, float)): k = torch.tensor([k], device=u.device)
-    if k.ndim == 1: k = k.view(-1, 1, 1, 1)
-    a = _int_pow(u, k)
-    uc, ac = u[:,:,1:-1,1:-1], a[:,:,1:-1,1:-1]
-    ae=0.5*(ac+a[:,:,1:-1,2:]); aw=0.5*(ac+a[:,:,1:-1,:-2])
-    an=0.5*(ac+a[:,:,2:,1:-1]); as_=0.5*(ac+a[:,:,:-2,1:-1])
-    fe=ae*(u[:,:,1:-1,2:]-uc)/h; fw=aw*(uc-u[:,:,1:-1,:-2])/h
-    fn=an*(u[:,:,2:,1:-1]-uc)/h; fs=as_*(uc-u[:,:,:-2,1:-1])/h
-    return -(fe-fw+fn-fs)/h
+    """5-point flux-form FD: -div(a(u,k) grad u) with arithmetic-mean
+    interface coefficients a = |u|^k."""
+    if isinstance(k, (int, float)):
+        k = torch.tensor([k], device=u.device)
+    if k.ndim == 1:
+        k = k.view(-1, 1, 1, 1)
+
+    a = _abs_pow(u, k)
+
+    # cell-centered coefficient and u
+    uc = u[:, :, 1:-1, 1:-1]
+    ac = a[:, :, 1:-1, 1:-1]
+
+    # arithmetic-mean interface coefficients
+    ae = 0.5 * (ac + a[:, :, 1:-1, 2:])
+    aw = 0.5 * (ac + a[:, :, 1:-1, :-2])
+    an = 0.5 * (ac + a[:, :, 2:, 1:-1])
+    as_ = 0.5 * (ac + a[:, :, :-2, 1:-1])
+
+    # flux on each face (east, west, north, south)
+    fe = ae * (u[:, :, 1:-1, 2:] - uc) / h
+    fw = aw * (uc - u[:, :, 1:-1, :-2]) / h
+    fn = an * (u[:, :, 2:, 1:-1] - uc) / h
+    fs = as_ * (uc - u[:, :, :-2, 1:-1]) / h
+
+    return -(fe - fw + fn - fs) / h
+
 
 def nonlinear_pde_residual(u, f, k, h):
-    return nonlinear_flux_divergence(u, k, h) - f[:,:,1:-1,1:-1]
+    """PDE residual R = -div_h(a(u,k) grad_h u) - f, interior nodes only."""
+    return nonlinear_flux_divergence(u, k, h) - f[:, :, 1:-1, 1:-1]
 
 # -- CNN --------------------------------------------------------------------
 
@@ -139,7 +167,7 @@ def manufactured_u(x, y, M, rng=np.random):
 # -- MMS dataset ------------------------------------------------------------
 
 def make_mms_dataset(N, n_samples, device, args, seed):
-    """Build MMS dataset: u_ref -> f = -div_h(u_ref^k grad_h u_ref) in float64, store float32."""
+    """Build MMS dataset: u_ref -> f = -div_h(|u_ref|^k grad_h u_ref) in float64, store float32."""
     rng = np.random.RandomState(seed)
     x_t, y_t, bnd, interior, h = make_grid(N, device)
     x64, y64, *_ = make_grid(N, "cpu", torch.float64)
@@ -286,6 +314,26 @@ def _select_device(name):
         return torch.device("mps")
     return torch.device("cpu")
 
+def _sync(device):
+    """Block until pending GPU kernels finish (for wall-time measurement)."""
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.synchronize()
+
+def _time_forward(model, batch, stats):
+    """CNN inference wall time (model forward only, after one warm-up forward).
+    Returns (u_pred, ms_per_batch, ms_per_sample)."""
+    device = batch["f"].device
+    with torch.no_grad():
+        _forward(model, batch, stats)          # warm-up
+        _sync(device)
+        t0 = time.perf_counter()
+        u_pred = _forward(model, batch, stats)
+        _sync(device)
+        ms = (time.perf_counter() - t0) * 1e3
+    return u_pred, ms, ms / batch["f"].shape[0]
+
 # -- training ---------------------------------------------------------------
 
 def train(args, best_path, last_path, history_path, convergence_path, model=None):
@@ -297,7 +345,7 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
 
     device = _select_device(args.device)
 
-    print(f"Equation: -div(u^k grad u) = f  |  k = {args.k}  |  data=mms")
+    print(f"Equation: -div(|u|^k grad u) = f  |  k = {args.k}  |  data=mms")
     if getattr(args, "random_k", False):
         print(f"  random k in [{args.k_min}, {args.k_max}]")
 
@@ -322,11 +370,10 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
     print(f"MMS residual RMSE (float64) = {ref_res:.4e}  (should be near 0)")
     print(f"u_ref range: [{u_min:.4f}, {u_max:.4f}]  "
           f"boundary error = {bnd_err:.2e}")
-    oracle = ref_res
 
     triv_rl2 = trivial_linear_baseline(val_data)
     print(f"trivial baseline (a≡1 linear Poisson) relL2 = {triv_rl2:.4e}  "
-          f"(CNN must beat this to have learned u^k)")
+          f"(CNN must beat this to have learned a(u,k))")
 
     n_layers = getattr(args, "n_layers", 6)
     if model is None:
@@ -359,7 +406,7 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
 
     n_train = train_data["f"].shape[0]
     n_val = val_data["f"].shape[0]
-    print(f"device={device}  oracle={oracle:.4e}  "
+    print(f"device={device}  ref_res={ref_res:.4e}  "
           f"steps/epoch={steps_per_ep}  total={total_steps}  "
           f"n_train={n_train}  n_val={n_val}")
 
@@ -400,6 +447,7 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
                 best_metric = val_m[val_key]
                 best_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save({
+                    "model_type": "cnn_mms",
                     "model_state_dict": model.state_dict(),
                     "stats": stats,
                     "args": vars(args),
@@ -420,9 +468,7 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
                 "val_relL2": val_m["relL2"],
                 "val_maxError": val_m["maxError"],
                 "val_gradRelL2": val_m["gradRelL2"],
-                "val_gradLinf": val_m["gradLinf"],
                 "val_meanMaxError": val_m["meanMaxError"],
-                "val_maxMaxError": val_m["maxMaxError"],
                 "val_meanBoundaryError": val_m["meanBoundaryError"],
                 "val_maxBoundaryError": val_m["maxBoundaryError"],
                 "val_meanGradLinf": val_m["meanGradLinf"],
@@ -432,11 +478,12 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
             })
 
     last_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_state_dict": model.state_dict(),
+    torch.save({"model_type": "cnn_mms",
+                 "model_state_dict": model.state_dict(),
                  "stats": stats, "args": vars(args)}, last_path)
     _write_csv(history, history_path)
-    _save_convergence_plot(history, convergence_path, oracle, args.loss)
-    return model, oracle, best_metric
+    _save_convergence_plot(history, convergence_path, args.loss)
+    return model, best_metric
 
 # -- evaluation -------------------------------------------------------------
 
@@ -461,16 +508,13 @@ def evaluate(model, data, stats, batch_size, args):
     return {"relL2": sum(r["relL2"] for r in all_rows) / n_total,
             "maxError": max(r["maxError"] for r in all_rows),
             "meanMaxError": sum(r["maxError"] for r in all_rows) / n_total,
-            "maxMaxError": max(r["maxError"] for r in all_rows),
             "meanBoundaryError": sum(r["bndErr"] for r in all_rows) / n_total,
             "maxBoundaryError": max(r["bndErr"] for r in all_rows),
             "meanGradLinf": sum(r["gradLinf"] for r in all_rows) / n_total,
             "maxGradLinf": max(r["gradLinf"] for r in all_rows),
             "resRMSE": math.sqrt(sum(r["predResRMSE"] ** 2 * n_pts for r in all_rows) / n_int),
             "refResRMSE": math.sqrt(sum(r["refResRMSE"] ** 2 * n_pts for r in all_rows) / n_int),
-            "bmax": max(r["bndErr"] for r in all_rows),
             "gradRelL2": sum(r["gradRelL2"] for r in all_rows) / n_total,
-            "gradLinf": max(r["gradLinf"] for r in all_rows),
             "linearBaselineRelL2": sum(r["linearBaselineRelL2"] for r in all_rows) / n_total,
             "constBaselineRelL2": sum(r["constBaselineRelL2"] for r in all_rows) / n_total,
             "per_sample": all_rows}
@@ -553,10 +597,6 @@ def per_sample_metrics(u_pred, batch, start_id=0):
 
     return rows, summary
 
-def save_summary_json(summary, path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
 
 # -- visualization ----------------------------------------------------------
 
@@ -628,7 +668,7 @@ def _save_centerline(ue, up, path, title, dpi=150):
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
-def _save_convergence_plot(history, path, oracle=0., loss_type="physics"):
+def _save_convergence_plot(history, path, loss_type="physics"):
     if len(history) < 2:
         return
     plt = _setup_plot()
@@ -645,10 +685,8 @@ def _save_convergence_plot(history, path, oracle=0., loss_type="physics"):
     ax2b = ax2.twinx()
     l1, = ax2.plot(epochs_list, [h["val_relL2"] for h in history], "g-", label="relL2")
     l2, = ax2b.plot(epochs_list, [h["val_resRMSE"] for h in history], "m--", label="resRMSE")
-    handles = [l1, l2]
-    if oracle > 0:
-        handles.append(ax2b.axhline(oracle, color="gray", ls=":", label=f"oracle {oracle:.1e}"))
-    ax2.set_xlabel("epoch"); ax2.legend(handles=handles, loc="upper right")
+    ax2.set_xlabel("epoch")
+    ax2.legend(handles=[l1, l2], loc="upper right")
     ax2.grid(True, alpha=.3); ax2.set_title("Validation")
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -657,10 +695,10 @@ def _save_convergence_plot(history, path, oracle=0., loss_type="physics"):
 
 # -- analytic test suite ----------------------------------------------------
 
-# Signed test functions; analytic suite uses a = u^k exactly (raw_power=True),
-# so --predict-k must be 2.
+# Signed test functions; a(u,k) = |u|^k gives non-negative diffusivity,
+# so any integer k >= 0 is safe regardless of u sign.
 ANALYTIC_CASES = {
-    "u1": lambda x, y: (1. - x ** 2) * (1. - y ** 2) * np.sin(np.pi * x) * np.cos(np.pi * y),
+    "u1": lambda x, y: np.sin(np.pi * x) * np.cos(np.pi * y),
     "u2": lambda x, y: x * (1. - x) * y * (1. - y),
     "u3": lambda x, y: np.cos(np.pi * x) * np.cos(2. * np.pi * y),
     "u4": lambda x, y: x ** 2 * (1. - y) + np.sin(np.pi * x) * y,
@@ -683,17 +721,19 @@ def make_analytic_dataset(N, case, k_val, device):
     g_np = u_np.copy()
     g_np[1:-1, 1:-1] = 0.
 
+    res64 = float(nonlinear_pde_residual(u64, f64, k64, h).pow(2).mean().sqrt())
+
     return {
         "f": f64.float().to(device), "g": torch.from_numpy(g_np).float()[None, None].to(device),
         "k": torch.tensor([k_val], dtype=torch.float32, device=device),
         "u_ref": u64.float().to(device),
         "mask": bnd, "interior_mask": interior,
         "x": x_t, "y": y_t, "h": h,
-        "ref_res64": 0.,   # analytic ref residual computed on-demand
+        "ref_res64": res64,   # float64 residual of (u_ref, f): machine precision by construction
     }
 
 def run_analytic_suite(model, stats, device, args, ckpt_args, out_dir):
-    """Run all 4 analytic test cases, save metrics + figures."""
+    """Run all analytic test cases, save metrics + figures."""
     N = ckpt_args.N
     all_rows = []
     out_dir = Path(out_dir)
@@ -702,20 +742,24 @@ def run_analytic_suite(model, stats, device, args, ckpt_args, out_dir):
     fext = [-1., 1., -1., 1.]
     rext = [-1. + h, 1. - h, -1. + h, 1. - h]
 
-    k_test = float(getattr(args, "predict_k", 2.0))
-    for case_name in ["u1", "u2", "u3", "u4"]:
+    k_test = int(getattr(args, "predict_k", 2))
+    cnn_ms_all = []
+    for case_name in ANALYTIC_CASES:
         print(f"\n  --- analytic case: {case_name}  (k={k_test:g}) ---")
         batch = make_analytic_dataset(N, case_name, k_test, device)
-        with torch.no_grad():
-            u_pred = _forward(model, batch, stats)
+        u_pred, _, cnn_ms_sample = _time_forward(model, batch, stats)
+        cnn_ms_all.append(cnn_ms_sample)
         rows, summary = per_sample_metrics(u_pred, batch)
         for r in rows:
             r["case"] = case_name
+            r["cnn_ms_per_sample"] = cnn_ms_sample
+            r["fd_solver_ms_per_sample"] = float("nan")   # no FD solve in MMS pipeline
         all_rows.extend(rows)
 
         print(f"    relL2={rows[0]['relL2']:.4e}  maxErr={rows[0]['maxError']:.4e}  "
               f"resRMSE={rows[0]['predResRMSE']:.4e}  "
               f"linBL={rows[0]['linearBaselineRelL2']:.4e}")
+        print(f"    ref residual (float64) = {batch['ref_res64']:.4e}")
 
         if args.plot or getattr(args, "predict_case", "") == "analytic":
             ui = batch["u_ref"][0, 0]
@@ -732,6 +776,8 @@ def run_analytic_suite(model, stats, device, args, ckpt_args, out_dir):
                              f"analytic {case_name}  k={rows[0]['k']:.2f}  "
                              f"relL2={rows[0]['relL2']:.3e}")
 
+    print(f"\n  timing: cnn_ms_per_sample={np.mean(cnn_ms_all):.3f}  "
+          f"fd_solver_ms_per_sample=nan (no FD solve in MMS pipeline)")
     _write_csv(all_rows, out_dir / "analytic_metrics.csv")
     # summary across all cases
     metric_keys = ["relL2", "maxError", "predResRMSE", "refResRMSE",
@@ -741,7 +787,8 @@ def run_analytic_suite(model, stats, device, args, ckpt_args, out_dir):
         vals = [r[k] for r in all_rows]
         summary_all[k] = {"mean": float(np.mean(vals)), "std": float(np.std(vals)),
                            "min": float(np.min(vals)), "max": float(np.max(vals))}
-    save_summary_json(summary_all, out_dir / "analytic_summary.json")
+    with open(out_dir / "analytic_summary.json", "w") as f:
+        json.dump(summary_all, f, indent=2, ensure_ascii=False)
     print(f"  analytic suite saved → {out_dir}")
     return all_rows
 
@@ -760,6 +807,12 @@ def run_prediction(args):
     device = _select_device(args.device)
 
     ckpt = torch.load(args.predict_from, map_location=device, weights_only=False)
+    ckpt_type = ckpt.get("model_type")
+    if ckpt_type and ckpt_type != "cnn_mms":
+        raise ValueError(
+            f"checkpoint type mismatch: expected 'cnn_mms', got '{ckpt_type}'. "
+            f"Use the correct prediction script (Baseline_mms.py for "
+            f"'cnn_mms', Baseline_solver.py for 'cnn').")
     ckpt_args = argparse.Namespace(**ckpt["args"])
     model = SimpleCNN(
         hidden_ch=ckpt_args.base_ch,
@@ -795,23 +848,24 @@ def run_prediction(args):
     batch = make_mms_dataset(N, args.predict_samples, device, data_args,
                              seed=args.test_seed)
 
-    with torch.no_grad():
-        u_pred = _forward(model, batch, stats)
+    u_pred, cnn_ms_batch, cnn_ms_sample = _time_forward(model, batch, stats)
 
     vm = evaluate(model, batch, stats, args.predict_samples, data_args)
     triv_rl2 = trivial_linear_baseline(batch)
     print(f"relL2={vm['relL2']:.4e}  maxErr={vm['maxError']:.4e}  "
           f"resRMSE={vm['resRMSE']:.4f}  refRMSE={vm['refResRMSE']:.4e}  "
           f"gradRelL2={vm['gradRelL2']:.4e}")
-    print(f"meanMaxError={vm['meanMaxError']:.4e}  maxMaxError={vm['maxMaxError']:.4e}")
+    print(f"meanMaxError={vm['meanMaxError']:.4e}")
     print(f"meanBoundaryError={vm['meanBoundaryError']:.2e}  maxBoundaryError={vm['maxBoundaryError']:.2e}")
     print(f"meanGradLinf={vm['meanGradLinf']:.4e}  maxGradLinf={vm['maxGradLinf']:.4e}")
     print(f"reference residual RMSE (float64) = {batch['ref_res64']:.4e}")
     print(f"trivial baseline (a≡1 linear Poisson) relL2 = {triv_rl2:.4e}  "
-          f"(CNN must beat this to have learned u^k)")
+          f"(CNN must beat this to have learned a(u,k))")
     print(f"linear baseline (a≡1) relL2 = {vm['linearBaselineRelL2']:.4e}  "
           f"const baseline relL2 = {vm['constBaselineRelL2']:.4e}")
-    print(f"boundary error = {vm['bmax']:.2e}")
+    print(f"timing: cnn={cnn_ms_batch:.2f} ms/batch  "
+          f"cnn_ms_per_sample={cnn_ms_sample:.3f}  "
+          f"fd_solver_ms_per_sample=nan (no FD solve in MMS pipeline)")
 
     if args.predict_save:
         p = Path(args.predict_save)
@@ -824,6 +878,9 @@ def run_prediction(args):
         print(f"saved predictions → {p}")
 
     rows, summary = per_sample_metrics(u_pred, batch)
+    for r in rows:
+        r["cnn_ms_per_sample"] = cnn_ms_sample
+        r["fd_solver_ms_per_sample"] = float("nan")   # no FD solve in MMS pipeline
 
     # Always save metrics — use save dir parent, plot-dir, or default
     if args.predict_save:
@@ -834,7 +891,8 @@ def run_prediction(args):
         out = Path("results") / "predict_mms"
     out.mkdir(parents=True, exist_ok=True)
     _write_csv(rows, out / "metrics.csv")
-    save_summary_json(summary, out / "summary.json")
+    with open(out / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
 
     if args.plot:
         h = float(batch["h"])
@@ -874,52 +932,6 @@ def ckpt_key(args):
     return (f"N{args.N}_e{args.epochs}_tr{args.train_samples}"
             f"_{k_str}_M{getattr(args, 'fourier_m', 6)}"
             f"_ch{args.base_ch}_L{n_layers}{loss_suffix}_mms")
-
-def _write_run_info(path, args, best_metric, oracle):
-    k_str = (f"{args.k_min:.4g}–{args.k_max:.4g}" if getattr(args, "random_k", False)
-             else f"{args.k:.4g}")
-    metric_name = "relL2" if args.loss == "supervised" else "resRMSE"
-    path.write_text(
-        f"Experiment: CNN Nonlinear Poisson (MMS, loss={args.loss})\n"
-        f"Key: {ckpt_key(args)}\n"
-        f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"N: {args.N}  Epochs: {args.epochs}  k: {k_str}  Seed: {args.seed}\n"
-        f"Train: {args.train_samples}  Val: {args.val_samples}\n"
-        f"ch={args.base_ch}  L={getattr(args, 'n_layers', 6)}\n"
-        f"Best val {metric_name}: {best_metric:.4e}  Oracle: {oracle:.4e}\n")
-
-def _update_registry(base_dir, key, args, best_metric, oracle):
-    reg_path = base_dir / "registry.json"
-    try:
-        reg = json.loads(reg_path.read_text()) if reg_path.exists() else {}
-    except json.JSONDecodeError:
-        reg = {}
-    metric_key = "best_val_relL2" if args.loss == "supervised" else "best_val_resRMSE"
-    reg.setdefault("cnn_mms", {})[key] = {
-        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "N": args.N, "epochs": args.epochs,
-        "k": [args.k_min, args.k_max] if getattr(args, "random_k", False) else args.k,
-        "train_samples": args.train_samples, "loss": args.loss,
-        metric_key: best_metric, "oracle": oracle,
-    }
-    reg_path.write_text(json.dumps(reg, indent=2, ensure_ascii=False) + "\n")
-
-def _link_latest(base_dir, key):
-    latest = base_dir / "cnn_mms" / "latest"
-    latest.unlink(missing_ok=True)
-    latest.symlink_to(key)
-
-def _archive_old_figures(figures_dir):
-    if not figures_dir.exists():
-        return
-    old = [p for p in figures_dir.iterdir() if p.name != "history"]
-    if not old:
-        return
-    archive = figures_dir / "history" / datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    archive.mkdir(parents=True, exist_ok=True)
-    for p in old:
-        p.rename(archive / p.name)
-    print(f"  archived {len(old)} files → {archive}")
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
@@ -962,11 +974,11 @@ def parse_args():
     p.add_argument("--predict", action="store_true")
     p.add_argument("--predict-samples", type=int, default=8)
     p.add_argument("--predict-save", default="")
-    p.add_argument("--test-seed", type=int, default=1234)
+    p.add_argument("--test-seed", type=int, default=9999)
     p.add_argument("--plot", action="store_true")
     p.add_argument("--predict-case", default="data",
                    choices=["data", "analytic"],
-                   help="'data': same MMS family | 'analytic': 4 signed analytic test cases, requires k=2")
+                   help="'data': same MMS family | 'analytic': 5 signed analytic test cases")
     p.add_argument("--predict-k", type=int, default=2,
                    help="fixed integer k for prediction")
     p.add_argument("--plot-dir", default="",
@@ -975,14 +987,30 @@ def parse_args():
 
 # -- main -------------------------------------------------------------------
 
+def _validate_args(args):
+    """Reject invalid argument combinations early."""
+    if args.N < 4:
+        raise ValueError(f"N must be >= 4, got {args.N}")
+    if args.epochs < 1:
+        raise ValueError(f"epochs must be >= 1, got {args.epochs}")
+    if args.batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {args.batch_size}")
+    if args.train_samples < 1:
+        raise ValueError(f"train_samples must be >= 1, got {args.train_samples}")
+    if args.k_min > args.k_max:
+        raise ValueError(f"k_min ({args.k_min}) > k_max ({args.k_max})")
+    if args.k < 0 and not args.random_k:
+        raise ValueError(f"--k must be >= 0, got {args.k}")
+
 def main():
     args = parse_args()
+    _validate_args(args)
 
     if args.mms_sanity:
         print("=" * 60)
         print("MMS SANITY CHECK")
         print("=" * 60)
-        print(f"Equation: -div(u^k grad u) = f  |  k = {args.k}")
+        print(f"Equation: -div(|u|^k grad u) = f  |  k = {args.k}")
         print(f"Grid: N={args.N}  |  samples: {args.train_samples}")
 
         random.seed(args.seed)
@@ -1009,7 +1037,7 @@ def main():
         print(f"  float32 data residual   = {ref32in64:.4e}  "
               f"(~h^-2·eps32 rounding floor)")
         print(f"  boundary error  = {bnd_err:.2e}  (should be 0)")
-        print(f"  u_ref range     = [{u_min:.4f}, {u_max:.4f}]  )")
+        print(f"  u_ref range     = [{u_min:.4f}, {u_max:.4f}]")
         print(f"  f range         = [{float(fi.min()):.4e}, {float(fi.max()):.4e}]")
         print(f"  trivial baseline (a≡1) relL2 = {trivial_linear_baseline(data):.4e}")
 
@@ -1023,10 +1051,6 @@ def main():
     if args.predict:
         return run_prediction(args)
 
-    if args.epochs == 0:
-        print("epochs=0, nothing to train.")
-        return
-
     key = ckpt_key(args)
     base_dir = Path("checkpoints")
     ckpt_dir = base_dir / "cnn_mms" / key
@@ -1037,18 +1061,15 @@ def main():
     else:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         print(f"training {key}")
-        _, oracle, best_metric = train(args, best_path,
-                                       ckpt_dir / "last.pt",
-                                       ckpt_dir / "history.csv",
-                                       ckpt_dir / "convergence.png")
-        _write_run_info(ckpt_dir / "run_info.txt", args, best_metric, oracle)
-        _update_registry(base_dir, key, args, best_metric, oracle)
-        _link_latest(base_dir, key)
+        _, best_metric = train(args, best_path,
+                               ckpt_dir / "last.pt",
+                               ckpt_dir / "history.csv",
+                               ckpt_dir / "convergence.png")
         print(f"saved → {ckpt_dir}")
 
     if args.plot:
         figures_dir = Path("results") / "cnn_mms" / key / "figures"
-        _archive_old_figures(figures_dir)
+        figures_dir.mkdir(parents=True, exist_ok=True)
         pa = argparse.Namespace(**vars(args))
         pa.predict_from = str(best_path)
         pa.predict_save = ""

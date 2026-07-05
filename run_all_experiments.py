@@ -68,18 +68,20 @@ def train_predict_mms(smoke, loss, predict_k, test_seed, ckpt_dir):
         print("  WARNING: no checkpoint found")
         return {}
 
-    pred_common = ["--predict", "--predict-from", ckpt,
-                   "--predict-k", str(predict_k),
-                   "--test-seed", str(test_seed),
-                   "--predict-samples", "8", "--plot"]
+    plot_flag = [] if smoke else ["--plot"]
     results = {}
     for case, case_label in [("data", "data"), ("analytic", "analytic")]:
-        ok, t = run_cmd(
-            [sys.executable, "Baseline_mms.py"] + pred_common + ["--predict-case", case],
-            f"MMS predict ({loss}, {case_label})")
+        tag = f"mms_{loss}_{case}"
+        pred_common = ["--predict", "--predict-from", ckpt,
+                       "--predict-k", str(predict_k),
+                       "--test-seed", str(test_seed),
+                       "--predict-samples", "8",
+                       "--predict-save", f"results/experiments/{tag}/predictions.pt",
+                       "--plot-dir", f"results/experiments/{tag}"]
+        cmd = [sys.executable, "Baseline_mms.py"] + pred_common + plot_flag + ["--predict-case", case]
+        ok, t = run_cmd(cmd, f"MMS predict ({loss}, {case_label})")
         if ok:
-            results[f"mms_{loss}_{case}"] = {"ckpt": ckpt, "time": t}
-
+            results[tag] = {"ckpt": ckpt, "time": t}
     return results
 
 
@@ -94,17 +96,20 @@ def train_predict_solver(smoke, loss, predict_k, test_seed, ckpt_dir):
         print("  WARNING: no checkpoint found")
         return {}
 
-    pred_common = ["--predict", "--predict-from", ckpt,
-                   "--predict-k", str(predict_k),
-                   "--test-seed", str(test_seed),
-                   "--predict-samples", "8", "--plot"]
+    plot_flag = [] if smoke else ["--plot"]
     results = {}
     for case, case_label in [("data", "data"), ("fixed-solver", "fixed-solver")]:
-        ok, t = run_cmd(
-            [sys.executable, "Baseline_solver.py"] + pred_common + ["--predict-case", case],
-            f"Solver predict ({loss}, {case_label})")
+        tag = f"solver_{loss}_{case}"
+        pred_common = ["--predict", "--predict-from", ckpt,
+                       "--predict-k", str(predict_k),
+                       "--test-seed", str(test_seed),
+                       "--predict-samples", "8",
+                       "--predict-save", f"results/experiments/{tag}/predictions.pt",
+                       "--plot-dir", f"results/experiments/{tag}"]
+        cmd = [sys.executable, "Baseline_solver.py"] + pred_common + plot_flag + ["--predict-case", case]
+        ok, t = run_cmd(cmd, f"Solver predict ({loss}, {case_label})")
         if ok:
-            results[f"solver_{loss}_{case}"] = {"ckpt": ckpt, "time": t}
+            results[tag] = {"ckpt": ckpt, "time": t}
 
     return results
 

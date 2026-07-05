@@ -894,10 +894,19 @@ def run_prediction(args):
 
     eps = getattr(data_args, "coeff_eps", 1e-4)
     rows, summary = per_sample_metrics(u_pred, batch, eps=eps)
-    if args.plot:
-        out = Path(out_dir) if out_dir else Path("results") / "predict_mms"
-        out.mkdir(parents=True, exist_ok=True)
 
+    # Always save metrics — use save dir parent, plot-dir, or default
+    if args.predict_save:
+        out = Path(args.predict_save).parent
+    elif out_dir:
+        out = Path(out_dir)
+    else:
+        out = Path("results") / "predict_mms"
+    out.mkdir(parents=True, exist_ok=True)
+    _write_csv(rows, out / "metrics.csv")
+    save_summary_json(summary, out / "summary.json")
+
+    if args.plot:
         h = float(batch["h"])
         fext = [-1., 1., -1., 1.]
         rext = [-1. + h, 1. - h, -1. + h, 1. - h]
@@ -921,8 +930,6 @@ def run_prediction(args):
                              f"sample {i}  k={row['k']:.2f}  "
                              f"relL2={row['relL2']:.3e}")
 
-        _write_csv(rows, out / "metrics.csv")
-        save_summary_json(summary, out / "summary.json")
         print(f"saved → {out}")
 
 

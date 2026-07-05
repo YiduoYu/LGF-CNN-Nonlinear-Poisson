@@ -15,15 +15,15 @@ from pathlib import Path
 
 
 def find_result_dirs(base):
-    """Walk base directory and collect all subdirectories containing metrics.csv."""
+    """Walk base directory and collect all subdirectories containing any *metrics*.csv."""
     dirs = []
-    for metrics in sorted(Path(base).rglob("metrics.csv")):
-        dirs.append(metrics.parent)
+    for metrics in sorted(Path(base).rglob("*metrics*.csv")):
+        dirs.append((metrics.parent, metrics.name))
     return dirs
 
 
-def read_metrics(result_dir):
-    csv_path = result_dir / "metrics.csv"
+def read_metrics(result_dir, csv_name="metrics.csv"):
+    csv_path = result_dir / csv_name
     summary_path = result_dir / "summary.json"
     if not csv_path.exists():
         return None
@@ -39,48 +39,49 @@ def read_metrics(result_dir):
     return {"rows": rows, "summary": summary}
 
 
-def classify(result_dir):
-    """Heuristic: determine experiment type from the directory path."""
+def classify(result_dir, csv_name="metrics.csv"):
+    """Heuristic: determine experiment type from path and filename."""
     p = str(result_dir)
     exp = {"data_source": "unknown", "training_loss": "unknown",
            "test_type": "data", "method": "CNN"}
+
+    # detect by csv filename first
+    if "analytic" in csv_name:
+        exp["test_type"] = "analytic"
+    elif "fixed_solver" in csv_name:
+        exp["test_type"] = "fixed-solver"
 
     if "pinn" in p.lower():
         exp["method"] = "PINN"
         exp["training_loss"] = "pinn"
         exp["data_source"] = "analytic"
-    elif "cnn_mms" in p or "predict_mms" in p:
+    elif "mms_" in p or "mms/" in p:
         exp["data_source"] = "mms"
         if "_sup" in p:
             exp["training_loss"] = "supervised"
-        else:
+        elif "_physics" in p:
             exp["training_loss"] = "physics"
-    elif "/cnn/" in p or "predict/" in p:
+    elif "solver_" in p or "solver/" in p:
         exp["data_source"] = "solver"
         if "_sup" in p:
             exp["training_loss"] = "supervised"
-        else:
+        elif "_physics" in p:
             exp["training_loss"] = "physics"
-
-    if "analytic" in p:
-        exp["test_type"] = "analytic"
-    elif "fixed" in p:
-        exp["test_type"] = "fixed-solver"
 
     return exp
 
 
 def build_table(all_dirs):
     rows = []
-    for d in sorted(all_dirs):
-        info = classify(d)
-        data = read_metrics(d)
+    for d, csv_name in sorted(all_dirs):
+        info = classify(d, csv_name)
+        data = read_metrics(d, csv_name)
         if data is None or not data["rows"]:
             continue
 
         summary = data["summary"]
         row = {
-            "directory": str(d),
+            "directory": f"{d}/{csv_name}",
             "experiment_name": d.parent.name if d.parent.name != "figures" else d.name,
             "data_source": info["data_source"],
             "training_loss": info["training_loss"],

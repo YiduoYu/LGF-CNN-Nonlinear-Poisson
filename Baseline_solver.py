@@ -1115,11 +1115,18 @@ def run_prediction(args):
         print(f"saved predictions → {p}")
 
     rows, summary = per_sample_metrics(u_pred, batch, eps=data_args.coeff_eps)
-    if args.plot:
-        plot_dir = getattr(args, "plot_dir", None)
-        out = Path(plot_dir) if plot_dir else Path("results") / "predict"
-        out.mkdir(parents=True, exist_ok=True)
 
+    # Always save metrics — use --predict-save or default dir
+    save_dir = getattr(args, "predict_save", "")
+    if save_dir:
+        out = Path(save_dir).parent
+    else:
+        out = Path(getattr(args, "plot_dir", None)) if getattr(args, "plot_dir", None) else Path("results") / "predict"
+    out.mkdir(parents=True, exist_ok=True)
+    _write_csv(rows, out / "metrics.csv")
+    save_summary_json(summary, out / "summary.json")
+
+    if args.plot:
         h = float(batch["h"])
         fext = [-1., 1., -1., 1.]
         rext = [-1. + h, 1. - h, -1. + h, 1. - h]
@@ -1143,9 +1150,7 @@ def run_prediction(args):
             _save_centerline(ui, up, out / f"sample_{i:03d}_centerline.png",
                              f"sample {i}  k={row['k']:.2f}  "
                              f"relL2={row['relL2']:.3e}")
-
-        _write_csv(rows, out / "metrics.csv")
-        print(f"saved → {out}")
+    print(f"saved → {out}")
 
 
 # -- CLI --------------------------------------------------------------------

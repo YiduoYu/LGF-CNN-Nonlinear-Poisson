@@ -913,7 +913,7 @@ def _save_convergence_plot(history, path, loss_type="physics"):
 #                 strictly in the solver pipeline and is comparable with the
 #                 MMS analytic cases (which live in Baseline_mms.py).
 
-# Same signed functions as the MMS ANALYTIC_CASES u0-u4.
+# Same signed functions as the MMS ANALYTIC_CASES u1-u4.
 # a(u,k) = |u|^k, so any integer k >= 0 is safe.
 FIXED_SOLVER_CASES = {
     "u1_sincos": lambda x, y: np.sin(np.pi * x) * np.cos(np.pi * y),

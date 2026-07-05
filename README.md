@@ -84,8 +84,8 @@ python PINN.py --N 32 --epochs 5000
 | `--fd-tol` | 1e-6 | 收敛判据：残差 RMSE < tol·max(1, ‖f‖_rms)（仅 solver） |
 | `--fd-omega` | 1.5 | SOR 松弛因子，1 = Gauss-Seidel，须 < 2（仅 solver） |
 | `--predict-from` | — | 加载 checkpoint 进行预测 |
-| `--predict-case` | data | MMS: `data` / `analytic`；solver: `data` / `fixed-solver`（u_target 只造 f,g，u_ref 由非线性 FD 求解器重算，严格 solver 参照，可与 MMS analytic 对照） |
-| `--predict-k` | 2.0 | 测试数据固定 k（训练用随机 k） |
+| `--predict-case` | data | MMS: `data` / `analytic`；solver: `data` / `fixed-solver`。analytic/fixed-solver 使用 signed 测试函数，强制 k=2 |
+| `--predict-k` | 2.0 | 测试固定 k；analytic/fixed-solver 模式必须为 2（训练用随机 k） |
 | `--test-seed` | 1234 | 预测数据种子（不得与训练 seed 及 seed+1 重合） |
 | `--retrain` | False | 覆盖已有 checkpoint |
 | `--data-sanity` / `--solver-sanity` / `--mms-sanity` | False | 数据预检后退出 |
@@ -135,7 +135,7 @@ results/
 - **6 通道输入**：`[f_norm, g, boundary_mask, k_channel, x, y]`，f 和 k 用 z-score 归一化
 - **float64 数据管线**：数据生成与参考残差在 float64 计算，训练存 float32；float32 舍入地板单独报告
 - **训练随机 k，测试固定 k**：训练 k ∈ U(0,5)，预测/测试统一用 `--predict-k`（默认 2.0）
-- **测试集统一使用正偏移函数**：u1–u4 均带正偏移（~1.2–1.5），匹配训练分布；`clamp(u,ε)^k` 在正常训练中不激活，仅作数值保护
-- **两条测试线可对照**：MMS 的 `analytic`（manufactured u 即 u_ref）与 solver 的 `fixed-solver`（同一组 u_target 只造 f,g，u_ref 由非线性 FD 求解器重算）使用同一组函数；`target_vs_solver_ref_relL2` 检查两条参照是否一致，支持任意实数 k
+- **测试集使用 signed 函数，k 固定为 2**：u1–u4 带符号，测试管线使用 `raw_power=True`（`a(u)=u^2` exactly，不 clamp）；`--predict-case analytic` / `--predict-case fixed-solver` 强制要求 `--predict-k 2`
+- **两条测试线可对照**：MMS 的 `analytic`（manufactured u 即 u_ref）与 solver 的 `fixed-solver`（同一组 u_target 只造 f,g，u_ref 由非线性 FD 求解器重算）使用同一组 signed 函数；`target_vs_solver_ref_relL2` 检查两条参照是否一致
 - **可复现**：全链路 seed、checkpoint 存 args+stats、registry.json、预测 seed 碰撞检查、旧图自动归档
 - **优化器**：AdamW + gradient clipping + warmup → cosine annealing

@@ -829,29 +829,33 @@ def _save_convergence_plot(history, path, oracle=0., loss_type="physics"):
 #                 strictly in the solver pipeline and is comparable with the
 #                 MMS analytic cases (which live in Baseline_mms.py).
 
-# Same functions as the MMS ANALYTIC_CASES u1-u4 (positive-shifted).
-# Pipeline uses a = clamp(u,eps)^k — matches training, supports any real k.
+# Same signed functions as the MMS ANALYTIC_CASES u1-u4.
+# Pipeline uses a = u^k exactly (raw_power=True) — k must be 2.
 FIXED_SOLVER_CASES = {
-    "u1_mms_sincos": lambda x, y: 1.2 + (1. - x ** 2) * (1. - y ** 2) * np.sin(np.pi * x) * np.cos(np.pi * y),
-    "u2_mms_poly":   lambda x, y: 1.2 + 0.25 * x * (1. - x) * y * (1. - y),
-    "u3_mms_cos":    lambda x, y: 1.5 + 0.5 * np.cos(np.pi * x) * np.cos(2. * np.pi * y),
-    "u4_mms_mixed":  lambda x, y: 1.2 + 0.5 * (x ** 2 * (1. - y) + np.sin(np.pi * x) * y),
+    "u1_mms_sincos": lambda x, y: (1. - x ** 2) * (1. - y ** 2) * np.sin(np.pi * x) * np.cos(np.pi * y),
+    "u2_mms_poly":   lambda x, y: x * (1. - x) * y * (1. - y),
+    "u3_mms_cos":    lambda x, y: np.cos(np.pi * x) * np.cos(2. * np.pi * y),
+    "u4_mms_mixed":  lambda x, y: x ** 2 * (1. - y) + np.sin(np.pi * x) * y,
 }
 
 
 def make_fixed_solver_dataset(N, device, args, k_val):
     """Deterministic solver test: u_target -> f = -div_h(u^k grad u), then
-    solve_nonlinear_fd(f,g,k) -> u_ref.  Matches training pipeline (clamp),
-    supports any real k."""
+    solve_nonlinear_fd(f,g,k) -> u_ref.  Signed u allowed; uses raw u^k
+    (raw_power=True), so k must be 2."""
     k_val = float(k_val)
+    if abs(k_val - 2.0) > 1e-12:
+        raise ValueError(
+            f"fixed-solver requires k=2 (signed u, raw u^k), got {k_val}")
     x_t, y_t, bnd, interior, h = make_grid(N, device)
     x64, y64, *_ = make_grid(N, "cpu", torch.float64)
     x_np = x64[0, 0].numpy()
     y_np = y64[0, 0].numpy()
     eps = args.coeff_eps
-    max_fd_iter = getattr(args, "max_fd_iter", 5000)
-    fd_tol = getattr(args, "fd_tol", 1e-6)
-    fd_omega = getattr(args, "fd_omega", 1.5)
+    # Conservative SOR for signed u: under-relaxation prevents divergence
+    max_fd_iter = max(getattr(args, "max_fd_iter", 5000), 10000)
+    fd_tol = min(getattr(args, "fd_tol", 1e-6), 1e-8)
+    fd_omega = 0.8
 
     f_list, g_list, k_list, u_list, t_list = [], [], [], [], []
     info_list, names = [], []
@@ -867,26 +871,24 @@ def make_fixed_solver_dataset(N, device, args, k_val):
         k64 = torch.tensor([k_val], dtype=torch.float64)
         f64 = torch.zeros_like(t64)
         f64[:, :, 1:-1, 1:-1] = nonlinear_flux_divergence(
-            t64, k64, h, eps, raw_power=False)
+            t64, k64, h, eps, raw_power=True)
         f_np = f64[0, 0].numpy()
 
         u_ref, info = solve_nonlinear_fd(
             f_np, g_np, k_val, h, eps, max_fd_iter, fd_tol, fd_omega,
-            raw_power=False)
+            raw_power=True)
 
-        # Acceptance: converged, or residual small enough (may happen with non-integer k)
+        # Acceptance: converged + small residual
         f_rms = float(np.sqrt(np.mean(f_np[1:-1, 1:-1] ** 2)))
-        accepted = info["converged"] or (
-            np.isfinite(info["residual_rmse"])
-            and info["residual_rmse"] < 1e-3 * max(1.0, f_rms)
-            and info["u_min"] > 0)
-        if not accepted:
+        if not (info["converged"]
+                and np.isfinite(info["residual_rmse"])
+                and info["residual_rmse"] < 1e-3 * max(1.0, f_rms)):
             raise RuntimeError(
                 f"fixed-solver case {case_name} rejected by solver: {info}")
 
         u64 = torch.from_numpy(u_ref).double()[None, None]
         res64_sq += float(nonlinear_pde_residual(
-            u64, f64, k64, h, eps=eps, raw_power=False).pow(2).sum())
+            u64, f64, k64, h, eps=eps, raw_power=True).pow(2).sum())
 
         f_list.append(f64.float().to(device))
         g_list.append(torch.from_numpy(g_np).float()[None, None].to(device))
@@ -901,7 +903,7 @@ def make_fixed_solver_dataset(N, device, args, k_val):
         "k": torch.cat(k_list), "u_ref": torch.cat(u_list),
         "u_target": torch.cat(t_list),
         "case_names": names, "solver_info": info_list,
-        "raw_power": False,
+        "raw_power": True,
         "mask": bnd, "interior_mask": interior,
         "x": x_t, "y": y_t, "h": h,
         "ref_res64": math.sqrt(res64_sq / (len(names) * N * N)),
@@ -1005,9 +1007,11 @@ def run_fixed_solver_suite(model, stats, device, args, data_args, out_dir):
         ui = batch["u_ref"][i, 0]
         up = u_pred[i, 0]
         pr = nonlinear_pde_residual(u_pred[i:i+1], batch["f"][i:i+1],
-                                    batch["k"][i:i+1], batch["h"], eps=eps)[0, 0]
+                                    batch["k"][i:i+1], batch["h"], eps=eps,
+                                    raw_power=True)[0, 0]
         er = nonlinear_pde_residual(batch["u_ref"][i:i+1], batch["f"][i:i+1],
-                                    batch["k"][i:i+1], batch["h"], eps=eps)[0, 0]
+                                    batch["k"][i:i+1], batch["h"], eps=eps,
+                                    raw_power=True)[0, 0]
         _save_panel(ui, up, up - ui, batch["f"][i, 0], pr, er,
                     out_dir / f"fixed_solver_{case}_panel.png",
                     f"fixed-solver {case}  k={r['k']:.2f}  "
@@ -1301,7 +1305,7 @@ def parse_args():
                    help="output dir for prediction figures "
                         "(default: results/predict/<case>)")
     p.add_argument("--predict-k", type=float, default=2.0,
-                   help="fixed k for all prediction/test data (training uses random k)")
+                   help="fixed k for prediction (--predict-case fixed-solver requires k=2)")
     return p.parse_args()
 
 

@@ -6,51 +6,58 @@
 -div(u^k grad u) = f,   u = g on boundary,   Omega = [-1,1]^2
 ```
 
-扩散系数为 u^k 本身（无外部 a(x,y) 场），u > 0，k > 0。
+扩散系数为 u^k 本身（无外部 a(x,y) 场），u > 0，k 为标量。
 
 ---
 
-## 两条路线
+## 三个独立文件（零交叉 import）
 
 | 文件 | 路线 | 用途 |
 |------|------|------|
-| `Baseline_nonlinear_picard.py` | **Route B: Picard** | 随机 PDE 生成 + 训练 + 预测（主力） |
-| `Baseline_nonlinear_mms.py` | **Route A: MMS** | 人造解验证 / 过拟合 debug（辅助） |
+| `Baseline_solver.py` | **正向 solver 数据** | 随机 f, g, k → 非线性 FD 求解 u_ref → CNN 训练（主力） |
+| `Baseline_mms.py` | **MMS 反向数据** | 人造解 u_ref → FD 反算 f（oracle = 0）→ CNN 训练 |
+| `PINN.py` | **PINN 对照** | MLP + autodiff，Raissi 式实现，固定 k=2 |
 
-### Route B — Picard
+### Baseline_solver.py — 正向数据
 
-随机采样 f, g, k → Picard 迭代求解 u_ref → CNN 学习 (f, g, k) → u_ref。
+随机采样 f, g（二维 Fourier 级数）、k ~ U(0,5) → **非线性有限差分求解器**求 u_ref → CNN 学习 (f, g, k) → u_ref。
 
-### Route A — MMS
+非线性 FD 求解器 = **红黑 SOR 逐点松弛**：直接在 5 点 flux-form 差分方程上迭代，每个半扫描用当前迭代值重算 a = clamp(u,ε)^k 并逐点更新 u。纯 stencil 运算，无 Picard 外层线性化、无内层线性方程组求解。不收敛 / u 非正 / 残差过大的样本被拒绝。
 
-构造 `u_ref = 1 + c1*x + c2*y + 0.15*(1-x²)(1-y²)*smooth`，FD 反算 f（oracle = 0），小数据集过拟合验证。
+### Baseline_mms.py — MMS 反向数据
+
+构造正值 `u_ref = b(x,y) + 0.15*(1-x²)(1-y²)*(poly + Fourier)`（整体抬升至 ≥ 0.3），用同一离散算子反算 f，float64 残差为机器零（oracle = 0）。
 
 ---
 
 ## Quick Start
 
 ```bash
-# 参数预检
-python Baseline_nonlinear_picard.py --picard-sanity --N 32 --train-samples 16 --k 2
+# 数据预检
+python Baseline_solver.py --data-sanity --N 32 --train-samples 16
+python Baseline_mms.py --mms-sanity --N 32 --train-samples 8
 
-# 训练（physics-only）
-python Baseline_nonlinear_picard.py --N 32 --epochs 40 --train-samples 128 --k 2 --retrain --plot
+# 训练（physics loss，默认；随机 k ∈ [0,5]，默认）
+python Baseline_solver.py --N 32 --epochs 100 --train-samples 128 --retrain --plot
+python Baseline_mms.py --N 32 --epochs 200 --train-samples 32 --retrain --plot
 
-# 训练（supervised）
-python Baseline_nonlinear_picard.py --N 32 --epochs 40 --train-samples 128 --k 2 --loss supervised --retrain --plot
+# 训练（supervised loss）
+python Baseline_solver.py --N 32 --epochs 100 --train-samples 128 --loss supervised --retrain --plot
 
-# 训练（随机 k）
-python Baseline_nonlinear_picard.py --N 32 --epochs 40 --random-k --k-min 1 --k-max 3 --retrain --plot
+# 训练（固定 k）
+python Baseline_solver.py --N 32 --epochs 100 --no-random-k --k 2 --retrain --plot
 
-# 预测（随机 PDE）
-python Baseline_nonlinear_picard.py --predict --predict-from checkpoints/cnn/<key>/best.pt --plot
+# 预测（同分布测试集）
+python Baseline_solver.py --predict --predict-from checkpoints/cnn/<key>/best.pt --test-seed 9999 --plot
 
-# 预测（sincos 泛化测试）
-python Baseline_nonlinear_picard.py --predict --predict-from checkpoints/cnn/<key>/best.pt --predict-case sincos --plot
+# 预测（固定测试集；测试 k 默认固定为 2）
+# solver 路线：fixed-solver（u_target 只造 f,g，u_ref 由非线性 FD 求解器重算）
+python Baseline_solver.py --predict --predict-from checkpoints/cnn/<key>/best.pt --predict-case fixed-solver --plot
+# MMS 路线：analytic（manufactured u 直接作 u_ref）
+python Baseline_mms.py --predict --predict-from checkpoints/cnn_mms/<key>/best.pt --predict-case analytic --plot
 
-# MMS 验证
-python Baseline_nonlinear_mms.py --mms-sanity --N 32 --train-samples 8 --k 2
-python Baseline_nonlinear_mms.py --N 32 --epochs 200 --train-samples 32 --k 2 --retrain --plot
+# PINN 对照
+python PINN.py --N 32 --epochs 5000
 ```
 
 ---
@@ -66,19 +73,22 @@ python Baseline_nonlinear_mms.py --N 32 --epochs 200 --train-samples 32 --k 2 --
 | `--lr` | 1e-3 | 学习率 |
 | `--base-ch` | 32 | 隐藏通道数 |
 | `--n-layers` | 6 | 卷积层数 |
-| `--k` | 2.0 | 扩散系数指数（MMS 默认 k∈[0.5,3.0]） |
-| `--random-k` | False | 随机采样 k ∈ [k_min, k_max] |
-| `--f-scale` | 0.1 | forcing 幅度 |
-| `--g-base` | 1.0 | 边界基准值 |
-| `--g-scale` | 0.05 | 边界随机波动 |
-| `--loss` | physics | 训练模式：`physics`（PDE 残差）或 `supervised`（\|u-u_ref\|²） |
+| `--k` | 2.0 | 固定 k（需 `--no-random-k`） |
+| `--random-k` | True | 随机采样 k ∈ [k_min, k_max]，默认 [0, 5] |
+| `--fourier-m` | 6 | 随机场每维 Fourier 模数 |
+| `--f-scale` | 5.0 | forcing 幅度（仅 solver） |
+| `--g-base` / `--g-scale` | 1.0 / 0.4 | 边界基准值 / 随机波动（仅 solver） |
+| `--loss` | physics | 训练目标：`physics`（PDE 残差）或 `supervised`（\|u-u_ref\|²） |
 | `--coeff-eps` | 1e-4 | u^k 的 clamp 下界 |
-| `--picard-damping` | 0.5 | Picard 阻尼系数（仅 Picard） |
-| `--picard-tol` | 1e-8 | Picard 收敛容差（仅 Picard） |
+| `--max-fd-iter` | 5000 | SOR 最大扫描数（仅 solver） |
+| `--fd-tol` | 1e-6 | 收敛判据：残差 RMSE < tol·max(1, ‖f‖_rms)（仅 solver） |
+| `--fd-omega` | 1.5 | SOR 松弛因子，1 = Gauss-Seidel，须 < 2（仅 solver） |
 | `--predict-from` | — | 加载 checkpoint 进行预测 |
-| `--predict-case` | random | 预测模式：`random` 或 `sincos`（仅 Picard） |
+| `--predict-case` | data | MMS: `data` / `analytic`；solver: `data` / `fixed-solver`（u_target 只造 f,g，u_ref 由非线性 FD 求解器重算，严格 solver 参照，可与 MMS analytic 对照） |
+| `--predict-k` | 2.0 | 测试数据固定 k（训练用随机 k） |
+| `--test-seed` | 1234 | 预测数据种子（不得与训练 seed 及 seed+1 重合） |
 | `--retrain` | False | 覆盖已有 checkpoint |
-| `--picard-sanity` / `--mms-sanity` | False | 参数预检后退出 |
+| `--data-sanity` / `--solver-sanity` / `--mms-sanity` | False | 数据预检后退出 |
 
 ---
 
@@ -86,43 +96,46 @@ python Baseline_nonlinear_mms.py --N 32 --epochs 200 --train-samples 32 --k 2 --
 
 ```
 checkpoints/
-├── cnn/N32_e100_tr128_k2_fs0.1_gs0.05_ch32_L6/   # Picard
+├── cnn/N32_e100_tr128_k0-5_M6_fs5_gb1_gs0.4_ch32_L6/     # solver
 │   ├── best.pt, last.pt, history.csv, convergence.png, run_info.txt
-├── cnn_mms/N32_e200_tr32_k2_ch32_L6_mms/          # MMS
+├── cnn_mms/N32_e200_tr32_k0-5_M6_ch32_L6_mms/            # MMS
 │   ├── best.pt, last.pt, history.csv, convergence.png, run_info.txt
-├── cnn/latest -> N32_e100_tr128_k2_...
-├── cnn_mms/latest -> N32_e200_tr32_k2_...
-└── registry.json                                   # 实验索引（自动维护）
+├── cnn/latest, cnn_mms/latest                             # 符号链接
+├── pinn/N32_e5000_h64_l4_bc50/                            # PINN
+└── registry.json                                          # 实验索引（自动维护）
 
 results/
 └── cnn/<key>/figures/
-    ├── history/2026-07-04_113800/                  # 旧结果自动归档
-    ├── sample_000_panel.png, metrics.csv
+    ├── history/2026-07-04_113800/                         # 旧结果自动归档
+    ├── sample_000_panel.png, metrics.csv, summary.json
 ```
 
 ---
 
-## 评估指标
+## 评估指标（逐样本计算再汇总）
 
 | Metric | 含义 |
 |--------|------|
-| relL2 | u_pred vs u_ref 相对 L2 误差 |
-| resRMSE | u_pred PDE 残差 RMS |
-| refResRMSE | u_ref PDE 残差 RMS（oracle 下限） |
-| linf | 最大绝对误差 |
-| gradRelL2 | 梯度相对 L2 误差 |
+| relL2 | u_pred vs u_ref 内点相对 L2 误差（主指标） |
+| RMSE / MAE / maxError | 绝对误差统计 |
+| predResRMSE / refResRMSE | u_pred / u_ref 的 PDE 残差 RMS（ref = oracle 下限） |
+| bndErr | 边界误差（硬投影应为浮点零） |
+| gradRelL2 / gradLinf | 梯度相对 L2 / 最大误差 |
+| linearBaselineRelL2 | a≡1 线性 Poisson 解的 relL2（**CNN 必须显著打赢**） |
+| constBaselineRelL2 | 常数预测基线 relL2 |
 
 ---
 
 ## 关键设计
 
-- **向量化组装**：5 点差分矩阵用 `scipy.sparse.coo_matrix` 构建，无 Python 循环
-- **physics-only 或 supervised**：`--loss` 选训练目标，默认 PDE 残差，每个样本独立按 f 的 RMS 归一化
-- **Picard 收敛判断**：比较 `∥u_new − u_old∥ / ∥u_new∥`，damping=1 时不会假收敛
-- **预测复用训练分布**：`--predict` 自动从 checkpoint 继承 k、f_scale、coeff_eps 等参数
-- **Hard Dirichlet BC**：`u_pred = bnd * g + (1-bnd) * u_raw`
-- **Conservative FD**：交界面系数 = 相邻点算术平均
+- **只用有限差分**：空间离散为 5 点 flux-form 差分（交界面系数取相邻点算术平均）；非线性差分方程用红黑 SOR 逐点松弛求解——无 Picard / Newton / FEM / FNO / 谱方法
+- **a≡1 线性基线**：线性 FD 方程组用 `scipy.sparse` 直接求解（仅作平凡基线对照，不参与非线性求解）
+- **physics-only 或 supervised**：`--loss` 选训练目标；physics loss 为 mean((h²R)²)
+- **Hard Dirichlet BC**：`u_pred = bnd * g + (1-bnd) * u_raw`，边界误差恒为浮点零
 - **6 通道输入**：`[f_norm, g, boundary_mask, k_channel, x, y]`，f 和 k 用 z-score 归一化
-- **sincos 泛化测试**：`u_ref = sin(πx)·cos(πy)`，FD 反算 f（oracle = 0），测试模型泛化
-- **MMS 对齐 Picard**：两文件共享相同的 loss 选项、命名规范、存储系统
+- **float64 数据管线**：数据生成与参考残差在 float64 计算，训练存 float32；float32 舍入地板单独报告
+- **训练随机 k，测试固定 k**：训练 k ∈ U(0,5)，预测/测试统一用 `--predict-k`（默认 2.0）
+- **测试集在原始 u^k 意义下**：u1–u4 固定测试函数严格为正，clamp(u,ε)^k 数学上不激活，clamp 仅作训练期数值保护
+- **两条测试线可对照**：MMS 的 `analytic`（manufactured u 即 u_ref）与 solver 的 `fixed-solver`（同一组 u_target 只造 f,g，u_ref 由非线性 FD 求解器重算）使用同一组函数；`target_vs_solver_ref_relL2` 检查两条参照是否一致
+- **可复现**：全链路 seed、checkpoint 存 args+stats、registry.json、预测 seed 碰撞检查、旧图自动归档
 - **优化器**：AdamW + gradient clipping + warmup → cosine annealing

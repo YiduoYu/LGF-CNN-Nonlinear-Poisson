@@ -23,22 +23,84 @@ import csv
 import json
 import math
 import os
-import sys
 import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 
-# Minimal shared utilities for fair metric comparison
-from Baseline import (
-    set_seed, select_device, make_grid,
-    pde_residual as fd_residual,
-)
-
 K_DEFAULT = 2.0
+
+
+# -- inline utilities (no external dependencies) -----------------------------
+
+def set_seed(seed: int):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def select_device(name: str) -> torch.device:
+    if name != "auto":
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def make_grid(N: int, device="cpu", dtype=torch.float32):
+    H = W = N + 2
+    h = 2.0 / (N + 1)
+    xs = torch.linspace(-1., 1., W, device=device, dtype=dtype)
+    ys = torch.linspace(-1., 1., H, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    x = xx[None, None, :, :]
+    y = yy[None, None, :, :]
+    bnd = torch.zeros(1, 1, H, W, device=device, dtype=dtype)
+    bnd[:, :,  0, :] = 1.
+    bnd[:, :, -1, :] = 1.
+    bnd[:, :,  :,  0] = 1.
+    bnd[:, :,  :, -1] = 1.
+    return x, y, bnd, 1. - bnd, h
+
+
+def _flux_div(u, k, h, eps=1e-4):
+    """5-point flux-form FD: -div(u^k grad u)."""
+    if isinstance(k, (int, float)):
+        k = torch.tensor([k], device=u.device)
+    if k.ndim == 1:
+        k = k.view(-1, 1, 1, 1)
+    # raw integer-k coefficient: a = u^k exactly (k = K_DEFAULT = 2, integer),
+    # signed u allowed; matches the signed analytic forcing / autodiff loss.
+    # |u|^k * sign(u)^k form is backend-safe for negative bases.
+    k_int = k.round()
+    a = u.abs().pow(k_int)
+    odd = (k_int.long() % 2 == 1)
+    a = torch.where(odd & (u < 0), -a, a)
+    uc = u[:, :, 1:-1, 1:-1]
+    ac = a[:, :, 1:-1, 1:-1]
+    ae = 0.5 * (ac + a[:, :, 1:-1, 2:])
+    aw = 0.5 * (ac + a[:, :, 1:-1, :-2])
+    an = 0.5 * (ac + a[:, :, 2:, 1:-1])
+    as_ = 0.5 * (ac + a[:, :, :-2, 1:-1])
+    fe = ae * (u[:, :, 1:-1, 2:] - uc) / h
+    fw = aw * (uc - u[:, :, 1:-1, :-2]) / h
+    fn = an * (u[:, :, 2:, 1:-1] - uc) / h
+    fs = as_ * (uc - u[:, :, :-2, 1:-1]) / h
+    return -(fe - fw + fn - fs) / h
+
+
+def fd_residual(u, f, k, h, eps=1e-4):
+    """R(u) = -div_h(u^k grad_h u) - f on interior nodes."""
+    return _flux_div(u, k, h, eps) - f[:, :, 1:-1, 1:-1]
 
 
 # ===========================================================================
@@ -378,8 +440,8 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
         model.load_state_dict(best_state)
         print(f"best Adam model (val relL2={best_relL2:.4e})")
 
-    # ---- L-BFGS fine-tuning ----
-    if args.lbfgs_epochs > 0:
+    # ---- L-BFGS fine-tuning (reuses the last Adam epoch's collocation pts) ----
+    if args.lbfgs_epochs > 0 and args.epochs > 0:
         print(f"\nL-BFGS fine-tuning ({args.lbfgs_epochs} steps)...")
         optimizer_lbfgs = torch.optim.LBFGS(
             model.parameters(),
@@ -470,6 +532,8 @@ def _save_panel(u_true, u_pred, error, f_map, res_pred, res_exact,
     u_min = min(float(u_true.min()), float(u_pred.min()))
     u_max = max(float(u_true.max()), float(u_pred.max()))
     err_lim = _sym(error)
+    r_max = max(float(res_pred.abs().max().cpu()),
+                float(res_exact.abs().max().cpu()), 1e-12)
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
     fig.suptitle(title)
@@ -479,8 +543,8 @@ def _save_panel(u_true, u_pred, error, f_map, res_pred, res_exact,
         (0, 1, u_pred,     "PINN prediction",          "viridis",  full_ext,  u_min, u_max),
         (0, 2, error,      "signed error",             "coolwarm", full_ext,  *err_lim),
         (1, 0, f_map,      "forcing f",                "coolwarm", full_ext,  *_sym(f_map)),
-        (1, 1, res_pred,   "pred PDE residual",        "coolwarm", resid_ext, *_sym(res_pred)),
-        (1, 2, res_exact,  "exact PDE residual (floor)","coolwarm", resid_ext, *_sym(res_exact)),
+        (1, 1, res_pred,   "pred PDE residual",        "coolwarm", resid_ext, -r_max, r_max),
+        (1, 2, res_exact,  "exact PDE residual (floor)","coolwarm", resid_ext, -r_max, r_max),
     ]
     for r, c, vals, lbl, cmap, ext, v0, v1 in panels:
         ax = axes[r][c]
@@ -524,12 +588,8 @@ def parse_args():
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=1234)
     # output
-    p.add_argument("--save-path", default="",
-                   help="Deprecated: paths are auto-generated from config")
     p.add_argument("--retrain", action="store_true",
                    help="Force retraining even if a matching checkpoint exists")
-    p.add_argument("--plot-dir", default="",
-                   help="Deprecated: paths are auto-generated from config")
     p.add_argument("--no-plot", action="store_true")
 
     return p.parse_args()

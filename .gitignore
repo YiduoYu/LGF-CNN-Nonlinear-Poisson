@@ -19,6 +19,7 @@ Paper/
 report_draft.*
 report.docx
 ~$*.docx
+方案设计.docx
 
 # UNet experiment reports (local copy from branch)
 UNet/

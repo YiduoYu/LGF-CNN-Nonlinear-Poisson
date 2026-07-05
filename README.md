@@ -135,7 +135,7 @@ results/
 - **6 通道输入**：`[f_norm, g, boundary_mask, k_channel, x, y]`，f 和 k 用 z-score 归一化
 - **float64 数据管线**：数据生成与参考残差在 float64 计算，训练存 float32；float32 舍入地板单独报告
 - **训练随机 k，测试固定 k**：训练 k ∈ U(0,5)，预测/测试统一用 `--predict-k`（默认 2.0）
-- **测试集在原始 u^k 意义下**：u1–u4 固定测试函数严格为正，clamp(u,ε)^k 数学上不激活，clamp 仅作训练期数值保护
-- **两条测试线可对照**：MMS 的 `analytic`（manufactured u 即 u_ref）与 solver 的 `fixed-solver`（同一组 u_target 只造 f,g，u_ref 由非线性 FD 求解器重算）使用同一组函数；`target_vs_solver_ref_relL2` 检查两条参照是否一致
+- **测试集统一使用正偏移函数**：u1–u4 均带正偏移（~1.2–1.5），匹配训练分布；`clamp(u,ε)^k` 在正常训练中不激活，仅作数值保护
+- **两条测试线可对照**：MMS 的 `analytic`（manufactured u 即 u_ref）与 solver 的 `fixed-solver`（同一组 u_target 只造 f,g，u_ref 由非线性 FD 求解器重算）使用同一组函数；`target_vs_solver_ref_relL2` 检查两条参照是否一致，支持任意实数 k
 - **可复现**：全链路 seed、checkpoint 存 args+stats、registry.json、预测 seed 碰撞检查、旧图自动归档
 - **优化器**：AdamW + gradient clipping + warmup → cosine annealing

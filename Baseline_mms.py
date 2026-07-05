@@ -717,10 +717,10 @@ def _save_convergence_plot(history, path, oracle=0., loss_type="physics"):
 # Signed test functions; the analytic suite runs in raw integer-k mode
 # (a = u^k exactly, no clamp), so --predict-k must be an integer (default 2).
 ANALYTIC_CASES = {
-    "u1": lambda x, y: (1. - x ** 2) * (1. - y ** 2) * np.sin(np.pi * x) * np.cos(np.pi * y),
-    "u2": lambda x, y: x * (1. - x) * y * (1. - y),
-    "u3": lambda x, y: np.cos(np.pi * x) * np.cos(2. * np.pi * y),
-    "u4": lambda x, y: x ** 2 * (1. - y) + np.sin(np.pi * x) * y,
+    "u1": lambda x, y: 1.2 + (1. - x ** 2) * (1. - y ** 2) * np.sin(np.pi * x) * np.cos(np.pi * y),
+    "u2": lambda x, y: 1.2 + 0.25 * x * (1. - x) * y * (1. - y),
+    "u3": lambda x, y: 1.5 + 0.5 * np.cos(np.pi * x) * np.cos(2. * np.pi * y),
+    "u4": lambda x, y: 1.2 + 0.5 * (x ** 2 * (1. - y) + np.sin(np.pi * x) * y),
 }
 
 
@@ -747,7 +747,7 @@ def make_analytic_dataset(N, case, k_val, device, eps):
     k64 = torch.tensor([k_val], dtype=torch.float64)
     f64 = torch.zeros_like(u64)
     f64[:, :, 1:-1, 1:-1] = nonlinear_flux_divergence(
-        u64, k64, h, eps, raw_power=True)
+        u64, k64, h, eps, raw_power=False)
     g_np = u_np.copy()
     g_np[1:-1, 1:-1] = 0.
 
@@ -755,7 +755,7 @@ def make_analytic_dataset(N, case, k_val, device, eps):
         "f": f64.float().to(device), "g": torch.from_numpy(g_np).float()[None, None].to(device),
         "k": torch.tensor([k_val], dtype=torch.float32, device=device),
         "u_ref": u64.float().to(device),
-        "raw_power": True,
+        "raw_power": False,
         "mask": bnd, "interior_mask": interior,
         "x": x_t, "y": y_t, "h": h,
         "ref_res64": 0.,   # analytic ref residual computed on-demand
@@ -793,10 +793,10 @@ def run_analytic_suite(model, stats, device, args, ckpt_args, out_dir):
             up = u_pred[0, 0]
             pr = nonlinear_pde_residual(
                 u_pred[0:1], batch["f"][0:1], batch["k"][0:1], batch["h"],
-                eps=eps, raw_power=True)[0, 0]
+                eps=eps)[0, 0]
             er = nonlinear_pde_residual(
                 batch["u_ref"][0:1], batch["f"][0:1], batch["k"][0:1], batch["h"],
-                eps=eps, raw_power=True)[0, 0]
+                eps=eps)[0, 0]
             _save_panel(ui, up, up - ui, batch["f"][0, 0], pr, er,
                         out_dir / f"analytic_{case_name}_panel.png",
                         f"analytic {case_name}  k={rows[0]['k']:.2f}  "

@@ -19,6 +19,7 @@ import scipy.sparse.linalg as spla
 # -- grid -------------------------------------------------------------------
 
 def make_grid(N, device="cpu", dtype=torch.float32):
+    """Uniform grid on [-1,1]^2: returns x, y, boundary_mask, interior_mask, h."""
     H = W = N + 2
     h = 2.0 / (N + 1)
     xs = torch.linspace(-1., 1., W, device=device, dtype=dtype)
@@ -35,6 +36,7 @@ def make_grid(N, device="cpu", dtype=torch.float32):
 
 
 def enforce_dirichlet(u_raw, g, bnd):
+    """Hard Dirichlet projection: u = bnd * g + (1-bnd) * u_raw."""
     return bnd * g + (1. - bnd) * u_raw
 
 
@@ -57,6 +59,7 @@ def _coeff(u, k, eps, raw_power):
 
 
 def nonlinear_flux_divergence(u, k, h, eps=1e-4, raw_power=False):
+    """5-point flux-form FD: -div(u^k grad u) with arithmetic-mean interface coefficients."""
     if isinstance(k, (int, float)):
         k = torch.tensor([k], device=u.device)
     if k.ndim == 1:
@@ -80,6 +83,7 @@ def nonlinear_flux_divergence(u, k, h, eps=1e-4, raw_power=False):
 
 
 def nonlinear_pde_residual(u, f, k, h, eps=1e-4, raw_power=False):
+    """PDE residual R = -div_h(u^k grad_h u) - f, interior only."""
     return (nonlinear_flux_divergence(u, k, h, eps, raw_power)
             - f[:, :, 1:-1, 1:-1])
 
@@ -290,6 +294,7 @@ def trivial_linear_baseline(data):
 # -- input / stats / batching ------------------------------------------------
 
 def build_input(f_norm, g, bnd, k_norm, x, y):
+    """Assemble 6-channel CNN input: [f_norm, g, bnd, k_ch, x, y]."""
     B = f_norm.shape[0]
     def _expand(t):
         return t.expand(B, -1, -1, -1) if t.shape[0] == 1 else t
@@ -423,12 +428,12 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
                 err = (u_pred - batch["u_ref"]) * interior
                 loss = err.pow(2).mean()
             else:
-                # physics: mean((h^2 R)^2). Grid-based scaling (not per-sample
-                # ||f||) keeps the loss magnitude comparable across data
-                # families; the unscaled resRMSE is still logged separately.
+                # physics: per-sample normalized PDE residual
                 res = nonlinear_pde_residual(
                     u_pred, batch["f"], batch["k"], batch["h"], eps=eps)
-                loss = (batch["h"] ** 2 * res).pow(2).mean()
+                f_int = batch["f"][:, :, 1:-1, 1:-1]
+                scale = f_int.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt().clamp_min(1.0)
+                loss = ((res / scale) ** 2).mean()
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -1046,6 +1051,8 @@ def parse_args():
                    help="'data': same MMS family | 'analytic': 4 signed analytic test cases, requires k=2")
     p.add_argument("--predict-k", type=float, default=2.0,
                    help="fixed k for prediction (--predict-case analytic requires k=2)")
+    p.add_argument("--plot-dir", default="",
+                   help="directory for output figures and metrics CSVs")
     return p.parse_args()
 
 

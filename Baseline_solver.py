@@ -406,6 +406,7 @@ def ref_residual_rmse64(data, eps):
 # -- input / stats / batching ------------------------------------------------
 
 def build_input(f_norm, g, bnd, k_norm, x, y):
+    """Assemble 6-channel CNN input: [f_norm, g, bnd, k_ch, x, y]."""
     B = f_norm.shape[0]
     def _expand(t):
         return t.expand(B, -1, -1, -1) if t.shape[0] == 1 else t
@@ -537,12 +538,12 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
                 err = (u_pred - batch["u_ref"]) * interior
                 loss = err.pow(2).mean()
             else:
-                # physics: mean((h^2 R)^2). Grid-based scaling (not per-sample
-                # ||f||) keeps the loss magnitude comparable across data
-                # families; the unscaled resRMSE is still logged separately.
+                # physics: per-sample normalized PDE residual
                 res = nonlinear_pde_residual(
                     u_pred, batch["f"], batch["k"], batch["h"], eps=args.coeff_eps)
-                loss = (batch["h"] ** 2 * res).pow(2).mean()
+                f_int = batch["f"][:, :, 1:-1, 1:-1]
+                scale = f_int.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt().clamp_min(1.0)
+                loss = ((res / scale) ** 2).mean()
 
             opt.zero_grad(set_to_none=True)
             loss.backward()

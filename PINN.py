@@ -31,6 +31,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 
 K_DEFAULT = 2.0
 
@@ -101,6 +103,40 @@ def _flux_div(u, k, h, eps=1e-4):
 def fd_residual(u, f, k, h, eps=1e-4):
     """R(u) = -div_h(u^k grad_h u) - f on interior nodes."""
     return _flux_div(u, k, h, eps) - f[:, :, 1:-1, 1:-1]
+
+
+def _solve_linear_poisson(f, g, h):
+    """Solve -lap(u) = f with Dirichlet BC u=g on 5-point stencil."""
+    N = f.shape[0] - 2
+    n = N * N
+    h2 = 1.0 / (h * h)
+    idx = np.arange(n)
+    mask_e = (idx % N) != (N - 1)
+    mask_w = (idx % N) != 0
+    mask_n = idx < (n - N)
+    mask_s = idx >= N
+
+    diag = np.full(n, 4.0 * h2)
+    off = np.full(n - 1, -h2)
+    off[~mask_e[:n-1]] = 0.
+    off_n = np.full(n - N, -h2)
+
+    rows = np.concatenate([idx, idx[mask_e], idx[mask_w], idx[mask_n], idx[mask_s]])
+    cols = np.concatenate([idx, idx[mask_e] + 1, idx[mask_w] - 1, idx[mask_n] + N, idx[mask_s] - N])
+    data = np.concatenate([diag,
+        np.full(mask_e.sum(), -h2), np.full(mask_w.sum(), -h2),
+        np.full(mask_n.sum(), -h2), np.full(mask_s.sum(), -h2)])
+
+    b = f[1:N+1, 1:N+1].ravel().copy()
+    b[N-1::N] += h2 * g[1:N+1, N+1]
+    b[0::N]   += h2 * g[1:N+1, 0]
+    b[(N-1)*N:] += h2 * g[N+1, 1:N+1]
+    b[:N]     += h2 * g[0, 1:N+1]
+
+    A = sp.coo_matrix((data, (rows, cols)), shape=(n, n)).tocsr()
+    u = g.copy()
+    u[1:-1, 1:-1] = spla.spsolve(A, b).reshape(N, N)
+    return u
 
 
 # ===========================================================================
@@ -321,38 +357,60 @@ def pinn_loss(model: nn.Module,
 # ===========================================================================
 
 @torch.no_grad()
-def _eval_grid(model, x, y, boundary, interior, h, f, k, g, need_gradient=False):
+def _eval_grid(model, x, y, boundary, interior, h, f, k, g):
+    """Evaluate PINN on a grid.  Returns (metrics_dict, u_pred_tensor)."""
     xp = x.reshape(-1, 1)
     yp = y.reshape(-1, 1)
     u_pred_flat = model(xp, yp)
     u_pred = u_pred_flat.reshape(1, 1, x.shape[-2], x.shape[-1])
-
     ue = u_exact(x, y)
     err = (u_pred - ue) * interior
+    err_flat = err[:, :, 1:-1, 1:-1]
+    u_flat = ue[:, :, 1:-1, 1:-1]
 
-    m = {
-        "relL2": float(err.norm(p=2) / ue.mul(interior).norm(p=2).clamp_min(1e-12)),
-        "linf": float(err.abs().max()),
-        "bmax": float(((u_pred - g) * boundary).abs().max()),
-    }
-
+    # residuals
     res_pred = fd_residual(u_pred, f, k, h)
     res_exact = fd_residual(ue, f, k, h)
-    m["resRMSE"] = float(res_pred.pow(2).mean().sqrt())
-    m["exact_resRMSE"] = float(res_exact.pow(2).mean().sqrt())
 
-    if need_gradient:
-        du = lambda v: (v[:, :, 1:-1, 2:] - v[:, :, 1:-1, :-2]) / (2.0 * h)
-        dv = lambda v: (v[:, :, 2:, 1:-1] - v[:, :, :-2, 1:-1]) / (2.0 * h)
-        p_grad = torch.cat([du(u_pred), dv(u_pred)], dim=1)
-        t_grad = torch.cat([du(ue), dv(ue)], dim=1)
-        m["gradRelL2"] = float(
-            (p_grad - t_grad).norm(p=2) / t_grad.norm(p=2).clamp_min(1e-12)
-        )
-    else:
-        m["gradRelL2"] = 0.0
+    # gradients
+    du = lambda v: (v[:, :, 1:-1, 2:] - v[:, :, 1:-1, :-2]) / (2.0 * h)
+    dv = lambda v: (v[:, :, 2:, 1:-1] - v[:, :, :-2, 1:-1]) / (2.0 * h)
+    p_grad = torch.cat([du(u_pred), dv(u_pred)], dim=1).flatten(2)
+    t_grad = torch.cat([du(ue), dv(ue)], dim=1).flatten(2)
 
+    # baselines
+    const_val = u_flat.mean()
+    cpred = boundary * g + (1. - boundary) * const_val
+    const_err = ((cpred - ue) * interior)[:, :, 1:-1, 1:-1]
+
+    u_lin = _solve_linear_poisson(
+        f[0, 0].cpu().numpy(), g[0, 0].cpu().numpy(), float(h))
+    lin_err = (torch.from_numpy(u_lin).to(u_pred) - ue[0, 0]) * interior[0, 0]
+    lin_err_flat = lin_err[1:-1, 1:-1]
+
+    m = {
+        "relL2": float(err_flat.norm(p=2) / u_flat.norm(p=2).clamp_min(1e-12)),
+        "RMSE": float(err_flat.pow(2).mean().sqrt()),
+        "MAE": float(err_flat.abs().mean()),
+        "maxError": float(err_flat.abs().max()),
+        "predResRMSE": float(res_pred.pow(2).mean().sqrt()),
+        "refResRMSE": float(res_exact.pow(2).mean().sqrt()),
+        "bndErr": float(((u_pred - g) * boundary).abs().max()),
+        "gradRelL2": float((p_grad - t_grad).norm(p=2)
+                            / t_grad.norm(p=2).clamp_min(1e-12)),
+        "gradLinf": float((p_grad - t_grad).abs().max()),
+        "constBaselineRelL2": float(const_err.norm(p=2)
+                                     / u_flat.norm(p=2).clamp_min(1e-12)),
+        "linearBaselineRelL2": float(lin_err_flat.norm(p=2)
+                                      / u_flat.norm(p=2).clamp_min(1e-12)),
+    }
     return m, u_pred
+
+
+def save_summary_json(summary, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path), "w") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
 
 
 # ===========================================================================
@@ -424,15 +482,15 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
 
             elapsed = time.time() - t0
             print(f"{epoch:6d}  {float(loss_pde):10.3e}  {float(loss_bc):10.3e}  "
-                  f"{relL2:10.3e}  {vm['resRMSE']:10.3e}  {elapsed:7.1f}s")
+                  f"{relL2:10.3e}  {vm['predResRMSE']:10.3e}  {elapsed:7.1f}s")
 
             history.append({
                 "epoch": epoch,
                 "loss_pde": float(loss_pde),
                 "loss_bc": float(loss_bc),
                 "relL2": relL2,
-                "resRMSE": vm["resRMSE"],
-                "bmax": vm["bmax"],
+                "resRMSE": vm["predResRMSE"],
+                "bmax": vm["bndErr"],
             })
 
     # restore best Adam state
@@ -470,8 +528,8 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
                                    h, f_grid, k_grid, g_grid)
                 elapsed = time.time() - t0
                 print(f"  lbfgs {i+1:4d}  loss={float(loss_lbfgs):.3e}  "
-                      f"relL2={vm['relL2']:.3e}  resRMSE={vm['resRMSE']:.3e}  "
-                      f"bmax={vm['bmax']:.3e}  {elapsed:.0f}s")
+                      f"relL2={vm['relL2']:.3e}  resRMSE={vm['predResRMSE']:.3e}  "
+                      f"bndErr={vm['bndErr']:.3e}  {elapsed:.0f}s")
 
                 if vm["relL2"] < best_relL2:
                     best_relL2 = vm["relL2"]
@@ -486,8 +544,8 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
                         "epoch": f"lbfgs_{i+1}",
                         "loss_pde": 0, "loss_bc": 0,
                         "relL2": vm["relL2"],
-                        "resRMSE": vm["resRMSE"],
-                        "bmax": vm["bmax"],
+                        "resRMSE": vm["predResRMSE"],
+                        "bmax": vm["bndErr"],
                     })
 
         if best_state is not None:
@@ -508,8 +566,7 @@ def evaluate_final(model: nn.Module, N: int, device: torch.device):
     f = forcing(x, y)
     g = boundary * u_exact(x, y)
 
-    vm, u_pred = _eval_grid(model, x, y, boundary, interior,
-                            h, f, k, g, need_gradient=True)
+    vm, u_pred = _eval_grid(model, x, y, boundary, interior, h, f, k, g)
 
     data = {"u_pred": u_pred, "u_exact": u_exact(x, y),
             "f": f, "h": h, "boundary": boundary, "interior": interior}
@@ -659,11 +716,31 @@ def main():
 
     # ── Evaluate & plot ──
     device = select_device(args.device)
+    t0 = time.time()
     data, metrics = evaluate_final(model, args.N, device)
+    solve_time = time.time() - t0
+    metrics["solve_time_sec"] = solve_time
 
-    print(f"\nFinal metrics (N={args.N} grid):")
-    for k, v in metrics.items():
-        print(f"  {k}: {v:.4e}")
+    print(f"\nFinal metrics (N={args.N} grid, {solve_time:.1f}s):")
+    for k in sorted(metrics.keys()):
+        print(f"  {k}: {metrics[k]:.4e}")
+
+    # per-sample row + summary
+    rows = [{"sample_id": 0, "k": K_DEFAULT, **metrics}]
+    metric_keys = [k for k in sorted(metrics.keys()) if k != "solve_time_sec"]
+    summary = {}
+    for k in metric_keys:
+        summary[k] = {"mean": metrics[k], "std": 0.0,
+                       "min": metrics[k], "max": metrics[k]}
+
+    out = paths["figure_dir"]
+    out.mkdir(parents=True, exist_ok=True)
+    with open(str(out / "metrics.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    save_summary_json(summary, out / "summary.json")
+    print(f"saved metrics + summary: {out}")
 
     run_params = {
         "run_id": get_run_id(), "model": "PINN (MLP)",
@@ -677,8 +754,6 @@ def main():
     _update_latest_symlink(Path("results") / model_type, ckey)
 
     if not args.no_plot:
-        out = paths["figure_dir"]
-        out.mkdir(parents=True, exist_ok=True)
         h = float(data["h"])
         full_ext = [-1.0, 1.0, -1.0, 1.0]
         resid_ext = [-1.0 + h, 1.0 - h, -1.0 + h, 1.0 - h]
@@ -696,19 +771,13 @@ def main():
         )[0, 0]
 
         title = (f"PINN | relL2={metrics['relL2']:.3e}  "
-                 f"Linf={metrics['linf']:.3e}  "
-                 f"resRMSE={metrics['resRMSE']:.3e}  "
-                 f"exact_resRMSE={metrics['exact_resRMSE']:.3e}")
+                 f"maxErr={metrics['maxError']:.3e}  "
+                 f"resRMSE={metrics['predResRMSE']:.3e}  "
+                 f"refResRMSE={metrics['refResRMSE']:.3e}")
 
         _save_panel(ui, up, err, data["f"][0, 0], res_pred, res_exact,
                     out / "pinn_panel.png", title, full_ext, resid_ext)
-
-        csv_path = out / "metrics.csv"
-        with open(str(csv_path), "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(metrics.keys()))
-            w.writeheader()
-            w.writerow(metrics)
-        print(f"saved panel + metrics: {out}")
+        print(f"saved panel: {out}")
 
     print(f"\nDone. Config: {paths['config_name']}")
     print(f"Checkpoints: {paths['ckpt_dir']}")

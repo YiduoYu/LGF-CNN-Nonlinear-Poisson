@@ -352,6 +352,19 @@ def pinn_loss(model: nn.Module,
     return loss_pde + bc_weight * loss_bc, loss_pde.detach(), loss_bc.detach()
 
 
+def validation_loss(model: nn.Module,
+                    x_int: torch.Tensor, y_int: torch.Tensor,
+                    x_bnd: torch.Tensor, y_bnd: torch.Tensor,
+                    bc_weight: float) -> float:
+    """PINN loss on a fixed validation collocation set.
+
+    Used for model selection: depends only on f and the boundary data g,
+    never on u_exact in the interior — no test leakage."""
+    model.eval()
+    loss, _, _ = pinn_loss(model, x_int, y_int, x_bnd, y_bnd, bc_weight)
+    return float(loss)
+
+
 # ===========================================================================
 # 5. Grid evaluation  (shared by training and final eval)
 # ===========================================================================
@@ -435,14 +448,17 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
     f_grid = forcing(x_grid, y_grid).detach()
     g_grid = boundary * u_exact(x_grid, y_grid)
 
+    # ---- fixed validation collocation set (model selection, no u_exact) ----
+    xv_int, yv_int, xv_bnd, yv_bnd = sample_points(args.n_int, args.n_bnd, device)
+
     print(f"device={device}  N={args.N}  epochs={args.epochs}  "
           f"collocation: interior={args.n_int}  boundary={args.n_bnd}  "
           f"bc_weight={args.bc_weight}")
     print(f"hidden_dim={args.hidden_dim}  n_layers={args.n_layers}")
-    print(f"{'epoch':>6s}  {'loss_pde':>10s}  {'loss_bc':>10s}  "
+    print(f"{'epoch':>6s}  {'loss_pde':>10s}  {'loss_bc':>10s}  {'val_loss':>10s}  "
           f"{'relL2':>10s}  {'resRMSE':>10s}  {'time':>8s}")
 
-    best_relL2 = math.inf
+    best_val_loss = math.inf
     best_state = None
     history: list[dict] = []
 
@@ -468,26 +484,30 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
             vm, _ = _eval_grid(model, x_grid, y_grid, boundary, interior,
                                h, f_grid, k_grid, g_grid)
             relL2 = vm["relL2"]
+            val_loss = validation_loss(model, xv_int, yv_int, xv_bnd, yv_bnd,
+                                       args.bc_weight)
 
-            if relL2 < best_relL2:
-                best_relL2 = relL2
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 best_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save({
                     "model_state_dict": best_state,
                     "args": vars(args),
                     "epoch": epoch,
-                    "best_val_relL2": best_relL2,
+                    "best_val_loss": best_val_loss,
                 }, best_path)
 
             elapsed = time.time() - t0
             print(f"{epoch:6d}  {float(loss_pde):10.3e}  {float(loss_bc):10.3e}  "
+                  f"{val_loss:10.3e}  "
                   f"{relL2:10.3e}  {vm['predResRMSE']:10.3e}  {elapsed:7.1f}s")
 
             history.append({
                 "epoch": epoch,
                 "loss_pde": float(loss_pde),
                 "loss_bc": float(loss_bc),
+                "val_loss": val_loss,
                 "relL2": relL2,
                 "resRMSE": vm["predResRMSE"],
                 "bmax": vm["bndErr"],
@@ -496,7 +516,7 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
     # restore best Adam state
     if best_state is not None:
         model.load_state_dict(best_state)
-        print(f"best Adam model (val relL2={best_relL2:.4e})")
+        print(f"best Adam model (val loss={best_val_loss:.4e})")
 
     # ---- L-BFGS fine-tuning (reuses the last Adam epoch's collocation pts) ----
     if args.lbfgs_epochs > 0 and args.epochs > 0:
@@ -526,23 +546,27 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
             if (i + 1) % 20 == 0 or i == 0 or i == args.lbfgs_epochs - 1:
                 vm, _ = _eval_grid(model, x_grid, y_grid, boundary, interior,
                                    h, f_grid, k_grid, g_grid)
+                val_loss = validation_loss(model, xv_int, yv_int, xv_bnd, yv_bnd,
+                                           args.bc_weight)
                 elapsed = time.time() - t0
                 print(f"  lbfgs {i+1:4d}  loss={float(loss_lbfgs):.3e}  "
+                      f"val_loss={val_loss:.3e}  "
                       f"relL2={vm['relL2']:.3e}  resRMSE={vm['predResRMSE']:.3e}  "
                       f"bndErr={vm['bndErr']:.3e}  {elapsed:.0f}s")
 
-                if vm["relL2"] < best_relL2:
-                    best_relL2 = vm["relL2"]
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
                     best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                     best_path.parent.mkdir(parents=True, exist_ok=True)
                     torch.save({
                         "model_state_dict": best_state,
                         "args": vars(args),
-                        "best_val_relL2": best_relL2,
+                        "best_val_loss": best_val_loss,
                     }, best_path)
                     history.append({
                         "epoch": f"lbfgs_{i+1}",
                         "loss_pde": 0, "loss_bc": 0,
+                        "val_loss": val_loss,
                         "relL2": vm["relL2"],
                         "resRMSE": vm["predResRMSE"],
                         "bmax": vm["bndErr"],
@@ -550,9 +574,9 @@ def train(args: argparse.Namespace, best_path: Path, last_path: Path,
 
         if best_state is not None:
             model.load_state_dict(best_state)
-            print(f"best overall model (val relL2={best_relL2:.4e})")
+            print(f"best overall model (val loss={best_val_loss:.4e})")
 
-    return model, history, best_relL2
+    return model, history, best_val_loss
 
 
 # ===========================================================================
@@ -690,7 +714,7 @@ def main():
         print(f"  Output:       {paths['ckpt_dir']}")
         print("=" * 60)
 
-        model, history, best_relL2 = train(
+        model, history, best_val_loss = train(
             args, paths["best_path"], paths["last_path"], paths["history_path"],
         )
 
@@ -711,7 +735,7 @@ def main():
             "N": args.N, "epochs": args.epochs,
             "hidden_dim": args.hidden_dim, "n_layers": args.n_layers,
             "bc_weight": args.bc_weight, "k": K_DEFAULT,
-            "best_val_relL2": best_relL2,
+            "best_val_loss": best_val_loss,
         })
 
     # ── Evaluate & plot ──

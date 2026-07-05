@@ -25,3 +25,9 @@ report.docx
 # UNet experiment reports (local copy from branch)
 UNet/
 UNet draft/
+
+# LGF solver (reference implementation, not part of this experiment)
+LGF_python/
+
+# Experiment run scripts (local only)
+run_experiments*.sh

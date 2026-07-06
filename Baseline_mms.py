@@ -699,7 +699,7 @@ def _save_convergence_plot(history, path, loss_type="physics"):
 # so any integer k >= 0 is safe regardless of u sign.
 ANALYTIC_CASES = {
     "u1": lambda x, y: np.sin(np.pi * x) * np.cos(np.pi * y),
-    "u2": lambda x, y: x * (1. - x) * y * (1. - y),
+    "u2": lambda x, y: (1. - x ** 2) * (1. - y ** 2),
     "u3": lambda x, y: np.cos(np.pi * x) * np.cos(2. * np.pi * y),
     "u4": lambda x, y: x ** 2 * (1. - y) + np.sin(np.pi * x) * y,
 }

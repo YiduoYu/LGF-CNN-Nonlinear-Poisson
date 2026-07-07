@@ -678,7 +678,7 @@ ANALYTIC_CASES = {
 # Exact (min, max) of the raw formulas above over [-1,1]^2 (analytically
 # verified). Used to shift+rescale to [U_EPS, 1+U_EPS]: shifting alone would
 # leave some cases spanning up to 2, which blows up a=u^k's dynamic range
-# (up to 2^k vs the intended ~1^k) and destabilizes the nonlinear FD solver.
+# (up to 2^k vs the intended ~1^k) and destabilizes CNN training.
 ANALYTIC_RANGE = {"u1": (-1.0, 1.0), "u2": (0.0, 1.0), "u3": (-1.0, 1.0), "u4": (-1.0, 2.0)}
 
 def make_analytic_dataset(N, case, k_val, device):

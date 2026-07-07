@@ -22,12 +22,20 @@ report.docx
 ~$*.docx
 方案设计.docx
 
-# UNet experiment reports (local copy from branch)
-UNet/
-UNet draft/
+# last experiments report (local copy from branch)
+Draft/
+
 
 # LGF solver (reference implementation, not part of this experiment)
 LGF_python/
 
 # Experiment run scripts (local only)
 run_experiments*.sh
+
+
+EXPERIMENT_REPORT.md
+PROJECT_HISTORY.md
+
+run_all.log
+
+

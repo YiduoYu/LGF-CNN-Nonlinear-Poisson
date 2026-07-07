@@ -10,13 +10,12 @@
 
 ---
 
-## 三个独立文件（零交叉 import）
+## 两个独立文件（零交叉 import）
 
 | 文件 | 路线 | 用途 |
 |------|------|------|
 | `Baseline_solver.py` | **正向 solver 数据** | 随机 f, g, k → damped Newton FD 求解 u_ref → CNN 训练（主力） |
 | `Baseline_mms.py` | **MMS 反向数据** | 人造解 u_ref → FD 反算 f（oracle = 0）→ CNN 训练 |
-| `PINN.py` | **PINN 对照** | MLP + autodiff，固定 k=2，sin(πx)cos(πy) 制造解 |
 
 ### Baseline_solver.py — 正向数据
 
@@ -68,9 +67,6 @@ python Baseline_mms.py --predict \
 python Baseline_solver.py --predict \
   --predict-from checkpoints/cnn/<key>/best.pt \
   --predict-case fixed-solver --predict-k 2 --plot --device cpu
-
-# PINN 对照
-python PINN.py --N 32 --epochs 5000
 ```
 
 ---

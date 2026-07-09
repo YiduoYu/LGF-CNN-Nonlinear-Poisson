@@ -1,19 +1,17 @@
 """
-CNN solver for -div(u^k grad u) = f on [-1,1]^2, Dirichlet BC u=g.
-a(u,k) = u^k.  MMS data: u_ref -> f = -div_h(a grad_h u_ref).
-k integer in {0,1,2,3}, u strictly positive (u >= U_EPS). Supports
---loss {supervised, physics}.
+CNN solver for -div(a(x,y) grad u) = f on [-1,1]^2, Dirichlet BC u=g.
+a(x,y) = exp(sigma*psi) is a given smooth positive coefficient field
+(sigma controls contrast).  MMS data: u_ref -> f = -div_h(a grad_h u_ref).
+u may take either sign. Supports --loss {supervised, physics}.
 """
 
 import argparse, csv, json, math, os, random, tempfile, time
 from pathlib import Path
 
 import numpy as np
-import torch, torch.nn as nn, torch.nn.functional as F
+import torch, torch.nn as nn
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
-
-U_EPS = 1e-15  # strict positivity floor: every constructed u has min(u) == U_EPS
 
 # per-sample metric columns written to metrics.csv / summary.json
 METRIC_KEYS = ["relL2", "RMSE", "MAE", "maxError", "predResRMSE", "refResRMSE",
@@ -35,35 +33,25 @@ def make_grid(N, device="cpu", dtype=torch.float32):
     bnd[:, :, 1:-1, 1:-1] = 0.
     return x, y, bnd, 1. - bnd, h
 
-def enforce_dirichlet(u_raw, g, bnd, u_floor=1e-4):
-    """Hard Dirichlet projection: u = bnd * g + (1-bnd) * u_raw. Interior
-    values are forced positive via softplus so a(u,k) = u^k stays well-defined."""
-    u_int = u_floor + F.softplus(u_raw)
-    return bnd * g + (1. - bnd) * u_int
+def enforce_dirichlet(u_raw, g, bnd):
+    """Hard Dirichlet projection: u = bnd * g + (1-bnd) * u_raw (u may take
+    either sign)."""
+    return bnd * g + (1. - bnd) * u_raw
 
-# -- nonlinear flux-form operator -------------------------------------------
+# -- variable-coefficient flux-form operator ---------------------------------
 
-def nonlinear_flux_divergence(u, k, h):
-    """5-point flux-form FD: -div(a(u,k) grad u) with arithmetic-mean
-    interface coefficients a = u^k."""
-    if isinstance(k, (int, float)):
-        k = torch.tensor([k], device=u.device)
-    if k.ndim == 1:
-        k = k.view(-1, 1, 1, 1)
-
-    a = u.pow(k.float())    # a(u,k) = u^k (u > 0)
-
-    # cell-centered coefficient and u
+def flux_divergence(u, a, h):
+    """5-point flux-form FD: -div(a(x,y) grad u), arithmetic-mean interface
+    coefficients. u, a same shape (B,1,H,W); a is a given positive field.
+    Returns interior nodes (B,1,H-2,W-2)."""
     uc = u[:, :, 1:-1, 1:-1]
     ac = a[:, :, 1:-1, 1:-1]
 
-    # arithmetic-mean interface coefficients
     ae = 0.5 * (ac + a[:, :, 1:-1, 2:])
     aw = 0.5 * (ac + a[:, :, 1:-1, :-2])
     an = 0.5 * (ac + a[:, :, 2:, 1:-1])
     as_ = 0.5 * (ac + a[:, :, :-2, 1:-1])
 
-    # flux on each face (east, west, north, south)
     fe = ae * (u[:, :, 1:-1, 2:] - uc) / h
     fw = aw * (uc - u[:, :, 1:-1, :-2]) / h
     fn = an * (u[:, :, 2:, 1:-1] - uc) / h
@@ -72,9 +60,9 @@ def nonlinear_flux_divergence(u, k, h):
     return -(fe - fw + fn - fs) / h
 
 
-def nonlinear_pde_residual(u, f, k, h):
-    """PDE residual R = -div_h(a(u,k) grad_h u) - f, interior nodes only."""
-    return nonlinear_flux_divergence(u, k, h) - f[:, :, 1:-1, 1:-1]
+def pde_residual(u, f, a, h):
+    """R = -div_h(a grad_h u) - f, interior nodes only."""
+    return flux_divergence(u, a, h) - f[:, :, 1:-1, 1:-1]
 
 # -- CNN --------------------------------------------------------------------
 
@@ -123,10 +111,19 @@ def random_fourier_field(N, M, rng=np.random, normalize=True):
         field /= denom
     return field
 
+def random_positive_field(N, sigma, M, rng=np.random):
+    """Smooth log-normal positive coefficient field a(x,y)=exp(sigma*psi),
+    psi a 2D Fourier field normalized to [-1,1]. sigma controls contrast:
+    a in [exp(-sigma), exp(sigma)], dynamic range exp(2*sigma). sigma=0 ->
+    a≡1 (degenerates to constant-coefficient Poisson). Returns full grid
+    (N+2, N+2) float64."""
+    psi = random_fourier_field(N, M, rng, normalize=True)
+    return np.exp(sigma * psi)
+
 # -- manufactured solution --------------------------------------------------
 
 def manufactured_u(x, y, M, rng=np.random):
-    """u = b(x,y) + (1-x^2)(1-y^2)*q(x,y), shifted so min(u) == U_EPS.
+    """u = b(x,y) + (1-x^2)(1-y^2)*q(x,y) (signed).
 
     q(x,y) is a normalized 2D Fourier series (interior perturbation).
     x, y are torch tensors; returns a CPU float64 tensor."""
@@ -146,44 +143,44 @@ def manufactured_u(x, y, M, rng=np.random):
     fourier_part = random_fourier_field(N, M, rng, normalize=True)
 
     u_signed = boundary_part + 0.36 * phi * fourier_part
-    u = u_signed - u_signed.min() + U_EPS   # strictly positive, min == U_EPS
-    return torch.from_numpy(u)
+    return torch.from_numpy(u_signed)
 
 # -- MMS dataset ------------------------------------------------------------
 
 def make_mms_dataset(N, n_samples, device, args, seed):
-    """Build MMS dataset: u_ref -> f = -div_h(u_ref^k grad_h u_ref) in float64, store float32."""
+    """Build MMS dataset: u_ref, a(sigma) -> f = -div_h(a grad_h u_ref) in
+    float64, store float32."""
     rng = np.random.RandomState(seed)
     x_t, y_t, bnd, interior, h = make_grid(N, device)
     x64, y64, *_ = make_grid(N, "cpu", torch.float64)
-    f_list, g_list, k_list, u_list = [], [], [], []
+    f_list, g_list, a_list, sigma_list, u_list = [], [], [], [], []
     res64_sq = 0.
 
     M = getattr(args, "fourier_m", 6)
     for _ in range(n_samples):
-        if getattr(args, "random_k", False):
-            k_i = int(rng.randint(args.k_min, args.k_max + 1))
-        else:
-            k_i = int(args.k)
+        sigma_i = (rng.uniform(args.sigma_min, args.sigma_max)
+                   if getattr(args, "random_sigma", False) else args.sigma)
 
+        a64 = torch.from_numpy(random_positive_field(N, sigma_i, M, rng))[None, None]
         u64 = manufactured_u(x64[0, 0], y64[0, 0], M, rng)
         u64 = u64.unsqueeze(0).unsqueeze(0)          # CPU float64
-        k64 = torch.tensor([k_i], dtype=torch.float64)
         f64 = torch.zeros_like(u64)
-        f64[:, :, 1:-1, 1:-1] = nonlinear_flux_divergence(u64, k64, h)
+        f64[:, :, 1:-1, 1:-1] = flux_divergence(u64, a64, h)
         g64 = u64.clone()
         g64[:, :, 1:-1, 1:-1] = 0.
-        res64_sq += float(nonlinear_pde_residual(
-            u64, f64, k64, h).pow(2).sum())
+        res64_sq += float(pde_residual(
+            u64, f64, a64, h).pow(2).sum())
 
         f_list.append(f64.float().to(device))
         g_list.append(g64.float().to(device))
-        k_list.append(torch.tensor([k_i], dtype=torch.float32, device=device))
+        a_list.append(a64.float().to(device))
+        sigma_list.append(torch.tensor([sigma_i], dtype=torch.float32, device=device))
         u_list.append(u64.float().to(device))
 
     return {
         "f": torch.cat(f_list), "g": torch.cat(g_list),
-        "k": torch.cat(k_list), "u_ref": torch.cat(u_list),
+        "a": torch.cat(a_list), "sigma": torch.cat(sigma_list),
+        "u_ref": torch.cat(u_list),
         "mask": bnd, "interior_mask": interior,
         "x": x_t, "y": y_t, "h": h,
         "ref_res64": math.sqrt(res64_sq / (n_samples * N * N)),
@@ -195,8 +192,8 @@ def ref_residual_rmse64(data):
     Training itself stays float32."""
     u = data["u_ref"].detach().cpu().double()
     f = data["f"].detach().cpu().double()
-    k = data["k"].detach().cpu().double()
-    return float(nonlinear_pde_residual(u, f, k, data["h"])
+    a = data["a"].detach().cpu().double()
+    return float(pde_residual(u, f, a, data["h"])
                  .pow(2).mean().sqrt())
 
 # -- sparse linear FD solver / trivial baseline ------------------------------
@@ -255,7 +252,7 @@ def _linear_baseline_rl2(f, g, u_ref, interior, h):
     return float(np.linalg.norm(err) / max(np.linalg.norm(ref), 1e-12))
 
 def trivial_linear_baseline(data):
-    """Mean relL2 of a≡1 linear solve vs nonlinear u_ref.  CNN must beat this."""
+    """Mean relL2 of a≡1 linear solve vs u_ref.  CNN must beat this."""
     h = float(data["h"])
     f = data["f"].detach().cpu().numpy()
     g = data["g"].detach().cpu().numpy()
@@ -267,30 +264,31 @@ def trivial_linear_baseline(data):
 
 # -- input / stats / batching ------------------------------------------------
 
-def build_input(f_norm, g, bnd, k_norm, x, y):
-    """Assemble 6-channel CNN input: [f_norm, g, bnd, k_ch, x, y]."""
+def build_input(f_norm, g, bnd, a_norm, x, y):
+    """Assemble 6-channel CNN input: [f_norm, g, bnd, log_a_norm, x, y].
+    a_norm is a full-grid field (B,1,H,W)."""
     B = f_norm.shape[0]
     def _expand(t):
         return t.expand(B, -1, -1, -1) if t.shape[0] == 1 else t
-    k_ch = k_norm.view(B, 1, 1, 1).expand(-1, 1, *bnd.shape[-2:])
-    return torch.cat([f_norm, g, _expand(bnd), k_ch, _expand(x), _expand(y)], dim=1)
+    return torch.cat([f_norm, g, _expand(bnd), _expand(a_norm),
+                      _expand(x), _expand(y)], dim=1)
 
 def compute_stats(data):
     fi = data["f"][:, :, 1:-1, 1:-1]
-    k = data["k"]
+    loga = data["a"].clamp_min(1e-12).log()
     return (fi.mean().item(), fi.std(unbiased=False).clamp_min(1e-8).item(),
-            k.mean().item(), k.std(unbiased=False).clamp_min(1e-8).item())
+            loga.mean().item(), loga.std(unbiased=False).clamp_min(1e-8).item())
 
 def _take_batch(data, idx):
     return {"h": data["h"],
-            **{k: data[k][idx] for k in ("f", "g", "k", "u_ref")},
+            **{k: data[k][idx] for k in ("f", "g", "a", "sigma", "u_ref")},
             **{k: data[k][:1] for k in ("mask", "interior_mask", "x", "y")}}
 
 def _forward(model, batch, stats):
-    f_mean, f_std, k_mean, k_std = stats
+    f_mean, f_std, loga_mean, loga_std = stats
     fn = (batch["f"] - f_mean) / f_std
-    kn = (batch["k"] - k_mean) / k_std
-    inp = build_input(fn, batch["g"], batch["mask"], kn, batch["x"], batch["y"])
+    loga_n = (batch["a"].clamp_min(1e-12).log() - loga_mean) / loga_std
+    inp = build_input(fn, batch["g"], batch["mask"], loga_n, batch["x"], batch["y"])
     return enforce_dirichlet(model(inp), batch["g"], batch["mask"])
 
 def _set_seed(seed):
@@ -335,9 +333,9 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
     _set_seed(args.seed)
     device = _select_device(args.device)
 
-    print(f"Equation: -div(u^k grad u) = f  |  k = {args.k}  |  data=mms")
-    if args.random_k:
-        print(f"  random k in [{args.k_min}, {args.k_max}]")
+    print(f"Equation: -div(a(x,y) grad u) = f  |  sigma = {args.sigma}  |  data=mms")
+    if args.random_sigma:
+        print(f"  random sigma in [{args.sigma_min}, {args.sigma_max}]")
 
     print(f"generating {args.train_samples} MMS samples (N={args.N})")
     train_data = make_mms_dataset(args.N, args.train_samples, device, args,
@@ -346,7 +344,7 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
                                 seed=args.seed + 1)
     stats = compute_stats(train_data)
     print(f"f stats: mean={stats[0]:.4e}  std={stats[1]:.4e}  "
-          f"k stats: mean={stats[2]:.4e}  std={stats[3]:.4e}")
+          f"log(a) stats: mean={stats[2]:.4e}  std={stats[3]:.4e}")
 
     # Reference residual, reported in float64 (float32 rounding floor
     # ~h^-2*eps32 must not be mistaken for solver accuracy)
@@ -363,7 +361,7 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
 
     triv_rl2 = trivial_linear_baseline(val_data)
     print(f"trivial baseline (a≡1 linear Poisson) relL2 = {triv_rl2:.4e}  "
-          f"(CNN must beat this to have learned a(u,k))")
+          f"(CNN must beat this to have learned a(x,y))")
 
     if model is None:
         model = SimpleCNN(hidden_ch=args.base_ch, n_layers=args.n_layers).to(device)
@@ -417,8 +415,8 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
                 loss = err.pow(2).mean()
             else:
                 # physics: per-sample normalized PDE residual
-                res = nonlinear_pde_residual(
-                    u_pred, batch["f"], batch["k"], batch["h"])
+                res = pde_residual(
+                    u_pred, batch["f"], batch["a"], batch["h"])
                 f_int = batch["f"][:, :, 1:-1, 1:-1]
                 scale = f_int.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt().clamp_min(1.0)
                 loss = ((res / scale) ** 2).mean()
@@ -514,8 +512,8 @@ def per_sample_metrics(u_pred, batch, start_id=0):
     n_samples = u_pred.shape[0]
 
     err = (u_pred - ue) * interior
-    res = nonlinear_pde_residual(u_pred, batch["f"], batch["k"], batch["h"])
-    res_ref = nonlinear_pde_residual(ue, batch["f"], batch["k"], batch["h"])
+    res = pde_residual(u_pred, batch["f"], batch["a"], batch["h"])
+    res_ref = pde_residual(ue, batch["f"], batch["a"], batch["h"])
 
     err_flat = err[:, :, 1:-1, 1:-1].flatten(1)
     u_flat = ue[:, :, 1:-1, 1:-1].flatten(1)
@@ -533,7 +531,7 @@ def per_sample_metrics(u_pred, batch, start_id=0):
     for i in range(n_samples):
         rl2 = (err_flat[i].norm() / u_flat[i].norm().clamp_min(1e-12)).item()
         # constant baseline: predict mean(u_ref) on interior (direct
-        # projection — enforce_dirichlet would distort the constant via softplus)
+        # projection — enforce_dirichlet would distort the constant otherwise)
         m01 = batch["mask"][:1]
         const_pred = m01 * batch["g"][i:i+1] + (1. - m01) * u_flat[i].mean()
         const_err = ((const_pred - ue[i:i+1]) * interior[i:i+1])[:, :, 1:-1, 1:-1].flatten(1)
@@ -541,7 +539,7 @@ def per_sample_metrics(u_pred, batch, start_id=0):
 
         rows.append({
             "sample_id": start_id + i,
-            "k": batch["k"][i].item(),
+            "sigma": batch["sigma"][i].item(),
             "relL2": rl2,
             "RMSE": err_flat[i].pow(2).mean().sqrt().item(),
             "MAE": err_flat[i].abs().mean().item(),
@@ -666,8 +664,7 @@ def _save_convergence_plot(history, path, loss_type="physics"):
 
 # -- analytic test suite ----------------------------------------------------
 
-# Raw analytic formulas (signed); shifted+rescaled to strictly positive u
-# below via ANALYTIC_RANGE so a(u,k) = u^k stays well-defined for any k >= 0.
+# Analytic formulas (signed) -- used directly, no shift/rescale.
 ANALYTIC_CASES = {
     "u1": lambda x, y: np.sin(np.pi * x) * np.cos(np.pi * y),
     "u2": lambda x, y: (1. - x ** 2) * (1. - y ** 2),
@@ -675,36 +672,29 @@ ANALYTIC_CASES = {
     "u4": lambda x, y: x ** 2 * (1. - y) + np.sin(np.pi * x) * y,
 }
 
-# Exact (min, max) of the raw formulas above over [-1,1]^2 (analytically
-# verified). Used to shift+rescale to [U_EPS, 1+U_EPS]: shifting alone would
-# leave some cases spanning up to 2, which blows up a=u^k's dynamic range
-# (up to 2^k vs the intended ~1^k) and destabilizes CNN training.
-ANALYTIC_RANGE = {"u1": (-1.0, 1.0), "u2": (0.0, 1.0), "u3": (-1.0, 1.0), "u4": (-1.0, 2.0)}
-
-def make_analytic_dataset(N, case, k_val, device):
-    """Build a test dataset from an analytic u(x,y). k integer."""
-    k_val = int(k_val)
+def make_analytic_dataset(N, case, sigma, device, test_rng, M=6):
+    """Build a test dataset from an analytic u(x,y) (signed) against a
+    freshly-drawn test coefficient field a(x,y) of contrast sigma."""
     x_t, y_t, bnd, interior, h = make_grid(N, device)
     x_np = x_t[0, 0].cpu().numpy()
     y_np = y_t[0, 0].cpu().numpy()
     u_func = ANALYTIC_CASES[case]
 
     u_np = u_func(x_np, y_np).astype(np.float64)
-    lo, hi = ANALYTIC_RANGE[case]
-    u_np = (u_np - lo) / (hi - lo) + U_EPS   # shift+rescale to [U_EPS, 1+U_EPS]
+    a_np = random_positive_field(N, sigma, M, test_rng)
     u64 = torch.from_numpy(u_np)[None, None]          # CPU float64
-    k64 = torch.tensor([k_val], dtype=torch.float64)
+    a64 = torch.from_numpy(a_np)[None, None]
     f64 = torch.zeros_like(u64)
-    f64[:, :, 1:-1, 1:-1] = nonlinear_flux_divergence(
-        u64, k64, h)
+    f64[:, :, 1:-1, 1:-1] = flux_divergence(u64, a64, h)
     g_np = u_np.copy()
     g_np[1:-1, 1:-1] = 0.
 
-    res64 = float(nonlinear_pde_residual(u64, f64, k64, h).pow(2).mean().sqrt())
+    res64 = float(pde_residual(u64, f64, a64, h).pow(2).mean().sqrt())
 
     return {
         "f": f64.float().to(device), "g": torch.from_numpy(g_np).float()[None, None].to(device),
-        "k": torch.tensor([k_val], dtype=torch.float32, device=device),
+        "a": a64.float().to(device),
+        "sigma": torch.tensor([sigma], dtype=torch.float32, device=device),
         "u_ref": u64.float().to(device),
         "mask": bnd, "interior_mask": interior,
         "x": x_t, "y": y_t, "h": h,
@@ -721,11 +711,13 @@ def run_analytic_suite(model, stats, device, args, ckpt_args, out_dir):
     fext = [-1., 1., -1., 1.]
     rext = [-1. + h, 1. - h, -1. + h, 1. - h]
 
-    k_test = int(args.predict_k)
+    sigma_test = float(args.predict_sigma)
+    M = getattr(ckpt_args, "fourier_m", 6)
+    test_rng = np.random.RandomState(args.test_seed)
     cnn_ms_all = []
     for case_name in ANALYTIC_CASES:
-        print(f"\n  --- analytic case: {case_name}  (k={k_test:g}) ---")
-        batch = make_analytic_dataset(N, case_name, k_test, device)
+        print(f"\n  --- analytic case: {case_name}  (sigma={sigma_test:g}) ---")
+        batch = make_analytic_dataset(N, case_name, sigma_test, device, test_rng, M)
         u_pred, _, cnn_ms_sample = _time_forward(model, batch, stats)
         cnn_ms_all.append(cnn_ms_sample)
         rows, summary = per_sample_metrics(u_pred, batch)
@@ -743,16 +735,16 @@ def run_analytic_suite(model, stats, device, args, ckpt_args, out_dir):
         # analytic suite always saves figures (only reached with predict_case=analytic)
         ui = batch["u_ref"][0, 0]
         up = u_pred[0, 0]
-        pr = nonlinear_pde_residual(
-            u_pred[0:1], batch["f"][0:1], batch["k"][0:1], batch["h"])[0, 0]
-        er = nonlinear_pde_residual(
-            batch["u_ref"][0:1], batch["f"][0:1], batch["k"][0:1], batch["h"])[0, 0]
+        pr = pde_residual(
+            u_pred[0:1], batch["f"][0:1], batch["a"][0:1], batch["h"])[0, 0]
+        er = pde_residual(
+            batch["u_ref"][0:1], batch["f"][0:1], batch["a"][0:1], batch["h"])[0, 0]
         _save_panel(ui, up, up - ui, batch["f"][0, 0], pr, er,
                     out_dir / f"analytic_{case_name}_panel.png",
-                    f"analytic {case_name}  k={rows[0]['k']:.2f}  "
+                    f"analytic {case_name}  sigma={rows[0]['sigma']:.2f}  "
                     f"relL2={rows[0]['relL2']:.3e}", fext, rext)
         _save_centerline(ui, up, out_dir / f"analytic_{case_name}_centerline.png",
-                         f"analytic {case_name}  k={rows[0]['k']:.2f}  "
+                         f"analytic {case_name}  sigma={rows[0]['sigma']:.2f}  "
                          f"relL2={rows[0]['relL2']:.3e}")
 
     print(f"\n  timing: cnn_ms_per_sample={np.mean(cnn_ms_all):.3f}  "
@@ -782,6 +774,10 @@ def run_prediction(args):
             f"checkpoint type mismatch: expected 'cnn_mms', got '{ckpt_type}'. "
             f"Use the correct prediction script (Baseline_mms.py for "
             f"'cnn_mms', Baseline_solver.py for 'cnn').")
+    if "sigma" not in ckpt["args"]:
+        raise ValueError(
+            "checkpoint predates the a(x,y)/sigma refactor (has 'k', not "
+            "'sigma') — retrain with the current script.")
     ckpt_args = argparse.Namespace(**ckpt["args"])
     model = SimpleCNN(
         hidden_ch=ckpt_args.base_ch,
@@ -795,8 +791,8 @@ def run_prediction(args):
     data_args = argparse.Namespace(**vars(ckpt_args))
     data_args.device = args.device
     data_args.seed = args.test_seed
-    data_args.random_k = False
-    data_args.k = args.predict_k
+    data_args.random_sigma = False
+    data_args.sigma = args.predict_sigma
 
     if args.predict_case == "analytic":
         out = (Path(args.plot_dir) if args.plot_dir
@@ -810,7 +806,7 @@ def run_prediction(args):
     )
 
     print(f"prediction (MMS): N={N}  samples={args.predict_samples}  "
-          f"k={args.predict_k:g} (fixed)")
+          f"sigma={args.predict_sigma:g} (fixed)")
 
     batch = make_mms_dataset(N, args.predict_samples, device, data_args,
                              seed=args.test_seed)
@@ -826,7 +822,7 @@ def run_prediction(args):
     print(f"meanGradLinf={vm['meanGradLinf']:.4e}  maxGradLinf={vm['maxGradLinf']:.4e}")
     print(f"reference residual RMSE (float64) = {batch['ref_res64']:.4e}")
     print(f"linear baseline (a≡1) relL2 = {vm['linearBaselineRelL2']:.4e}  "
-          f"(CNN must beat this to have learned a(u,k))  "
+          f"(CNN must beat this to have learned a(x,y))  "
           f"const baseline relL2 = {vm['constBaselineRelL2']:.4e}")
     print(f"timing: cnn={cnn_ms_batch:.2f} ms/batch  "
           f"cnn_ms_per_sample={cnn_ms_sample:.3f}  "
@@ -837,7 +833,7 @@ def run_prediction(args):
         p.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             "f": batch["f"].cpu(), "g": batch["g"].cpu(),
-            "k": batch["k"].cpu(), "u_ref": batch["u_ref"].cpu(),
+            "a": batch["a"].cpu(), "u_ref": batch["u_ref"].cpu(),
             "u_pred": u_pred.cpu(), "h": float(batch["h"]), "metrics": vm,
         }, p)
         print(f"saved predictions → {p}")
@@ -869,19 +865,19 @@ def run_prediction(args):
             ui = batch["u_ref"][i, 0]
             up = u_pred[i, 0]
 
-            pr = nonlinear_pde_residual(
+            pr = pde_residual(
                 u_pred[i:i+1], batch["f"][i:i+1],
-                batch["k"][i:i+1], h)[0, 0]
-            er = nonlinear_pde_residual(
+                batch["a"][i:i+1], h)[0, 0]
+            er = pde_residual(
                 batch["u_ref"][i:i+1], batch["f"][i:i+1],
-                batch["k"][i:i+1], h)[0, 0]
+                batch["a"][i:i+1], h)[0, 0]
 
             _save_panel(ui, up, up - ui, batch["f"][i, 0], pr, er,
                         out / f"sample_{i:03d}_panel.png",
-                        f"sample {i}  k={row['k']:.2f}  relL2={row['relL2']:.3e}",
+                        f"sample {i}  sigma={row['sigma']:.2f}  relL2={row['relL2']:.3e}",
                         fext, rext)
             _save_centerline(ui, up, out / f"sample_{i:03d}_centerline.png",
-                             f"sample {i}  k={row['k']:.2f}  "
+                             f"sample {i}  sigma={row['sigma']:.2f}  "
                              f"relL2={row['relL2']:.3e}")
 
         print(f"saved → {out}")
@@ -889,14 +885,14 @@ def run_prediction(args):
 # -- CLI --------------------------------------------------------------------
 
 def ckpt_key(args):
-    if getattr(args, "random_k", False):
-        k_str = f"k{args.k_min:g}-{args.k_max:g}"
+    if getattr(args, "random_sigma", False):
+        sig_str = f"sig{args.sigma_min:g}-{args.sigma_max:g}"
     else:
-        k_str = f"k{args.k:g}"
+        sig_str = f"sig{args.sigma:g}"
     n_layers = getattr(args, "n_layers", 6)
     loss_suffix = "_sup" if getattr(args, "loss", "physics") == "supervised" else ""
     return (f"N{args.N}_e{args.epochs}_tr{args.train_samples}"
-            f"_{k_str}_M{getattr(args, 'fourier_m', 6)}"
+            f"_{sig_str}_M{getattr(args, 'fourier_m', 6)}"
             f"_ch{args.base_ch}_L{n_layers}{loss_suffix}_mms")
 
 def parse_args():
@@ -916,12 +912,13 @@ def parse_args():
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=1234)
 
-    # Nonlinear PDE
-    p.add_argument("--k", type=int, default=2)
-    p.add_argument("--random-k", action=argparse.BooleanOptionalAction, default=True,
-                   help="sample k uniformly from [k_min, k_max] (default: True; use --no-random-k to fix)")
-    p.add_argument("--k-min", type=int, default=0)
-    p.add_argument("--k-max", type=int, default=3)
+    # Linear variable coefficient a(x,y) = exp(sigma * psi)
+    p.add_argument("--sigma", type=float, default=0.5)
+    p.add_argument("--random-sigma", action=argparse.BooleanOptionalAction, default=False,
+                   help="sample sigma uniformly from [sigma_min, sigma_max] "
+                        "(default: False; use --random-sigma to enable)")
+    p.add_argument("--sigma-min", type=float, default=0.5)
+    p.add_argument("--sigma-max", type=float, default=1.5)
     p.add_argument("--fourier-m", type=int, default=6,
                    help="number of Fourier modes per dimension for random fields")
 
@@ -944,9 +941,9 @@ def parse_args():
     p.add_argument("--plot", action="store_true")
     p.add_argument("--predict-case", default="data",
                    choices=["data", "analytic"],
-                   help="'data': same MMS family | 'analytic': 4 shifted-positive analytic test cases")
-    p.add_argument("--predict-k", type=int, default=2,
-                   help="fixed integer k for prediction")
+                   help="'data': same MMS family | 'analytic': 4 signed analytic test cases")
+    p.add_argument("--predict-sigma", type=float, default=0.5,
+                   help="fixed sigma (test coefficient-field contrast) for prediction")
     p.add_argument("--plot-dir", default="",
                    help="directory for output figures and metrics CSVs")
     return p.parse_args()
@@ -960,7 +957,7 @@ def main():
         print("=" * 60)
         print("MMS SANITY CHECK")
         print("=" * 60)
-        print(f"Equation: -div(u^k grad u) = f  |  k = {args.k}")
+        print(f"Equation: -div(a(x,y) grad u) = f  |  sigma = {args.sigma}")
         print(f"Grid: N={args.N}  |  samples: {args.train_samples}")
 
         _set_seed(args.seed)

@@ -1,21 +1,20 @@
 """
-CNN solver for -div(u^k grad u) = f on [-1,1]^2, Dirichlet BC u=g.
-a(u,k) = u^k.
+CNN solver for -div(a(x,y) grad u) = f on [-1,1]^2, Dirichlet BC u=g.
+a(x,y) = exp(sigma*psi) is a given smooth positive coefficient field
+(sigma controls contrast). Linear elliptic problem: forward solves reduce
+to a single sparse linear solve; u may take either sign.
 
-Data generation: random f,g,k -> damped Newton FD solver -> u_ref.
-k integer in {0,1,2,3}, u strictly positive (u >= U_EPS). Supports
---loss {supervised, physics}.
+Data generation: random f,g,a(sigma) -> direct sparse linear solve -> u_ref.
+Supports --loss {supervised, physics}.
 """
 
 import argparse, csv, json, math, os, random, tempfile, time
 from pathlib import Path
 
 import numpy as np
-import torch, torch.nn as nn, torch.nn.functional as F
+import torch, torch.nn as nn
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
-
-U_EPS = 1e-15  # strict positivity floor (see Baseline_mms.py)
 
 # per-sample metric columns written to metrics.csv / summary.json
 METRIC_KEYS = ["relL2", "RMSE", "MAE", "maxError", "predResRMSE", "refResRMSE",
@@ -36,51 +35,24 @@ def make_grid(N, device="cpu", dtype=torch.float32):
     bnd[:, :, 1:-1, 1:-1] = 0.
     return x, y, bnd, 1. - bnd, h
 
-def enforce_dirichlet(u_raw, g, bnd, u_floor=1e-4):
-    """u = g on boundary, u_raw on interior. Interior values are forced
-    positive via softplus so a(u,k) = u^k stays well-defined."""
-    u_int = u_floor + F.softplus(u_raw)
-    return bnd * g + (1. - bnd) * u_int
+def enforce_dirichlet(u_raw, g, bnd):
+    """u = g on boundary, u_raw on interior (u may take either sign)."""
+    return bnd * g + (1. - bnd) * u_raw
 
-# -- nonlinear flux-form operator -------------------------------------------
+# -- variable-coefficient flux-form operator ---------------------------------
 
-def _coeff_np(u, k):
-    """a(u,k) = u^k (u > 0) for numpy arrays (integer k only)."""
-    ki = int(k)
-    if ki == 0:
-        return np.ones_like(u)
-    return u ** ki
-
-
-def _coeff_prime_np(u, k):
-    """da/du = k * u^(k-1) for numpy arrays, u > 0. k=0 → 0."""
-    ki = int(k)
-    if ki == 0:
-        return np.zeros_like(u)
-    return ki * (u ** (ki - 1))
-
-
-def nonlinear_flux_divergence(u, k, h):
-    """5-point flux-form FD: -div(a(u,k) grad u) with arithmetic-mean
-    interface coefficients a = u^k."""
-    if isinstance(k, (int, float)):
-        k = torch.tensor([k], device=u.device)
-    if k.ndim == 1:
-        k = k.view(-1, 1, 1, 1)
-
-    a = u.pow(k.float())    # a(u,k) = u^k (u > 0)
-
-    # cell-centered coefficient and u
+def flux_divergence(u, a, h):
+    """5-point flux-form FD: -div(a(x,y) grad u), arithmetic-mean interface
+    coefficients. u, a same shape (B,1,H,W); a is a given positive field.
+    Returns interior nodes (B,1,H-2,W-2)."""
     uc = u[:, :, 1:-1, 1:-1]
     ac = a[:, :, 1:-1, 1:-1]
 
-    # arithmetic-mean interface coefficients
     ae = 0.5 * (ac + a[:, :, 1:-1, 2:])
     aw = 0.5 * (ac + a[:, :, 1:-1, :-2])
     an = 0.5 * (ac + a[:, :, 2:, 1:-1])
     as_ = 0.5 * (ac + a[:, :, :-2, 1:-1])
 
-    # flux on each face (east, west, north, south)
     fe = ae * (u[:, :, 1:-1, 2:] - uc) / h
     fw = aw * (uc - u[:, :, 1:-1, :-2]) / h
     fn = an * (u[:, :, 2:, 1:-1] - uc) / h
@@ -89,9 +61,9 @@ def nonlinear_flux_divergence(u, k, h):
     return -(fe - fw + fn - fs) / h
 
 
-def nonlinear_pde_residual(u, f, k, h):
-    """PDE residual R = -div_h(a(u,k) grad_h u) - f, interior nodes only."""
-    return nonlinear_flux_divergence(u, k, h) - f[:, :, 1:-1, 1:-1]
+def pde_residual(u, f, a, h):
+    """R = -div_h(a grad_h u) - f, interior nodes only."""
+    return flux_divergence(u, a, h) - f[:, :, 1:-1, 1:-1]
 
 # -- CNN --------------------------------------------------------------------
 
@@ -140,6 +112,15 @@ def random_fourier_field(N, M, rng=np.random, normalize=True):
         field /= denom
     return field
 
+def random_positive_field(N, sigma, M, rng=np.random):
+    """Smooth log-normal positive coefficient field a(x,y)=exp(sigma*psi),
+    psi a 2D Fourier field normalized to [-1,1]. sigma controls contrast:
+    a in [exp(-sigma), exp(sigma)], dynamic range exp(2*sigma). sigma=0 ->
+    a≡1 (degenerates to constant-coefficient Poisson). Returns full grid
+    (N+2, N+2) float64."""
+    psi = random_fourier_field(N, M, rng, normalize=True)
+    return np.exp(sigma * psi)
+
 # -- random f and boundary generators ----------------------------------------
 
 def _random_f(N, f_scale, M, rng=np.random):
@@ -148,9 +129,9 @@ def _random_f(N, f_scale, M, rng=np.random):
     f[0, :] = f[-1, :] = f[:, 0] = f[:, -1] = 0.
     return f
 
-def _random_g(N, g_base=0.65, g_scale=0.6, M=6, rng=np.random):
-    """Random positive Dirichlet boundary via Fourier series (g_base shifts
-    it above 0). Interior = 0."""
+def _random_g(N, g_base=0.0, g_scale=0.6, M=6, rng=np.random):
+    """Random Dirichlet boundary via Fourier series (g_base shifts it).
+    Interior = 0."""
     raw = random_fourier_field(N, M, rng)
     g = np.zeros((N + 2, N + 2), dtype=np.float64)
     g[0, :] = g_base + g_scale * raw[0, :]
@@ -216,12 +197,12 @@ def _linear_baseline_rl2(f, g, u_ref, interior, h):
     return float(np.linalg.norm(err) / max(np.linalg.norm(ref), 1e-12))
 
 def trivial_linear_baseline(data):
-    """Mean relL2 of the a≡1 linear Poisson solution vs the nonlinear u_ref.
+    """Mean relL2 of the a≡1 linear Poisson solution vs u_ref.
 
-    Solves -div(grad u) = f (ignoring the nonlinear diffusivity entirely)
+    Solves -div(grad u) = f (ignoring the variable coefficient entirely)
     per sample.  This is the must-report trivial baseline: if the CNN cannot
     beat it, then a good relL2 only reflects that the problem is nearly
-    linear, not that the model learned a(u,k)."""
+    constant-coefficient, not that the model learned a(x,y)."""
     h = float(data["h"])
     f = data["f"].detach().cpu().numpy()
     g = data["g"].detach().cpu().numpy()
@@ -231,228 +212,58 @@ def trivial_linear_baseline(data):
            for i in range(f.shape[0])]
     return float(np.mean(rl2))
 
-# -- nonlinear finite-difference solver ---------------------------------------
-
-def _np_flux_residual(u, f, k, h):
-    """R(u) = -div_h(a(u,k) grad_h u) - f on interior nodes (numpy)."""
-    a = _coeff_np(u, k)
-    uc = u[1:-1, 1:-1]
-    ac = a[1:-1, 1:-1]
-    ae = 0.5 * (ac + a[1:-1, 2:])
-    aw = 0.5 * (ac + a[1:-1, :-2])
-    an = 0.5 * (ac + a[2:, 1:-1])
-    as_ = 0.5 * (ac + a[:-2, 1:-1])
-    fe = ae * (u[1:-1, 2:] - uc) / h
-    fw = aw * (uc - u[1:-1, :-2]) / h
-    fn = an * (u[2:, 1:-1] - uc) / h
-    fs = as_ * (uc - u[:-2, 1:-1]) / h
-    return -(fe - fw + fn - fs) / h - f[1:-1, 1:-1]
-
-def _residual64(u, f, k, h):
-    """float64 PDE residual of numpy (u, f) — reference-quality check."""
-    u_t = torch.from_numpy(u).double()[None, None]
-    f_t = torch.from_numpy(f).double()[None, None]
-    k_t = torch.tensor([k], dtype=torch.float64)
-    return nonlinear_pde_residual(u_t, f_t, k_t, h)
-
-def _assemble_newton_jacobian(u, k, h):
-    """Jacobian of -div(u^k grad u) w.r.t. u for damped Newton."""
-    N = u.shape[0] - 2
-    n = N * N
-    h2 = 1.0 / (h * h)
-
-    a = _coeff_np(u, k)
-    ap = _coeff_prime_np(u, k)
-
-    # interface coefficients (arithmetic mean)
-    ac = a[1:N+1, 1:N+1]
-    ae = 0.5 * (ac + a[1:N+1, 2:N+2])
-    aw = 0.5 * (ac + a[1:N+1, 0:N])
-    an_ = 0.5 * (ac + a[2:N+2, 1:N+1])
-    as_ = 0.5 * (ac + a[0:N, 1:N+1])
-
-    # u and a'(u) at cell centers and neighbours
-    uc = u[1:N+1, 1:N+1]
-    apc = ap[1:N+1, 1:N+1]
-    ue = u[1:N+1, 2:N+2]; ape = ap[1:N+1, 2:N+2]
-    uw = u[1:N+1, 0:N];   apw = ap[1:N+1, 0:N]
-    un = u[2:N+2, 1:N+1]; apn = ap[2:N+2, 1:N+1]
-    us = u[0:N, 1:N+1];   aps = ap[0:N, 1:N+1]
-
-    # diagonal: sum of interface coeffs + derivative term
-    diag = (ae + aw + an_ + as_) * h2 \
-           - 0.5 * apc * (ue + uw + un + us - 4. * uc) * h2
-    diag = np.where(np.abs(diag) < 1e-14, np.sign(diag + 1e-30) * 1e-14, diag)
-
-    # off-diagonal entries (east, west, north, south)
-    val_e = -(ae + 0.5 * ape * (ue - uc)) * h2
-    val_w = -(aw + 0.5 * apw * (uw - uc)) * h2
-    val_n = -(an_ + 0.5 * apn * (un - uc)) * h2
-    val_s = -(as_ + 0.5 * aps * (us - uc)) * h2
-
-    # assemble COO sparse matrix (same layout as _assemble_linear_system)
-    idx = np.arange(n)
-    mask_e = (idx % N) != (N - 1)
-    mask_w = (idx % N) != 0
-    mask_n = idx < (n - N)
-    mask_s = idx >= N
-
-    rows = np.concatenate([idx,
-        idx[mask_e], idx[mask_w], idx[mask_n], idx[mask_s]])
-    cols = np.concatenate([idx,
-        idx[mask_e] + 1, idx[mask_w] - 1, idx[mask_n] + N, idx[mask_s] - N])
-    data = np.concatenate([diag.ravel(),
-        val_e.ravel()[mask_e], val_w.ravel()[mask_w],
-        val_n.ravel()[mask_n], val_s.ravel()[mask_s]])
-    return sp.coo_matrix((data, (rows, cols)), shape=(n, n)).tocsr()
-
-def _damped_newton_stage(u, f, g, k, h, f_scale, max_iter, tol):
-    """Single-k damped Newton: minimize ||R(u)|| on the interior.
-    Returns (u, converged, num_iter)."""
-    N = f.shape[0] - 2
-
-    def pack(v):
-        return v[1:-1, 1:-1].ravel()
-
-    def unpack(vf):
-        v = g.copy()
-        v[1:-1, 1:-1] = vf.reshape(N, N)
-        return v
-
-    for it in range(max_iter):
-        res = _np_flux_residual(u, f, k, h)
-        res_rms = float(np.sqrt(np.mean(res.ravel() ** 2)))
-        if res_rms < tol * f_scale:
-            return u, True, it + 1
-        J = _assemble_newton_jacobian(u, k, h)
-        try:
-            delta = spla.spsolve(J, -res.ravel())
-        except Exception:
-            break
-        uf = pack(u)
-        accepted = False
-        for lp in range(16):
-            lam = 0.5 ** lp
-            unew = unpack(uf + lam * delta)
-            new_res = _np_flux_residual(unew, f, k, h)
-            if float(np.sqrt(np.mean(new_res.ravel() ** 2))) < res_rms:
-                u = unew
-                accepted = True
-                break
-        if not accepted:
-            break
-    return u, False, max_iter
-
-
-def solve_nonlinear_fd(f, g, k, h, max_iter=50, tol=1e-10):
-    """Damped Newton with k-continuation: k=0 (linear) → k=1 → ... → target k.
-
-    Always starts from the a≡1 linear solve.  Each stage uses the converged
-    solution of the previous stage as the initial guess, avoiding the
-    near-singular region around |u|≈0 that appears for k≥3 when starting
-    from the a≡1 linear guess."""
-    t_start = time.perf_counter()
-    k = int(k)
-    f_int = f[1:-1, 1:-1]
-    f_scale = max(float(np.sqrt((f_int ** 2).mean())), 1.0)
-
-    # stage 0: linear (a≡1) initial guess
-    u = solve_linear_fd(f, g, np.ones_like(g), h)
-
-    # continuation: kk = 1, 2, ..., k  (empty for k=0: linear solve is final)
-    total_iter = 0
-    stage_iters = []
-    converged = True
-    for kk in range(1, k + 1):
-        u, stage_conv, stage_it = _damped_newton_stage(
-            u, f, g, kk, h, f_scale, max_iter, tol,
-        )
-        total_iter += stage_it
-        stage_iters.append(stage_it)
-        if not stage_conv:
-            converged = False
-            break
-
-    final_res64 = float(_residual64(u, f, k, h).pow(2).mean().sqrt())
-    return u, {"num_iter": total_iter, "converged": converged,
-               "u_min": float(u.min()), "u_max": float(u.max()),
-               "residual_rmse": final_res64, "stage_iters": stage_iters,
-               "solve_time_ms": (time.perf_counter() - t_start) * 1e3}
-
 # -- forward solver dataset --------------------------------------------------
 
 def make_solver_dataset(N, n_samples, device, args, seed):
-    """Random f,g,k -> nonlinear FD solve -> u_ref.
-    a(u,k) = u^k requires u > 0; solves with u_min <= 0 are rejected and
-    resampled (g_base shifts the boundary above 0 to keep rejection low)."""
+    """Random f,g,a(sigma) -> single sparse linear FD solve -> u_ref."""
     rng = np.random.RandomState(seed)
     x_t, y_t, bnd, interior, h_grid = make_grid(N, device)
     M = getattr(args, "fourier_m", 6)
 
-    f_list, g_list, k_list, u_list, info_list = [], [], [], [], []
+    f_list, g_list, a_list, sigma_list, u_list, info_list = [], [], [], [], [], []
     res64_sq = 0.
-    max_attempts = args.max_attempt_factor * n_samples
-    attempts = 0
 
     print(f"generating {n_samples} solver samples (N={N})  "
-          f"f_scale={args.f_scale}  g_base={args.g_base}  g_scale={args.g_scale}  "
-          f"FD (damped Newton): max_iter={args.newton_max_iter}  tol={args.fd_tol:.1e}")
+          f"f_scale={args.f_scale}  g_base={args.g_base}  g_scale={args.g_scale}")
 
-    while len(u_list) < n_samples:
-        if attempts >= max_attempts:
-            raise RuntimeError(
-                f"too many failed solver attempts ({attempts}) — "
-                "try smaller --f-scale or looser --fd-tol.")
-        attempts += 1
-
-        if getattr(args, "random_k", False):
-            k_i = int(rng.randint(args.k_min, args.k_max + 1))
-        else:
-            k_i = int(args.k)
-
+    for _ in range(n_samples):
+        sigma_i = (rng.uniform(args.sigma_min, args.sigma_max)
+                   if getattr(args, "random_sigma", False) else args.sigma)
+        a_np = random_positive_field(N, sigma_i, M, rng)
         f_np = _random_f(N, args.f_scale, M, rng)
         g_np = _random_g(N, args.g_base, args.g_scale, M, rng)
 
-        u_np, info = solve_nonlinear_fd(f_np, g_np, k_i, h_grid, max_iter=args.newton_max_iter, tol=args.fd_tol)
+        t0 = time.perf_counter()
+        u_np = solve_linear_fd(f_np, g_np, a_np, h_grid)
+        solve_ms = (time.perf_counter() - t0) * 1e3
 
-        # Acceptance: converged, reasonable residual, u strictly positive
-        f_rms = float(np.sqrt(np.mean(f_np[1:-1, 1:-1] ** 2)))
-        if (info["converged"]
-                and np.isfinite(info["residual_rmse"])
-                and info["residual_rmse"] < 1e-3 * max(1.0, f_rms)
-                and info["u_min"] > 0):
+        u64 = torch.from_numpy(u_np).double()[None, None]
+        f64 = torch.from_numpy(f_np).double()[None, None]
+        a64 = torch.from_numpy(a_np).double()[None, None]
+        res64_sq += float(pde_residual(u64, f64, a64, h_grid).pow(2).sum())
 
-            # Reference residual in float64
-            res64_sq += float(_residual64(u_np, f_np, k_i, h_grid).pow(2).sum())
+        f_list.append(f64.float().to(device))
+        g_list.append(torch.from_numpy(g_np).float().unsqueeze(0).unsqueeze(0).to(device))
+        a_list.append(a64.float().to(device))
+        sigma_list.append(torch.tensor([sigma_i], dtype=torch.float32, device=device))
+        u_list.append(u64.float().to(device))
+        info_list.append({"solve_time_ms": solve_ms})
 
-            f_list.append(torch.from_numpy(f_np).float().unsqueeze(0).unsqueeze(0).to(device))
-            g_list.append(torch.from_numpy(g_np).float().unsqueeze(0).unsqueeze(0).to(device))
-            k_list.append(torch.tensor([k_i], dtype=torch.float32, device=device))
-            u_list.append(torch.from_numpy(u_np).float().unsqueeze(0).unsqueeze(0).to(device))
-            info_list.append(info)
-
-    iters = [x["num_iter"] for x in info_list]
-    res_list = [x["residual_rmse"] for x in info_list]
+    a_cat = torch.cat(a_list)
+    sigma_cat = torch.cat(sigma_list)
     ref_res64 = math.sqrt(res64_sq / (n_samples * N * N))
-    print(f"  acceptance: {len(u_list)}/{attempts} "
-          f"({100*len(u_list)/max(1,attempts):.1f}%)")
-    print(f"  FD iterations: mean={np.mean(iters):.1f}  max={np.max(iters)}")
-    print(f"  solver residual: mean={np.mean(res_list):.4e}  max={np.max(res_list):.4e}")
+    a_min, a_max = float(a_cat.min()), float(a_cat.max())
+    print(f"  sigma range: [{float(sigma_cat.min()):.4f}, {float(sigma_cat.max()):.4f}]")
+    print(f"  a range: [{a_min:.4f}, {a_max:.4f}]  "
+          f"contrast a_max/a_min={a_max/a_min:.4f}")
     print(f"  ref residual (float64) = {ref_res64:.2e}")
-    u_mins = [x['u_min'] for x in info_list]
-    u_maxs = [x['u_max'] for x in info_list]
-    sign_change = sum(1 for mn, mx in zip(u_mins, u_maxs) if mn <= 0 <= mx)
-    print(f"  u range: [{min(u_mins):.4f}, {max(u_maxs):.4f}]")
-    print(f"  sign-changing samples: {sign_change}/{len(u_list)} "
-          f"({100*sign_change/max(1,len(u_list)):.0f}%)")
 
     return {
         "f": torch.cat(f_list), "g": torch.cat(g_list),
-        "k": torch.cat(k_list), "u_ref": torch.cat(u_list),
+        "a": a_cat, "sigma": sigma_cat, "u_ref": torch.cat(u_list),
         "mask": bnd, "interior_mask": interior,
         "x": x_t, "y": y_t, "h": h_grid,
-        "ref_res64": ref_res64, "n_rejected": attempts - len(u_list),
-        "solver_info": info_list,
+        "ref_res64": ref_res64, "solver_info": info_list,
     }
 
 def ref_residual_rmse64(data):
@@ -461,36 +272,37 @@ def ref_residual_rmse64(data):
     Training itself stays float32."""
     u = data["u_ref"].detach().cpu().double()
     f = data["f"].detach().cpu().double()
-    k = data["k"].detach().cpu().double()
-    return float(nonlinear_pde_residual(u, f, k, data["h"])
+    a = data["a"].detach().cpu().double()
+    return float(pde_residual(u, f, a, data["h"])
                  .pow(2).mean().sqrt())
 
 # -- input / stats / batching ------------------------------------------------
 
-def build_input(f_norm, g, bnd, k_norm, x, y):
-    """Assemble 6-channel CNN input: [f_norm, g, bnd, k_ch, x, y]."""
+def build_input(f_norm, g, bnd, a_norm, x, y):
+    """Assemble 6-channel CNN input: [f_norm, g, bnd, log_a_norm, x, y].
+    a_norm is a full-grid field (B,1,H,W)."""
     B = f_norm.shape[0]
     def _expand(t):
         return t.expand(B, -1, -1, -1) if t.shape[0] == 1 else t
-    k_ch = k_norm.view(B, 1, 1, 1).expand(-1, 1, *bnd.shape[-2:])
-    return torch.cat([f_norm, g, _expand(bnd), k_ch, _expand(x), _expand(y)], dim=1)
+    return torch.cat([f_norm, g, _expand(bnd), _expand(a_norm),
+                      _expand(x), _expand(y)], dim=1)
 
 def compute_stats(data):
     fi = data["f"][:, :, 1:-1, 1:-1]
-    k = data["k"]
+    loga = data["a"].clamp_min(1e-12).log()
     return (fi.mean().item(), fi.std(unbiased=False).clamp_min(1e-8).item(),
-            k.mean().item(), k.std(unbiased=False).clamp_min(1e-8).item())
+            loga.mean().item(), loga.std(unbiased=False).clamp_min(1e-8).item())
 
 def _take_batch(data, idx):
     return {"h": data["h"],
-            **{k: data[k][idx] for k in ("f", "g", "k", "u_ref")},
+            **{k: data[k][idx] for k in ("f", "g", "a", "sigma", "u_ref")},
             **{k: data[k][:1] for k in ("mask", "interior_mask", "x", "y")}}
 
 def _forward(model, batch, stats):
-    f_mean, f_std, k_mean, k_std = stats
+    f_mean, f_std, loga_mean, loga_std = stats
     fn = (batch["f"] - f_mean) / f_std
-    kn = (batch["k"] - k_mean) / k_std
-    inp = build_input(fn, batch["g"], batch["mask"], kn, batch["x"], batch["y"])
+    loga_n = (batch["a"].clamp_min(1e-12).log() - loga_mean) / loga_std
+    inp = build_input(fn, batch["g"], batch["mask"], loga_n, batch["x"], batch["y"])
     return enforce_dirichlet(model(inp), batch["g"], batch["mask"])
 
 def _set_seed(seed):
@@ -535,9 +347,9 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
     _set_seed(args.seed)
     device = _select_device(args.device)
 
-    print(f"Equation: -div(u^k grad u) = f  |  k = {args.k}  |  data=solver")
-    if args.random_k:
-        print(f"  random k in [{args.k_min}, {args.k_max}]")
+    print(f"Equation: -div(a(x,y) grad u) = f  |  sigma = {args.sigma}  |  data=solver")
+    if args.random_sigma:
+        print(f"  random sigma in [{args.sigma_min}, {args.sigma_max}]")
 
     train_data = make_solver_dataset(args.N, args.train_samples, device,
                                       args, seed=args.seed)
@@ -545,7 +357,7 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
                                     args, seed=args.seed + 1)
     stats = compute_stats(train_data)
     print(f"f stats: mean={stats[0]:.4e}  std={stats[1]:.4e}  "
-          f"k stats: mean={stats[2]:.4e}  std={stats[3]:.4e}")
+          f"log(a) stats: mean={stats[2]:.4e}  std={stats[3]:.4e}")
 
     # Reference residual, reported in float64 (float32 rounding floor
     # ~h^-2*eps32 must not be mistaken for solver accuracy)
@@ -556,13 +368,13 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
         bnd_err = float(
             ((val_data["u_ref"] - val_data["g"]).abs()
              * val_data["mask"].expand_as(val_data["u_ref"])).max())
-    print(f"ref residual RMSE (float64) = {ref_res:.4e}  (nonlinear FD solver residual)")
+    print(f"ref residual RMSE (float64) = {ref_res:.4e}  (linear FD solver residual)")
     print(f"u_ref range: [{u_min:.4f}, {u_max:.4f}]  "
           f"boundary error = {bnd_err:.2e}")
 
     triv_rl2 = trivial_linear_baseline(val_data)
     print(f"trivial baseline (a≡1 linear Poisson) relL2 = {triv_rl2:.4e}  "
-          f"(CNN must beat this to have learned a(u,k))")
+          f"(CNN must beat this to have learned a(x,y))")
 
     if model is None:
         model = SimpleCNN(hidden_ch=args.base_ch, n_layers=args.n_layers).to(device)
@@ -616,8 +428,8 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
                 loss = err.pow(2).mean()
             else:
                 # physics: per-sample normalized PDE residual
-                res = nonlinear_pde_residual(
-                    u_pred, batch["f"], batch["k"], batch["h"])
+                res = pde_residual(
+                    u_pred, batch["f"], batch["a"], batch["h"])
                 f_int = batch["f"][:, :, 1:-1, 1:-1]
                 scale = f_int.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt().clamp_min(1.0)
                 loss = ((res / scale) ** 2).mean()
@@ -713,8 +525,8 @@ def per_sample_metrics(u_pred, batch, start_id=0):
     n_samples = u_pred.shape[0]
 
     err = (u_pred - ue) * interior
-    res = nonlinear_pde_residual(u_pred, batch["f"], batch["k"], batch["h"])
-    res_ref = nonlinear_pde_residual(ue, batch["f"], batch["k"], batch["h"])
+    res = pde_residual(u_pred, batch["f"], batch["a"], batch["h"])
+    res_ref = pde_residual(ue, batch["f"], batch["a"], batch["h"])
 
     err_flat = err[:, :, 1:-1, 1:-1].flatten(1)
     u_flat = ue[:, :, 1:-1, 1:-1].flatten(1)
@@ -732,14 +544,14 @@ def per_sample_metrics(u_pred, batch, start_id=0):
     for i in range(n_samples):
         rl2 = (err_flat[i].norm() / u_flat[i].norm().clamp_min(1e-12)).item()
         # constant baseline: direct projection — enforce_dirichlet would
-        # distort the constant via softplus
+        # distort the constant otherwise
         m01 = batch["mask"][:1]
         const_pred = m01 * batch["g"][i:i+1] + (1. - m01) * u_flat[i].mean()
         const_err = ((const_pred - ue[i:i+1]) * interior[i:i+1])[:, :, 1:-1, 1:-1].flatten(1)
         const_rl2 = (const_err[0].norm() / u_flat[i].norm().clamp_min(1e-12)).item()
 
         rows.append({
-            "sample_id": start_id + i, "k": batch["k"][i].item(),
+            "sample_id": start_id + i, "sigma": batch["sigma"][i].item(),
             "relL2": rl2,
             "RMSE": err_flat[i].pow(2).mean().sqrt().item(),
             "MAE": err_flat[i].abs().mean().item(),
@@ -864,14 +676,13 @@ def _save_convergence_plot(history, path, loss_type="physics"):
 # -- fixed-solver test suite --------------------------------------------------
 #
 # predict-case semantics:
-#   data:         random f,g,k -> nonlinear FD solver -> u_ref (training family)
+#   data:         random f,g,sigma -> linear FD solve -> u_ref (training family)
 #   fixed-solver: manufactured u_target only builds f and g; u_ref is
-#                 recomputed by the nonlinear FD solver, so the test stays
+#                 recomputed by the linear FD solver, so the test stays
 #                 strictly in the solver pipeline and is comparable with the
 #                 MMS analytic cases (which live in Baseline_mms.py).
 
-# Same raw formulas as the MMS ANALYTIC_CASES u1-u4, shifted to strictly
-# positive u below via FIXED_SOLVER_RANGE so a(u,k) = u^k stays well-defined.
+# Same raw formulas as the MMS ANALYTIC_CASES u1-u4 (signed, no shift).
 FIXED_SOLVER_CASES = {
     "u1_sincos": lambda x, y: np.sin(np.pi * x) * np.cos(np.pi * y),
     "u2_poly":   lambda x, y: (1. - x ** 2) * (1. - y ** 2),
@@ -879,71 +690,55 @@ FIXED_SOLVER_CASES = {
     "u4_mixed":  lambda x, y: x ** 2 * (1. - y) + np.sin(np.pi * x) * y,
 }
 
-# Exact (min, max) of the raw formulas above over [-1,1]^2 (analytically
-# verified, same functions as Baseline_mms.py's ANALYTIC_RANGE). Shift+rescale
-# to [U_EPS, 1+U_EPS]: shifting alone leaves some cases spanning up to 2,
-# which blows up a=u^k's dynamic range and stalls the damped-Newton solver.
-FIXED_SOLVER_RANGE = {"u1_sincos": (-1.0, 1.0), "u2_poly": (0.0, 1.0),
-                       "u3_cos": (-1.0, 1.0), "u4_mixed": (-1.0, 2.0)}
-
-def make_fixed_solver_dataset(N, device, args, k_val):
-    """Deterministic solver test: u_target -> f = -div_h(u^k grad u), then
-    solve_nonlinear_fd(f,g,k) -> u_ref.  u_target is shifted to be strictly
-    positive so a(u,k) = u^k stays well-defined for any integer k >= 0."""
-    k_val = int(k_val)
+def make_fixed_solver_dataset(N, device, args, sigma_val, test_rng):
+    """Deterministic solver test: u_target (signed) -> f = -div_h(a grad u),
+    then u_ref = solve_linear_fd(f, g, a, h) (single linear solve) against
+    a fresh test coefficient field per case."""
     x_t, y_t, bnd, interior, h = make_grid(N, device)
     x64, y64, *_ = make_grid(N, "cpu", torch.float64)
     x_np = x64[0, 0].numpy()
     y_np = y64[0, 0].numpy()
-    newton_max_iter = getattr(args, "newton_max_iter", 50)
-    fd_tol = getattr(args, "fd_tol", 1e-10)
+    M = getattr(args, "fourier_m", 6)
 
-    f_list, g_list, k_list, u_list, t_list = [], [], [], [], []
+    f_list, g_list, a_list, sigma_list, u_list, t_list = [], [], [], [], [], []
     info_list, names = [], []
     res64_sq = 0.
 
     for case_name, u_func in FIXED_SOLVER_CASES.items():
         u_target = u_func(x_np, y_np).astype(np.float64)
-        lo, hi = FIXED_SOLVER_RANGE[case_name]
-        u_target = (u_target - lo) / (hi - lo) + U_EPS
+        a_np = random_positive_field(N, sigma_val, M, test_rng)
 
         g_np = u_target.copy()
         g_np[1:-1, 1:-1] = 0.
 
         t64 = torch.from_numpy(u_target)[None, None]      # CPU float64
-        k64 = torch.tensor([k_val], dtype=torch.float64)
+        a64 = torch.from_numpy(a_np)[None, None]
         f64 = torch.zeros_like(t64)
-        f64[:, :, 1:-1, 1:-1] = nonlinear_flux_divergence(
-            t64, k64, h)
+        f64[:, :, 1:-1, 1:-1] = flux_divergence(t64, a64, h)
         f_np = f64[0, 0].numpy()
 
-        u_ref, info = solve_nonlinear_fd(f_np, g_np, k_val, h, max_iter=newton_max_iter, tol=fd_tol)
-
-        # Acceptance: small residual (converged flag uses tol=1e-10,
-        # which is unnecessarily strict for the fixed-solver test) and u > 0
-        f_rms = float(np.sqrt(np.mean(f_np[1:-1, 1:-1] ** 2)))
-        if not (np.isfinite(info["residual_rmse"])
-                and info["residual_rmse"] < 1e-3 * max(1.0, f_rms)
-                and info["u_min"] > 0):
-            raise RuntimeError(
-                f"fixed-solver case {case_name} rejected by solver: {info}")
+        t0 = time.perf_counter()
+        u_ref = solve_linear_fd(f_np, g_np, a_np, h)
+        solve_ms = (time.perf_counter() - t0) * 1e3
 
         u64 = torch.from_numpy(u_ref).double()[None, None]
-        res64_sq += float(nonlinear_pde_residual(
-            u64, f64, k64, h).pow(2).sum())
+        res64 = pde_residual(u64, f64, a64, h).pow(2)
+        case_res64 = float(res64.mean().sqrt())
+        res64_sq += float(res64.sum())
 
         f_list.append(f64.float().to(device))
         g_list.append(torch.from_numpy(g_np).float()[None, None].to(device))
-        k_list.append(torch.tensor([k_val], dtype=torch.float32, device=device))
+        a_list.append(a64.float().to(device))
+        sigma_list.append(torch.tensor([sigma_val], dtype=torch.float32, device=device))
         u_list.append(u64.float().to(device))
         t_list.append(t64.float().to(device))
-        info_list.append(info)
+        info_list.append({"residual_rmse": case_res64, "solve_time_ms": solve_ms})
         names.append(case_name)
 
     return {
         "f": torch.cat(f_list), "g": torch.cat(g_list),
-        "k": torch.cat(k_list), "u_ref": torch.cat(u_list),
-        "u_target": torch.cat(t_list),
+        "a": torch.cat(a_list), "sigma": torch.cat(sigma_list),
+        "u_ref": torch.cat(u_list), "u_target": torch.cat(t_list),
         "case_names": names, "solver_info": info_list,
         "mask": bnd, "interior_mask": interior,
         "x": x_t, "y": y_t, "h": h,
@@ -986,9 +781,10 @@ def run_fixed_solver_suite(model, stats, device, args, data_args, out_dir):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"prediction (fixed-solver): N={N}  k={args.predict_k:g}  "
-          f"{len(FIXED_SOLVER_CASES)} cases, u_ref from nonlinear FD solver")
-    batch = make_fixed_solver_dataset(N, device, data_args, args.predict_k)
+    print(f"prediction (fixed-solver): N={N}  sigma={args.predict_sigma:g}  "
+          f"{len(FIXED_SOLVER_CASES)} cases, u_ref from single linear FD solve")
+    test_rng = np.random.RandomState(args.test_seed)
+    batch = make_fixed_solver_dataset(N, device, data_args, args.predict_sigma, test_rng)
     print(f"  ref residual (float64) = {batch['ref_res64']:.4e}")
 
     u_pred, cnn_ms_batch, cnn_ms_sample = _time_forward(model, batch, stats)
@@ -1013,7 +809,7 @@ def run_fixed_solver_suite(model, stats, device, args, data_args, out_dir):
         r = rows[i]
         out_rows.append({
             "case": case,
-            "k": r["k"],
+            "sigma": r["sigma"],
             "cnn_vs_solver_ref_relL2": r["relL2"],
             "cnn_vs_solver_ref_maxError": r["maxError"],
             "predResRMSE": r["predResRMSE"],
@@ -1024,21 +820,18 @@ def run_fixed_solver_suite(model, stats, device, args, data_args, out_dir):
             "linearBaselineRelL2": r["linearBaselineRelL2"],
             "target_vs_solver_ref_relL2": t_rl2,
             "target_vs_solver_ref_maxError": t_max,
-            "solver_num_iter": info["num_iter"],
             "solver_residual_rmse": info["residual_rmse"],
-            "solver_u_min": info["u_min"],
-            "solver_u_max": info["u_max"],
             "cnn_ms_per_sample": cnn_ms_sample,
             "fd_solver_ms_per_sample": info["solve_time_ms"],
         })
 
-        print(f"\n  --- fixed-solver case: {case}  (k={r['k']:g}) ---")
+        print(f"\n  --- fixed-solver case: {case}  (sigma={r['sigma']:g}) ---")
         print(f"    relL2={r['relL2']:.4e}  maxErr={r['maxError']:.4e}  "
               f"resRMSE={r['predResRMSE']:.4e}  "
               f"linBL={r['linearBaselineRelL2']:.4e}")
         print(f"    target_vs_solver relL2={t_rl2:.2e}  maxErr={t_max:.2e}  "
-              f"solver: iter={info['num_iter']}  res={info['residual_rmse']:.2e}")
-        if t_rl2 > 1e-3:
+              f"solver: res={info['residual_rmse']:.2e}")
+        if t_rl2 > 1e-8:
             print(f"    WARNING: target_vs_solver_ref_relL2={t_rl2:.2e} — "
                   f"solver reference deviates from the MMS target; "
                   f"this case is NOT a fair MMS comparison")
@@ -1046,20 +839,20 @@ def run_fixed_solver_suite(model, stats, device, args, data_args, out_dir):
         ui = batch["u_ref"][i, 0]
         up = u_pred[i, 0]
         if args.plot:
-            pr = nonlinear_pde_residual(u_pred[i:i+1], batch["f"][i:i+1],
-                                        batch["k"][i:i+1], batch["h"])[0, 0]
-            er = nonlinear_pde_residual(batch["u_ref"][i:i+1], batch["f"][i:i+1],
-                                        batch["k"][i:i+1], batch["h"])[0, 0]
+            pr = pde_residual(u_pred[i:i+1], batch["f"][i:i+1],
+                              batch["a"][i:i+1], batch["h"])[0, 0]
+            er = pde_residual(batch["u_ref"][i:i+1], batch["f"][i:i+1],
+                              batch["a"][i:i+1], batch["h"])[0, 0]
             _save_panel(ui, up, up - ui, batch["f"][i, 0], pr, er,
                         out_dir / f"fixed_solver_{case}_panel.png",
-                        f"fixed-solver {case}  k={r['k']:.2f}  "
+                        f"fixed-solver {case}  sigma={r['sigma']:.2f}  "
                         f"relL2={r['relL2']:.3e}", fext, rext)
             _save_centerline(ui, up, out_dir / f"fixed_solver_{case}_centerline.png",
-                             f"fixed-solver {case}  k={r['k']:.2f}  "
+                             f"fixed-solver {case}  sigma={r['sigma']:.2f}  "
                              f"relL2={r['relL2']:.3e}")
             _save_target_comparison(batch["u_target"][i, 0], ui,
                                     out_dir / f"fixed_solver_{case}_target_vs_solver.png",
-                                    f"{case}  k={r['k']:.2f}  "
+                                    f"{case}  sigma={r['sigma']:.2f}  "
                                     f"target_vs_solver relL2={t_rl2:.2e}")
 
     fd_ms_mean = float(np.mean([x["solve_time_ms"] for x in batch["solver_info"]]))
@@ -1089,6 +882,10 @@ def run_prediction(args):
             f"checkpoint type mismatch: expected 'cnn', got '{ckpt_type}'. "
             f"Use the correct prediction script (Baseline_solver.py for "
             f"'cnn', Baseline_mms.py for 'cnn_mms').")
+    if "sigma" not in ckpt["args"]:
+        raise ValueError(
+            "checkpoint predates the a(x,y)/sigma refactor (has 'k', not "
+            "'sigma') — retrain with the current script.")
     ckpt_args = argparse.Namespace(**ckpt["args"])
     model = SimpleCNN(
         hidden_ch=ckpt_args.base_ch,
@@ -1116,10 +913,10 @@ def run_prediction(args):
         "test seed collides with a train/val seed! prediction data would "
         "overlap the training run (evaluation pollution)."
     )
-    data_args.random_k = False
-    data_args.k = args.predict_k
+    data_args.random_sigma = False
+    data_args.sigma = args.predict_sigma
     print(f"prediction (solver): N={N}  samples={args.predict_samples}  "
-          f"k={args.predict_k:g} (fixed)")
+          f"sigma={args.predict_sigma:g} (fixed)")
     batch = make_solver_dataset(N, args.predict_samples, device,
                                 data_args, seed=args.test_seed)
 
@@ -1134,10 +931,9 @@ def run_prediction(args):
     print(f"meanMaxError={vm['meanMaxError']:.4e}")
     print(f"meanBoundaryError={vm['meanBoundaryError']:.2e}  maxBoundaryError={vm['maxBoundaryError']:.2e}")
     print(f"meanGradLinf={vm['meanGradLinf']:.4e}  maxGradLinf={vm['maxGradLinf']:.4e}")
-    if "ref_res64" in batch:
-        print(f"reference residual RMSE (float64) = {batch['ref_res64']:.4e}")
+    print(f"reference residual RMSE (float64) = {batch['ref_res64']:.4e}")
     print(f"linear baseline (a≡1) relL2 = {vm['linearBaselineRelL2']:.4e}  "
-          f"(CNN must beat this to have learned a(u,k))")
+          f"(CNN must beat this to have learned a(x,y))")
     print(f"timing: cnn={cnn_ms_batch:.2f} ms/batch  "
           f"cnn_ms_per_sample={cnn_ms_sample:.3f}  "
           f"fd_solver_ms_per_sample={fd_ms_sample:.3f}")
@@ -1147,7 +943,7 @@ def run_prediction(args):
         p.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             "f": batch["f"].cpu(), "g": batch["g"].cpu(),
-            "k": batch["k"].cpu(), "u_ref": batch["u_ref"].cpu(),
+            "a": batch["a"].cpu(), "u_ref": batch["u_ref"].cpu(),
             "u_pred": u_pred.cpu(), "h": float(batch["h"]), "metrics": vm,
         }, p)
         print(f"saved predictions → {p}")
@@ -1180,19 +976,19 @@ def run_prediction(args):
             ui = batch["u_ref"][i, 0]
             up = u_pred[i, 0]
 
-            pr = nonlinear_pde_residual(
+            pr = pde_residual(
                 u_pred[i:i+1], batch["f"][i:i+1],
-                batch["k"][i:i+1], h)[0, 0]
-            er = nonlinear_pde_residual(
+                batch["a"][i:i+1], h)[0, 0]
+            er = pde_residual(
                 batch["u_ref"][i:i+1], batch["f"][i:i+1],
-                batch["k"][i:i+1], h)[0, 0]
+                batch["a"][i:i+1], h)[0, 0]
 
             _save_panel(ui, up, up - ui, batch["f"][i, 0], pr, er,
                         out / f"sample_{i:03d}_panel.png",
-                        f"sample {i}  k={row['k']:.2f}  relL2={row['relL2']:.3e}",
+                        f"sample {i}  sigma={row['sigma']:.2f}  relL2={row['relL2']:.3e}",
                         fext, rext)
             _save_centerline(ui, up, out / f"sample_{i:03d}_centerline.png",
-                             f"sample {i}  k={row['k']:.2f}  "
+                             f"sample {i}  sigma={row['sigma']:.2f}  "
                              f"relL2={row['relL2']:.3e}")
     print(f"saved → {out}")
 
@@ -1200,14 +996,14 @@ def run_prediction(args):
 
 def ckpt_key(args):
     """Experiment key encoding all data/model parameters that affect results."""
-    if getattr(args, "random_k", False):
-        k_str = f"k{args.k_min:g}-{args.k_max:g}"
+    if getattr(args, "random_sigma", False):
+        sig_str = f"sig{args.sigma_min:g}-{args.sigma_max:g}"
     else:
-        k_str = f"k{args.k:g}"
+        sig_str = f"sig{args.sigma:g}"
     n_layers = getattr(args, "n_layers", 6)
     loss_suffix = "_sup" if getattr(args, "loss", "physics") == "supervised" else ""
     return (f"N{args.N}_e{args.epochs}_tr{args.train_samples}"
-            f"_{k_str}_M{getattr(args, 'fourier_m', 6)}"
+            f"_{sig_str}_M{getattr(args, 'fourier_m', 6)}"
             f"_fs{args.f_scale:g}_gb{args.g_base:g}_gs{args.g_scale:g}"
             f"_ch{args.base_ch}_L{n_layers}{loss_suffix}")
 
@@ -1230,15 +1026,16 @@ def parse_args():
 
     # Data generation
     p.add_argument("--sanity", action="store_true",
-                   help="generate solver dataset, print acceptance/iteration/"
-                        "residual/data stats, then exit")
+                   help="generate solver dataset, print residual/data stats, "
+                        "then exit")
 
-    # Nonlinear PDE
-    p.add_argument("--k", type=int, default=2)
-    p.add_argument("--random-k", action=argparse.BooleanOptionalAction, default=True,
-                   help="sample k uniformly from [k_min, k_max] (default: True)")
-    p.add_argument("--k-min", type=int, default=0)
-    p.add_argument("--k-max", type=int, default=3)
+    # Linear variable coefficient a(x,y) = exp(sigma * psi)
+    p.add_argument("--sigma", type=float, default=0.5)
+    p.add_argument("--random-sigma", action=argparse.BooleanOptionalAction, default=False,
+                   help="sample sigma uniformly from [sigma_min, sigma_max] "
+                        "(default: False; use --random-sigma to enable)")
+    p.add_argument("--sigma-min", type=float, default=0.5)
+    p.add_argument("--sigma-max", type=float, default=1.5)
 
     # Fourier series
     p.add_argument("--fourier-m", type=int, default=6,
@@ -1247,14 +1044,8 @@ def parse_args():
     # Random field scales
     p.add_argument("--f-scale", type=float, default=6.0,
                    help="scale of random forcing")
-    p.add_argument("--g-base", type=float, default=0.65)
+    p.add_argument("--g-base", type=float, default=0.0)
     p.add_argument("--g-scale", type=float, default=0.6)
-
-    # Nonlinear FD solver (damped Newton)
-    p.add_argument("--newton-max-iter", type=int, default=50)
-    p.add_argument("--fd-tol", type=float, default=1e-10)
-    p.add_argument("--max-attempt-factor", type=int, default=20,
-                   help="max attempts = factor * n_samples")
 
     # Loss
     p.add_argument("--loss", default="physics",
@@ -1272,15 +1063,15 @@ def parse_args():
     p.add_argument("--plot", action="store_true")
     p.add_argument("--predict-case", default="data",
                    choices=["data", "fixed-solver"],
-                   help="'data': random f,g,k -> solver -> u_ref | "
+                   help="'data': random f,g,sigma -> solver -> u_ref | "
                         "'fixed-solver': manufactured u_target only builds f,g; "
-                        "u_ref recomputed by the nonlinear FD solver (strict "
+                        "u_ref recomputed by the linear FD solver (strict "
                         "solver test, comparable with MMS)")
     p.add_argument("--plot-dir", default="",
                    help="output dir for prediction figures "
                         "(default: results/predict/<case>)")
-    p.add_argument("--predict-k", type=int, default=2,
-                   help="fixed integer k for prediction")
+    p.add_argument("--predict-sigma", type=float, default=0.5,
+                   help="fixed sigma (test coefficient-field contrast) for prediction")
     return p.parse_args()
 
 # -- main -------------------------------------------------------------------
@@ -1290,12 +1081,10 @@ def main():
 
     if args.sanity:
         print("=" * 60)
-        print("SANITY CHECK (data=solver, damped Newton)")
+        print("SANITY CHECK (data=solver, single linear FD solve)")
         print("=" * 60)
-        print(f"Equation: -div(u^k grad u) = f  |  k = {args.k}")
+        print(f"Equation: -div(a(x,y) grad u) = f  |  sigma = {args.sigma}")
         print(f"Grid: N={args.N}  |  samples: {args.train_samples}")
-        print(f"Solver: damped Newton "
-              f"(max_iter={args.newton_max_iter}, tol={args.fd_tol:.1e})")
 
         _set_seed(args.seed)
         device = _select_device(args.device)
@@ -1310,19 +1099,11 @@ def main():
             u_min, u_max = float(u_ex.min()), float(u_ex.max())
             fi = data["f"][:, :, 1:-1, 1:-1]
 
-        stage_lists = [x["stage_iters"] for x in data["solver_info"]
-                       if x["stage_iters"]]
-        if stage_lists:
-            max_stages = max(len(s) for s in stage_lists)
-            per_stage = "  ".join(
-                f"k{j+1}:{np.mean([s[j] for s in stage_lists if len(s) > j]):.1f}"
-                for j in range(max_stages))
-            print(f"  per-stage mean iters: {per_stage}")
         print(f"  ref residual (float64 pipeline) = {data['ref_res64']:.4e}")
         print(f"  stored float32 data residual    = {ref32in64:.4e}  "
               f"(~h^-2·eps32 rounding floor)")
         print(f"  boundary error = {bnd_err:.2e}  (should be 0)")
-        print(f"  u_ref range    = [{u_min:.4f}, {u_max:.4f}]  (must be > 0)")
+        print(f"  u_ref range    = [{u_min:.4f}, {u_max:.4f}]")
         print(f"  f range        = [{float(fi.min()):.4e}, {float(fi.max()):.4e}]")
         print(f"  trivial baseline (a≡1) relL2    = "
               f"{trivial_linear_baseline(data):.4e}")

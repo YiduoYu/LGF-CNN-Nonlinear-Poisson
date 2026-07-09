@@ -31,7 +31,7 @@ LGF_python/
 
 # Experiment run scripts (local only)
 run_experiments*.sh
-
+run_pinn_vs_cnn.sh
 
 EXPERIMENT_REPORT.md
 PROJECT_HISTORY.md

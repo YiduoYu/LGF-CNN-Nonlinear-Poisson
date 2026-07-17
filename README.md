@@ -1,4 +1,4 @@
-# Variable-Coefficient Poisson Equation — CNN & PINN Solvers
+# Variable-Coefficient Poisson Equation — UNet & PINN Solvers
 
 求解线性变系数椭圆方程：
 
@@ -20,19 +20,24 @@
 
 | 文件 | 路线 | 用途 |
 |------|------|------|
-| `Baseline_solver.py` | **正向 solver 数据** | 随机 f, g, a(sigma) → 单次线性 FD 求解 u_ref → CNN 训练（主力） |
-| `Baseline_mms.py` | **MMS 反向数据** | 人造解 u_ref + 随机 a(sigma) → FD 反算 f（oracle = 0）→ CNN 训练 |
+| `UNet-solver.py` | **正向 solver 数据** | 随机 f, g, a(sigma) → 单次线性 FD 求解 u_ref → HourglassUNet 训练（主力） |
+| `UNet-mms.py` | **MMS 反向数据** | 人造解 u_ref + 随机 a(sigma) → FD 反算 f（oracle = 0）→ HourglassUNet 训练 |
 | `PINN.py` | **PINN 对照** | u1-u4 解析解 + a(sigma)，mesh-free 训练，autodiff 求 `-div(a grad u)` 残差 |
 
-### Baseline_solver.py — 正向数据
+模型架构统一是 `HourglassUNet`：通道走向 8C-4C-2C-C-2C-4C-8C（沙漏形，瓶颈最窄，
+`C = --base-ch`，默认 32 即 256-128-64-32-64-128-256），~4.1M 参数。此前的
+`SimpleCNN`（固定膨胀卷积、无下采样、~48K 参数）已从两个文件中移除；历史训练结果
+仍保留在 `checkpoints/cnn*/`、`results/axy_sig0.5-1.5/` 下，不受影响。
+
+### UNet-solver.py — 正向数据
 
 随机采样 f, g（二维 Fourier 级数）、a(x,y)（`sigma ~ U(sigma_min, sigma_max)` 或固定
-`sigma`）→ 直接稀疏线性求解 `-div(a grad u)=f` → CNN 学习 `(f, g, a)` → `u_ref`。
+`sigma`）→ 直接稀疏线性求解 `-div(a grad u)=f` → HourglassUNet 学习 `(f, g, a)` → `u_ref`。
 
 FD 离散：5 点 flux-form 差分，界面系数算术平均；`scipy.sparse.linalg.spsolve`
 一次求解，无需迭代、无拒绝采样。
 
-### Baseline_mms.py — MMS 反向数据
+### UNet-mms.py — MMS 反向数据
 
 构造带符号 `u_ref = b(x,y) + 0.36*(1-x²)(1-y²)*Fourier` 与独立随机 `a(x,y)`，用同一
 离散算子反算 `f = -div_h(a grad_h u_ref)`，float64 残差为机器零（oracle = 0）。
@@ -42,9 +47,9 @@ FD 离散：5 点 flux-form 差分，界面系数算术平均；`scipy.sparse.li
 标准 Raissi et al. (2017) 设计：MLP（Tanh + Xavier init）+ Adam + L-BFGS 微调，边界
 条件用惩罚项软约束。PDE 残差通过**两次嵌套 autograd**计算 `-div(a grad u)`
 （`q=a*grad(u)` 再对 `q` 求散度），链式法则自动展开出 `grad(a)·grad(u)` 项，无需手推
-公式。mesh-free：训练不依赖网格，`a(x,y)` 用与 CNN 相同的 Fourier 系数、以解析公式
+公式。mesh-free：训练不依赖网格，`a(x,y)` 用与 UNet 相同的 Fourier 系数、以解析公式
 在任意配点求值（含 autodiff），因此**一个训好的模型可在任意 `--N` 下重新评估，无需
-重新训练**（checkpoint key 不含 N）。测试目标为 `Baseline_mms.py` 的 u1-u4 解析解。
+重新训练**（checkpoint key 不含 N）。测试目标为 `UNet-mms.py` 的 u1-u4 解析解。
 
 ---
 
@@ -52,27 +57,27 @@ FD 离散：5 点 flux-form 差分，界面系数算术平均；`scipy.sparse.li
 
 ```bash
 # 数据预检
-python Baseline_solver.py --sanity --N 32 --train-samples 16 --device cpu
-python Baseline_mms.py --mms-sanity --N 32 --train-samples 16 --device cpu
+python UNet-solver.py --sanity --N 32 --train-samples 16 --device cpu
+python UNet-mms.py --mms-sanity --N 32 --train-samples 16 --device cpu
 
 # 训练（physics loss；固定 sigma=0.5）
-python Baseline_solver.py --N 32 --epochs 200 --loss physics --sigma 0.5 --device cpu
-python Baseline_mms.py --N 32 --epochs 200 --loss physics --sigma 0.5 --device cpu
+python UNet-solver.py --N 32 --epochs 200 --loss physics --sigma 0.5 --device cpu
+python UNet-mms.py --N 32 --epochs 200 --loss physics --sigma 0.5 --device cpu
 
 # 训练（随机 sigma ∈ [0.5, 1.5]，一次训练覆盖整个难度区间）
-python Baseline_solver.py --N 32 --epochs 200 --loss physics \
+python UNet-solver.py --N 32 --epochs 200 --loss physics \
   --random-sigma --sigma-min 0.5 --sigma-max 1.5 --device cpu
 
 # 训练（supervised loss）
-python Baseline_solver.py --N 32 --epochs 200 --loss supervised --sigma 0.5 --device cpu
-python Baseline_mms.py --N 32 --epochs 200 --loss supervised --sigma 0.5 --device cpu
+python UNet-solver.py --N 32 --epochs 200 --loss supervised --sigma 0.5 --device cpu
+python UNet-mms.py --N 32 --epochs 200 --loss supervised --sigma 0.5 --device cpu
 
 # 预测 with 分析测试套件
-python Baseline_mms.py --predict \
+python UNet-mms.py --predict \
   --predict-from checkpoints/cnn_mms/<key>/best.pt \
   --predict-case analytic --predict-sigma 0.5 --plot --device cpu
 
-python Baseline_solver.py --predict \
+python UNet-solver.py --predict \
   --predict-from checkpoints/cnn/<key>/best.pt \
   --predict-case fixed-solver --predict-sigma 0.5 --plot --device cpu
 
@@ -87,7 +92,7 @@ python PINN.py --case u1 --sigma 0.5 --N 32 --device cpu
 
 ## 主要 CLI 参数
 
-### Baseline_solver.py / Baseline_mms.py（共有）
+### UNet-solver.py / UNet-mms.py（共有）
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
@@ -96,8 +101,7 @@ python PINN.py --case u1 --sigma 0.5 --N 32 --device cpu
 | `--train-samples` | 128 (solver) / 32 (mms) | 训练样本数 |
 | `--batch-size` | 8 | 批大小 |
 | `--lr` | 1e-3 | 学习率 |
-| `--base-ch` | 32 | 隐藏通道数 |
-| `--n-layers` | 6 | 卷积层数 |
+| `--base-ch` | 32 | HourglassUNet 基宽 C（通道 8C-4C-2C-C-2C-4C-8C，瓶颈最窄） |
 | `--sigma` | 0.5 | 固定 sigma（需 `--no-random-sigma`，默认已是固定） |
 | `--random-sigma` | False | 随机 sigma ∈ [sigma_min, sigma_max] |
 | `--sigma-min` / `--sigma-max` | 0.5 / 1.5 | sigma 范围 |
@@ -139,9 +143,9 @@ python PINN.py --case u1 --sigma 0.5 --N 32 --device cpu
 | predResRMSE / refResRMSE | u_pred / u_ref 的 PDE 残差 RMS |
 | bndErr | 边界误差（hard Dirichlet 投影应为浮点零） |
 | gradRelL2 / gradLinf | 梯度相对 L2 / 最大误差 |
-| linearBaselineRelL2 | a≡1 线性 Poisson 解的 relL2（**CNN/PINN 必须显著打赢**） |
+| linearBaselineRelL2 | a≡1 线性 Poisson 解的 relL2（**UNet/PINN 必须显著打赢**） |
 | constBaselineRelL2 | 常数预测基线 relL2 |
-| f_RMSE | forcing 项 f 的 RMS（尺度参考，CNN 脚本） |
+| f_RMSE | forcing 项 f 的 RMS（尺度参考，UNet 脚本） |
 
 ---
 
@@ -153,7 +157,7 @@ python PINN.py --case u1 --sigma 0.5 --N 32 --device cpu
   softplus / 正性下限
 - **a≡1 线性基线**：线性 FD 方程组用 `scipy.sparse` 直接求解（平凡基线对照）
 - **physics-only 或 supervised**：`--loss` 选训练目标
-- **6 通道输入**（CNN）：`[f_norm, g, boundary_mask, log(a)_norm, x, y]`，`a` 是逐点
+- **6 通道输入**（UNet）：`[f_norm, g, boundary_mask, log(a)_norm, x, y]`，`a` 是逐点
   场（不是标量广播）
 - **float64 数据管线**：数据生成与参考残差在 float64 计算，训练存 float32
 - **难度轴 sigma**：`a=exp(sigma*psi)`，`sigma=0` 退化为常系数 Poisson（sanity
@@ -166,8 +170,8 @@ python PINN.py --case u1 --sigma 0.5 --N 32 --device cpu
   展开，无需为每个 `a(x,y)` 手推残差公式
 - **PINN mesh-free 复用**：checkpoint key 不含评估网格 `N`，同一模型可在任意 `--N`
   下重新评估而不重训
-- **优化器**：CNN 用 AdamW + gradient clipping + warmup → cosine annealing；PINN 用
+- **优化器**：UNet 用 AdamW + gradient clipping + warmup → cosine annealing；PINN 用
   Adam + L-BFGS 微调（Raissi et al. 2017 标准做法）
 - **checkpoint 类型标记**：`model_type` 字段防止 MMS/solver checkpoint 混用；两个
-  Baseline 脚本还会拒绝加载重构前（`a(u,k)=u^k`）的旧 checkpoint（缺少 `"sigma"`
+  UNet 脚本还会拒绝加载重构前（`a(u,k)=u^k`）的旧 checkpoint（缺少 `"sigma"`
   字段会直接报错，避免静默产出错误预测）

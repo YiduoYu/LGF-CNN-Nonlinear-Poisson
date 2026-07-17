@@ -16,18 +16,26 @@
 
 ---
 
-## 三个独立文件（零交叉 import）
+## 文件（零交叉 import）
 
-| 文件 | 路线 | 用途 |
-|------|------|------|
-| `UNet-solver.py` | **正向 solver 数据** | 随机 f, g, a(sigma) → 单次线性 FD 求解 u_ref → HourglassUNet 训练（主力） |
-| `UNet-mms.py` | **MMS 反向数据** | 人造解 u_ref + 随机 a(sigma) → FD 反算 f（oracle = 0）→ HourglassUNet 训练 |
-| `PINN.py` | **PINN 对照** | u1-u4 解析解 + a(sigma)，mesh-free 训练，autodiff 求 `-div(a grad u)` 残差 |
+| 文件 | 模型 | 路线 | 用途 |
+|------|------|------|------|
+| `UNet-solver.py` | HourglassUNet | 正向 solver 数据 | 随机 f, g, a(sigma) → 单次线性 FD 求解 u_ref → 训练（当前主力） |
+| `UNet-mms.py` | HourglassUNet | MMS 反向数据 | 人造解 u_ref + 随机 a(sigma) → FD 反算 f（oracle = 0）→ 训练 |
+| `Baseline_solver.py` | SimpleCNN | 正向 solver 数据 | 同上数据管线，模型是固定膨胀卷积的 SimpleCNN（UNet 之前的版本，保留供对比） |
+| `Baseline_mms.py` | SimpleCNN | MMS 反向数据 | 同上数据管线，模型是 SimpleCNN（UNet 之前的版本，保留供对比） |
+| `PINN.py` | MLP（PINN） | PINN 对照 | u1-u4 解析解 + a(sigma)，mesh-free 训练，autodiff 求 `-div(a grad u)` 残差 |
 
-模型架构统一是 `HourglassUNet`：通道走向 8C-4C-2C-C-2C-4C-8C（沙漏形，瓶颈最窄，
-`C = --base-ch`，默认 32 即 256-128-64-32-64-128-256），~4.1M 参数。此前的
-`SimpleCNN`（固定膨胀卷积、无下采样、~48K 参数）已从两个文件中移除；历史训练结果
-仍保留在 `checkpoints/cnn*/`、`results/axy_sig0.5-1.5/` 下，不受影响。
+`UNet-{mms,solver}.py` 和 `Baseline_{mms,solver}.py` 的数据生成、loss、评估指标、CLI
+参数**完全一致**，唯一区别是模型架构：
+
+- `HourglassUNet`（UNet-*.py）：通道走向 8C-4C-2C-C-2C-4C-8C（沙漏形，瓶颈最窄，
+  `C = --base-ch`，默认 32 即 256-128-64-32-64-128-256），~4.1M 参数，下采样金字塔
+  带来全局感受野
+- `SimpleCNN`（Baseline_*.py）：固定膨胀卷积、无下采样、~48K 参数，感受野随层数固定
+
+两者的历史训练结果分别在 `checkpoints/cnn_mms/`、`checkpoints/cnn/` 下按 ckpt_key 区分
+（UNet 的 key 含 `_unet` 后缀），互不冲突，可以直接对比。
 
 ### UNet-solver.py — 正向数据
 
@@ -54,6 +62,10 @@ FD 离散：5 点 flux-form 差分，界面系数算术平均；`scipy.sparse.li
 ---
 
 ## Quick Start
+
+下面以 `UNet-*.py` 为例；`Baseline_*.py`（SimpleCNN 版本）CLI 几乎相同，直接把命令里
+的文件名换掉即可，唯一区别是 `Baseline_*.py` 多一个 `--n-layers`（SimpleCNN 卷积层数，
+默认 6；HourglassUNet 深度固定，没有这个参数）。
 
 ```bash
 # 数据预检

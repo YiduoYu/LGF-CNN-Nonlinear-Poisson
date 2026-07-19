@@ -4,21 +4,30 @@ a(x,y) = exp(sigma*psi) is the same log-normal Fourier coefficient field as
 Baseline_mms.py's random_positive_field; u is one of the u1-u4 analytic
 targets (Baseline_mms.ANALYTIC_CASES, signed, no shift).
 
-Follows Raissi et al. (2017) design:
-  - MLP with Tanh, Xavier init
-  - Adam + L-BFGS fine-tuning
+Uses the Raissi et al. (2017) PINN method with training hyperparameters
+borrowed from their Burgers experiment. This is NOT a strict reproduction of
+any Raissi benchmark: the problem here is a custom 2D variable-coefficient
+Poisson equation, LINEAR in u (despite the repo name, it is not a nonlinear
+Poisson). What is shared with the paper is the method and setup, not the PDE:
+  - MLP with Tanh, Xavier init (Burgers architecture: 8 hidden layers x 20)
+  - collocation points drawn ONCE via Latin Hypercube Sampling and held fixed
+    (N_f interior + N_u boundary), as in the paper's fixed-point training
+  - equal-weight composite loss MSE_f + MSE_u (bc_weight = 1)
+  - Adam warm-up + a single L-BFGS run to convergence
   - PDE residual via autodiff (strong/flux form: -div(a grad u) computed as
     two nested autograd passes, so the product-rule term grad(a).grad(u)
     falls out automatically — no hand-derived formula needed)
   - Boundary conditions via penalty (soft constraint)
 
-Mesh-free: training never touches a grid (collocation points are sampled
-continuously in [-1,1]^2), so a single trained model can be re-evaluated at
-any --N without retraining. The (case, sigma) pair defines the coefficient
-field via a seeded RNG; the checkpoint key does not include N.
+Mesh-free: training never touches a grid (collocation points live in the
+continuous [-1,1]^2), so a single trained model can be re-evaluated at any
+--N without retraining; the checkpoint key does not include N. The coefficient
+field a(x,y) is fixed by --seed (and the other PDE parameters), all of which
+enter the checkpoint key, and the actual Fourier coefficients are stored in the
+checkpoint so evaluation always uses exactly the field the model trained on.
 
 Recommended:
-    python PINN.py --case u1 --sigma 0.5 --N 128 --epochs 5000 --retrain
+    python PINN.py --case u1 --sigma 0.5 --N 128 --retrain
     python PINN.py --case u1 --sigma 0.5 --N 32     # reuses the same checkpoint
 """
 
@@ -26,12 +35,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
 import tempfile
 import time
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +48,7 @@ import torch
 import torch.nn as nn
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from scipy.stats import qmc
 
 # Reference grid resolution used only to compute the a(x,y) normalization
 # denominator (see random_fourier_field), so training (mesh-free) and
@@ -223,10 +233,11 @@ ANALYTIC_CASES_TORCH = {
 }
 
 
-def build_problem_def(case, sigma, M, seed):
+def build_problem_def(M, seed):
     """Problem instance, independent of any evaluation grid: RNG-seeded
     Fourier coefficients for a(x,y) + their fixed-reference-grid
-    normalization denominator."""
+    normalization denominator. Only M and seed affect the field; case/sigma
+    are applied later (case selects the analytic target, sigma scales psi)."""
     rng = np.random.RandomState(seed)
     coeffs = _fourier_coeffs(M, rng)
     denom = _psi_denom(coeffs)
@@ -266,10 +277,6 @@ def build_eval_grid(N, case, sigma, coeffs, denom, device):
 # 0. Utilities
 # ===========================================================================
 
-def get_run_id() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
 def _get_plt():
     cache = Path(tempfile.gettempdir())
     os.environ.setdefault("MPLCONFIGDIR", str(cache / "matplotlib"))
@@ -284,10 +291,25 @@ def _get_plt():
 #     checkpoint is re-evaluated at any --N without retraining)
 # ===========================================================================
 
-def config_key(case: str, sigma: float, M: int, epochs: int, hidden_dim: int,
-               n_layers: int, bc_weight: float) -> str:
-    bc_str = f"bc{bc_weight:g}"
-    return f"{case}_sig{sigma:g}_M{M}_e{epochs}_h{hidden_dim}_l{n_layers}_{bc_str}"
+# Every parameter that changes the PDE instance or the trained weights. --N is
+# excluded (mesh-free) and so are monitoring-only knobs (--eval-every) and
+# runtime flags (--device/--retrain/--no-plot), which do not affect the model.
+RESULT_AFFECTING_KEYS = [
+    "case", "sigma", "fourier_m", "seed", "epochs", "lr",
+    "n_int", "n_bnd", "bc_weight", "hidden_dim", "n_layers", "lbfgs_iters",
+]
+
+
+def config_key(args) -> str:
+    """Readable prefix + short hash of every result-affecting parameter, so
+    changing any of them (crucially --seed, which picks the a(x,y) field) can
+    never silently reuse a mismatched checkpoint."""
+    prefix = (f"{args.case}_sig{args.sigma:g}_M{args.fourier_m}"
+              f"_h{args.hidden_dim}_l{args.n_layers}_s{args.seed}")
+    payload = {k: getattr(args, k) for k in RESULT_AFFECTING_KEYS}
+    payload["denom_grid_n"] = DENOM_GRID_N   # coefficient-field normalization grid
+    h = hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:8]
+    return f"{prefix}_{h}"
 
 
 def resolve_paths(ckey: str, N: int, model_type: str = "pinn") -> dict:
@@ -295,8 +317,8 @@ def resolve_paths(ckey: str, N: int, model_type: str = "pinn") -> dict:
     results_dir = Path("results") / model_type / ckey / f"N{N}"
     return {
         "ckpt_dir": ckpt_dir,
-        "best_path": ckpt_dir / "best.pt",
-        "last_path": ckpt_dir / "last.pt",
+        "adam_path": ckpt_dir / "adam.pt",     # post-Adam weights
+        "last_path": ckpt_dir / "last.pt",     # final (post-L-BFGS) weights — the one reused
         "history_path": ckpt_dir / "history.csv",
         "figure_dir": results_dir / "figures",
         "results_dir": results_dir,
@@ -309,8 +331,10 @@ def resolve_paths(ckey: str, N: int, model_type: str = "pinn") -> dict:
 # ===========================================================================
 
 class MLP(nn.Module):
-    """Fully-connected network: (x,y) -> u(x,y)."""
-    def __init__(self, hidden_dim: int = 64, n_layers: int = 4):
+    """Fully-connected network: (x,y) -> u(x,y). Raissi et al. (2017) Burgers
+    architecture by default: n_layers hidden Tanh layers of width hidden_dim
+    (8 x 20)."""
+    def __init__(self, hidden_dim: int = 20, n_layers: int = 8):
         super().__init__()
         layers = [nn.Linear(2, hidden_dim), nn.Tanh()]
         for _ in range(n_layers - 1):
@@ -333,20 +357,37 @@ class MLP(nn.Module):
 # 2. Collocation point sampling
 # ===========================================================================
 
-def sample_points(n_int: int, n_bnd: int, device: torch.device):
-    """Sample random collocation points each epoch (standard PINN).
+def sample_points(n_int: int, n_bnd: int, seed: int, device: torch.device):
+    """Latin Hypercube collocation points, sampled ONCE and held fixed for the
+    whole run (Raissi et al. 2017 use a fixed LHS point set, not per-epoch
+    resampling).
 
-    Interior: uniform in [-1,1]^2. Boundary: equal split among 4 edges.
+    Interior: LHS in [-1,1]^2, exactly n_int points. Boundary: exactly n_bnd
+    points spread over the 4 edges — the remainder n_bnd % 4 is handed to the
+    first edges (so n_bnd is honoured exactly, unlike a bare n_bnd // 4), and
+    each edge draws its free coordinate from an independent 1D LHS (no shared
+    coordinates across edges).
     """
-    x_int = torch.rand(n_int, 1, device=device) * 2.0 - 1.0
-    y_int = torch.rand(n_int, 1, device=device) * 2.0 - 1.0
+    eng = qmc.LatinHypercube(d=2, seed=seed)
+    pts = eng.random(n_int) * 2.0 - 1.0
+    x_int = torch.tensor(pts[:, 0:1], dtype=torch.float32, device=device)
+    y_int = torch.tensor(pts[:, 1:2], dtype=torch.float32, device=device)
 
-    n_edge = max(n_bnd // 4, 1)
-    t = torch.rand(n_edge, 1, device=device) * 2.0 - 1.0
-    one = torch.ones(n_edge, 1, device=device)
-
-    x_bnd = torch.cat([t, t, -one, one], dim=0)
-    y_bnd = torch.cat([-one, one, t, t], dim=0)
+    base, rem = divmod(n_bnd, 4)
+    counts = [base + (1 if e < rem else 0) for e in range(4)]
+    eng1 = qmc.LatinHypercube(d=1, seed=seed + 1)
+    xs, ys = [], []
+    for edge, c in enumerate(counts):
+        if c == 0:
+            continue
+        t = eng1.random(c)[:, 0] * 2.0 - 1.0          # free coordinate in [-1,1]
+        fixed = np.full(c, -1.0 if edge in (0, 2) else 1.0)
+        if edge in (0, 1):      # bottom (y=-1) / top (y=+1)
+            xs.append(t);     ys.append(fixed)
+        else:                   # left (x=-1) / right (x=+1)
+            xs.append(fixed); ys.append(t)
+    x_bnd = torch.tensor(np.concatenate(xs)[:, None], dtype=torch.float32, device=device)
+    y_bnd = torch.tensor(np.concatenate(ys)[:, None], dtype=torch.float32, device=device)
 
     return x_int, y_int, x_bnd, y_bnd
 
@@ -370,40 +411,43 @@ def _flux_div_continuous(u, a, x, y):
     return -(qx_x + qy_y)
 
 
-def pinn_loss(model, x_int, y_int, x_bnd, y_bnd, coeffs, sigma, denom,
-              u_target_fn, bc_weight):
-    """Compute physics-informed loss. Returns (total_loss, pde_loss, bc_loss)."""
+def manufactured_forcing(x_int, y_int, coeffs, sigma, denom, u_target_fn):
+    """Precompute the manufactured forcing f = -div(a grad u_target) at the
+    (fixed) interior collocation points. f depends only on the analytic target
+    and a(x,y), not on the network, so with a fixed point set it is computed
+    ONCE and reused every optimisation step (the old code recomputed it — two
+    nested autograd passes on the analytic solution — inside every loss call,
+    which the L-BFGS closure hits many times per iteration)."""
+    x = x_int.detach().clone().requires_grad_(True)
+    y = y_int.detach().clone().requires_grad_(True)
+    u_true = u_target_fn(x, y)
+    a_true = a_field_torch(coeffs, sigma, denom, x, y)
+    return _flux_div_continuous(u_true, a_true, x, y).detach()
+
+
+def pinn_loss(model, x_int, y_int, f_int, x_bnd, y_bnd, g_bnd,
+              coeffs, sigma, denom, bc_weight):
+    """Equal-weight composite loss MSE_f + bc_weight * MSE_u (Raissi et al.
+    2017 use bc_weight = 1). x_int/y_int are the fixed interior points (plain
+    value tensors); f_int and g_bnd are precomputed constants. Returns
+    (total, pde, bc)."""
+    # Fresh grad leaves each call so input-derivative graphs don't accumulate
+    # onto a persistent leaf's .grad across optimisation steps.
     x = x_int.detach().requires_grad_(True)
     y = y_int.detach().requires_grad_(True)
 
-    # target forcing f = -div(a grad u_target), continuous (no grid) — does
-    # not depend on the model, detach once computed.
-    u_true = u_target_fn(x, y)
-    a_true = a_field_torch(coeffs, sigma, denom, x, y)
-    f = _flux_div_continuous(u_true, a_true, x, y).detach()
-
-    # ---- PDE residual on interior ----
+    # ---- PDE residual on interior (a_pred must keep its graph in x,y so the
+    #      grad(a).grad(u) product-rule term survives the nested autodiff) ----
     u_pred = model(x, y)
     a_pred = a_field_torch(coeffs, sigma, denom, x, y)
-    residual = _flux_div_continuous(u_pred, a_pred, x, y) - f
+    residual = _flux_div_continuous(u_pred, a_pred, x, y) - f_int
     loss_pde = residual.pow(2).mean()
 
-    # ---- Boundary condition ----
+    # ---- Boundary condition (soft penalty) ----
     u_bnd = model(x_bnd, y_bnd)
-    g_bnd = u_target_fn(x_bnd, y_bnd)
     loss_bc = (u_bnd - g_bnd).pow(2).mean()
 
     return loss_pde + bc_weight * loss_bc, loss_pde.detach(), loss_bc.detach()
-
-
-def validation_loss(model, x_int, y_int, x_bnd, y_bnd, coeffs, sigma, denom,
-                    u_target_fn, bc_weight) -> float:
-    """PINN loss on a fixed validation collocation set, for model
-    selection."""
-    model.eval()
-    loss, _, _ = pinn_loss(model, x_int, y_int, x_bnd, y_bnd, coeffs, sigma,
-                           denom, u_target_fn, bc_weight)
-    return float(loss)
 
 
 # ===========================================================================
@@ -411,8 +455,31 @@ def validation_loss(model, x_int, y_int, x_bnd, y_bnd, coeffs, sigma, denom,
 # ===========================================================================
 
 @torch.no_grad()
+def _eval_grid_light(model, grid):
+    """Cheap training-monitor metrics (relL2, predResRMSE, bndErr) — no SciPy
+    sparse solve and no constant/linear baselines, since those are independent
+    of the network and only belong in the final evaluation (they were being
+    recomputed on every periodic monitoring call)."""
+    x, y = grid["x"], grid["y"]
+    boundary, interior, h = grid["bnd"], grid["interior"], grid["h"]
+    f, a, g, ue = grid["f_grid"], grid["a_grid"], grid["g_grid"], grid["u_target_grid"]
+
+    u_pred = model(x.reshape(-1, 1), y.reshape(-1, 1)).reshape(
+        1, 1, x.shape[-2], x.shape[-1])
+    err_flat = ((u_pred - ue) * interior)[:, :, 1:-1, 1:-1]
+    u_flat = ue[:, :, 1:-1, 1:-1]
+    res_pred = pde_residual(u_pred, f, a, h)
+    return {
+        "relL2": float(err_flat.norm(p=2) / u_flat.norm(p=2).clamp_min(1e-12)),
+        "predResRMSE": float(res_pred.pow(2).mean().sqrt()),
+        "bndErr": float(((u_pred - g) * boundary).abs().max()),
+    }, u_pred
+
+
+@torch.no_grad()
 def _eval_grid(model, grid):
-    """Evaluate PINN on a grid. Returns (metrics_dict, u_pred_tensor)."""
+    """Full final evaluation (all metrics + const/linear baselines).
+    Returns (metrics_dict, u_pred_tensor)."""
     x, y = grid["x"], grid["y"]
     boundary, interior, h = grid["bnd"], grid["interior"], grid["h"]
     f, a, g, ue = grid["f_grid"], grid["a_grid"], grid["g_grid"], grid["u_target_grid"]
@@ -471,7 +538,7 @@ def save_summary_json(summary, path):
 # 5. Training (Adam + L-BFGS, per Raissi et al. 2017)
 # ===========================================================================
 
-def train(args, coeffs, denom, u_target_fn, best_path, last_path, history_path):
+def train(args, coeffs, denom, u_target_fn):
     set_seed(args.seed)
     device = select_device(args.device)
     t0 = time.time()
@@ -479,153 +546,95 @@ def train(args, coeffs, denom, u_target_fn, best_path, last_path, history_path):
     model = MLP(hidden_dim=args.hidden_dim, n_layers=args.n_layers).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
+        optimizer, T_max=max(args.epochs, 1), eta_min=args.lr * 0.01,
     )
 
-    # ---- evaluation grid (headline N, for periodic monitoring) ----
+    # ---- evaluation grid (headline N, for monitoring only) ----
     eval_grid = build_eval_grid(args.N, args.case, args.sigma, coeffs, denom, device)
 
-    # ---- fixed validation collocation set (model selection, no u_target leakage) ----
-    xv_int, yv_int, xv_bnd, yv_bnd = sample_points(args.n_int, args.n_bnd, device)
+    # ---- fixed collocation set (drawn ONCE via LHS, held for the whole run).
+    #      Manufactured forcing f and boundary data g are precomputed once —
+    #      with fixed points they never change, so the two nested autodiff
+    #      passes that build f run a single time instead of every loss call. ----
+    x_int, y_int, x_bnd, y_bnd = sample_points(args.n_int, args.n_bnd, args.seed, device)
+    f_int = manufactured_forcing(x_int, y_int, coeffs, args.sigma, denom, u_target_fn)
+    g_bnd = u_target_fn(x_bnd, y_bnd).detach()
+    colloc = (x_int, y_int, f_int, x_bnd, y_bnd, g_bnd)
 
     print(f"device={device}  case={args.case}  sigma={args.sigma}  N={args.N}  epochs={args.epochs}  "
-          f"collocation: interior={args.n_int}  boundary={args.n_bnd}  "
+          f"collocation (fixed LHS): interior={args.n_int}  boundary={x_bnd.shape[0]}  "
           f"bc_weight={args.bc_weight}")
-    print(f"hidden_dim={args.hidden_dim}  n_layers={args.n_layers}")
-    print(f"{'epoch':>6s}  {'loss_pde':>10s}  {'loss_bc':>10s}  {'val_loss':>10s}  "
+    print(f"hidden_dim={args.hidden_dim}  n_layers={args.n_layers}  "
+          f"lbfgs_iters={args.lbfgs_iters}")
+    print(f"{'step':>8s}  {'loss_pde':>10s}  {'loss_bc':>10s}  "
           f"{'relL2':>10s}  {'resRMSE':>10s}  {'time':>8s}")
 
-    best_val_loss = math.inf
-    best_state = None
     history: list[dict] = []
 
+    def _log(step):
+        """Append a monitoring point and print it. Loss and grid metrics are
+        both read from the CURRENT model state, so the loss on each training-
+        curve row matches the relL2 on the same row (no off-by-one-update gap).
+        Pure monitoring — it never selects or saves a model, so eval_every only
+        sets the curve resolution, not the result."""
+        model.eval()
+        with torch.enable_grad():
+            _, lp, lb = pinn_loss(model, *colloc, coeffs, args.sigma, denom, args.bc_weight)
+        vm, _ = _eval_grid_light(model, eval_grid)
+        history.append({
+            "step": step, "loss_pde": float(lp), "loss_bc": float(lb),
+            "relL2": vm["relL2"], "resRMSE": vm["predResRMSE"], "bmax": vm["bndErr"],
+        })
+        print(f"{step:8d}  {float(lp):10.3e}  {float(lb):10.3e}  "
+              f"{vm['relL2']:10.3e}  {vm['predResRMSE']:10.3e}  {time.time() - t0:7.1f}s")
+
+    # ---- Adam warm-up (full-batch on the fixed collocation set) ----
     for epoch in range(1, args.epochs + 1):
         model.train()
-
-        x_int, y_int, x_bnd, y_bnd = sample_points(
-            args.n_int, args.n_bnd, device,
-        )
-
-        loss, loss_pde, loss_bc = pinn_loss(
-            model, x_int, y_int, x_bnd, y_bnd, coeffs, args.sigma, denom,
-            u_target_fn, args.bc_weight,
-        )
-
+        loss, _, _ = pinn_loss(model, *colloc, coeffs, args.sigma, denom, args.bc_weight)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
         scheduler.step()
 
-        # ---- evaluation ----
-        if epoch % args.eval_every == 0 or epoch == args.epochs:
-            model.eval()
-            vm, _ = _eval_grid(model, eval_grid)
-            relL2 = vm["relL2"]
-            val_loss = validation_loss(model, xv_int, yv_int, xv_bnd, yv_bnd,
-                                       coeffs, args.sigma, denom, u_target_fn,
-                                       args.bc_weight)
+        # periodic monitoring only; the final epoch is covered by the log below
+        if epoch % args.eval_every == 0 and epoch != args.epochs:
+            _log(epoch)
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                best_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save({
-                    "model_state_dict": best_state,
-                    "args": vars(args),
-                    "epoch": epoch,
-                    "best_val_loss": best_val_loss,
-                }, best_path)
+    if args.epochs > 0:
+        _log(args.epochs)                 # one evaluation at the end of Adam
+    adam_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-            elapsed = time.time() - t0
-            print(f"{epoch:6d}  {float(loss_pde):10.3e}  {float(loss_bc):10.3e}  "
-                  f"{val_loss:10.3e}  "
-                  f"{relL2:10.3e}  {vm['predResRMSE']:10.3e}  {elapsed:7.1f}s")
-
-            history.append({
-                "epoch": epoch,
-                "loss_pde": float(loss_pde),
-                "loss_bc": float(loss_bc),
-                "val_loss": val_loss,
-                "relL2": relL2,
-                "resRMSE": vm["predResRMSE"],
-                "bmax": vm["bndErr"],
-            })
-
-    # restore best Adam state
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        print(f"best Adam model (val loss={best_val_loss:.4e})")
-
-    # ---- L-BFGS fine-tuning (reuses the last Adam epoch's collocation pts:
-    #      L-BFGS's line search needs a fixed objective, not a resampled one) ----
-    if args.lbfgs_epochs > 0 and args.epochs > 0:
-        print(f"\nL-BFGS fine-tuning ({args.lbfgs_epochs} steps)...")
+    # ---- single L-BFGS run to convergence. The closure does ONLY zero_grad /
+    #      loss / backward: strong-Wolfe calls it many times per accepted
+    #      iteration with trial parameters, so monitoring or checkpointing
+    #      inside it would record line-search probes, not real iterations. All
+    #      evaluation happens once, after step() returns. ----
+    if args.lbfgs_iters > 0:
+        print(f"\nL-BFGS to convergence (max_iter={args.lbfgs_iters})...")
         optimizer_lbfgs = torch.optim.LBFGS(
             model.parameters(),
-            lr=0.5,
-            max_iter=20,
-            max_eval=25,
+            lr=1.0,
+            max_iter=args.lbfgs_iters,
+            max_eval=int(args.lbfgs_iters * 1.25),
             history_size=50,
+            tolerance_grad=1e-9,
+            tolerance_change=1e-11,
             line_search_fn="strong_wolfe",
         )
 
         def lbfgs_closure():
             optimizer_lbfgs.zero_grad()
-            loss_total, _, _ = pinn_loss(
-                model, x_int, y_int, x_bnd, y_bnd, coeffs, args.sigma, denom,
-                u_target_fn, args.bc_weight,
-            )
+            loss_total, _, _ = pinn_loss(model, *colloc, coeffs, args.sigma,
+                                         denom, args.bc_weight)
             loss_total.backward()
             return loss_total
 
-        for i in range(args.lbfgs_epochs):
-            model.train()
-            loss_lbfgs = optimizer_lbfgs.step(lbfgs_closure)
-            model.eval()
+        optimizer_lbfgs.step(lbfgs_closure)
+        _log(args.epochs + 1)             # one evaluation at the end of L-BFGS
 
-            if (i + 1) % 20 == 0 or i == 0 or i == args.lbfgs_epochs - 1:
-                vm, _ = _eval_grid(model, eval_grid)
-                val_loss = validation_loss(model, xv_int, yv_int, xv_bnd, yv_bnd,
-                                           coeffs, args.sigma, denom, u_target_fn,
-                                           args.bc_weight)
-                _, cur_loss_pde, cur_loss_bc = pinn_loss(
-                    model, x_int, y_int, x_bnd, y_bnd, coeffs, args.sigma, denom,
-                    u_target_fn, args.bc_weight,
-                )
-                elapsed = time.time() - t0
-                print(f"  lbfgs {i+1:4d}  loss={float(loss_lbfgs):.3e}  "
-                      f"val_loss={val_loss:.3e}  "
-                      f"relL2={vm['relL2']:.3e}  resRMSE={vm['predResRMSE']:.3e}  "
-                      f"bndErr={vm['bndErr']:.3e}  {elapsed:.0f}s")
-
-                # numeric epoch (continues the Adam-phase axis) so the training
-                # curve stays on a single numeric x-axis instead of mixing in
-                # string labels, which forces matplotlib to treat epoch as
-                # categorical and garbles the tick labels.
-                history.append({
-                    "epoch": args.epochs + i + 1,
-                    "loss_pde": float(cur_loss_pde), "loss_bc": float(cur_loss_bc),
-                    "val_loss": val_loss,
-                    "relL2": vm["relL2"],
-                    "resRMSE": vm["predResRMSE"],
-                    "bmax": vm["bndErr"],
-                })
-
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                    best_path.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save({
-                        "model_state_dict": best_state,
-                        "args": vars(args),
-                        "best_val_loss": best_val_loss,
-                    }, best_path)
-
-        if best_state is not None:
-            model.load_state_dict(best_state)
-            print(f"best overall model (val loss={best_val_loss:.4e})")
-
-    return model, history, best_val_loss
+    last_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    return model, history, adam_state, last_state, coeffs, denom
 
 
 # ===========================================================================
@@ -692,44 +701,36 @@ def _save_centerline(ue, up, path, title, dpi=150):
 
 
 def _save_training_curve(history, path, title, dpi=150):
-    """2-panel training curve: losses (log) | relL2 + resRMSE with best checkpoint."""
+    """2-panel training curve: PDE/BC loss (log) | relL2 + resRMSE. Monitoring
+    only — the final model is the converged L-BFGS model, not a selected best,
+    so there is no best-checkpoint marker."""
     if len(history) < 2:
         return
     plt = _get_plt()
 
-    epochs = [h["epoch"] for h in history]
-    val_losses = [h.get("val_loss", float("inf")) for h in history]
-    best_idx = min(range(len(val_losses)), key=lambda i: val_losses[i])
-    best_epoch = epochs[best_idx]
+    steps = [h["step"] for h in history]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
     fig.suptitle(title)
 
-    ax1.plot(epochs, [h["loss_pde"] for h in history], "b-", alpha=0.7, label="PDE loss")
-    ax1.plot(epochs, [h["loss_bc"] for h in history], "c-", alpha=0.7, label="BC loss")
-    ax1.plot(epochs, val_losses, "r-", label="val loss")
-    ax1.axvline(best_epoch, color="gray", ls=":", lw=1,
-                label=f"best (epoch {best_epoch})")
-    ax1.set_xlabel("epoch")
+    ax1.plot(steps, [h["loss_pde"] for h in history], "b-", alpha=0.7, label="PDE loss")
+    ax1.plot(steps, [h["loss_bc"] for h in history], "c-", alpha=0.7, label="BC loss")
+    ax1.set_xlabel("step (Adam epoch → L-BFGS end)")
     ax1.set_ylabel("loss")
     ax1.set_yscale("log")
-    ax1.set_title("Training & validation loss")
+    ax1.set_title("Training loss")
     ax1.legend(fontsize="small")
     ax1.grid(True, alpha=0.3)
 
     ax2b = ax2.twinx()
-    l1, = ax2.plot(epochs, [h["relL2"] for h in history], "g-", label="relL2")
-    l2, = ax2b.plot(epochs, [h["resRMSE"] for h in history], "m--", label="resRMSE")
-    ax2.scatter(best_epoch, history[best_idx]["relL2"],
-                color="gray", s=60, zorder=5, marker="o",
-                label=f"best (epoch {best_epoch})")
-    ax2.set_xlabel("epoch")
+    l1, = ax2.plot(steps, [h["relL2"] for h in history], "g-", label="relL2")
+    l2, = ax2b.plot(steps, [h["resRMSE"] for h in history], "m--", label="resRMSE")
+    ax2.set_xlabel("step (Adam epoch → L-BFGS end)")
     ax2.set_ylabel("relL2")
     ax2b.set_ylabel("resRMSE")
-    handles = [l1, l2, ax2.collections[0]] if ax2.collections else [l1, l2]
-    ax2.legend(handles=handles, loc="upper right", fontsize="small")
+    ax2.legend(handles=[l1, l2], loc="upper right", fontsize="small")
     ax2.grid(True, alpha=0.3)
-    ax2.set_title("Validation metrics (monitoring only)")
+    ax2.set_title("Grid metrics (monitoring only)")
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(path), dpi=dpi, bbox_inches="tight")
@@ -754,44 +755,79 @@ def parse_args():
                    help="evaluation grid size (training is mesh-free and "
                         "independent of N)")
     # training
-    p.add_argument("--epochs", type=int, default=5000)
-    p.add_argument("--n-int", type=int, default=1024,
-                   help="interior collocation points per epoch")
-    p.add_argument("--n-bnd", type=int, default=256,
-                   help="boundary collocation points per epoch")
+    p.add_argument("--epochs", type=int, default=5000,
+                   help="Adam warm-up epochs (full-batch on the fixed points)")
+    p.add_argument("--n-int", type=int, default=10000,
+                   help="interior collocation points (fixed LHS; Raissi Burgers N_f)")
+    p.add_argument("--n-bnd", type=int, default=100,
+                   help="boundary collocation points (fixed LHS; Raissi Burgers N_u)")
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--bc-weight", type=float, default=50.0,
-                   help="boundary loss weight (higher = stronger BC enforcement)")
-    p.add_argument("--eval-every", type=int, default=500)
-    # model
-    p.add_argument("--hidden-dim", type=int, default=64)
-    p.add_argument("--n-layers", type=int, default=4)
-    # L-BFGS
-    p.add_argument("--lbfgs-epochs", type=int, default=100,
-                   help="L-BFGS fine-tuning steps (0 to skip)")
+    p.add_argument("--bc-weight", type=float, default=1.0,
+                   help="boundary loss weight (Raissi: equal-weight MSE_f+MSE_u = 1)")
+    p.add_argument("--eval-every", type=int, default=500,
+                   help="monitoring cadence (Adam); does not affect the model")
+    # model (Raissi Burgers architecture: 8 hidden layers x 20, Tanh)
+    p.add_argument("--hidden-dim", type=int, default=20)
+    p.add_argument("--n-layers", type=int, default=8)
+    # L-BFGS (single run to convergence)
+    p.add_argument("--lbfgs-iters", type=int, default=50000,
+                   help="L-BFGS max iterations for the single to-convergence run "
+                        "(tolerances stop it earlier; 0 to skip)")
     # system
     p.add_argument("--device", default="auto")
-    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--seed", type=int, default=1234,
+                   help="picks the a(x,y) Fourier field AND the LHS points; "
+                        "part of the checkpoint key")
     # output
     p.add_argument("--retrain", action="store_true",
                    help="force retraining even if a matching checkpoint exists")
     p.add_argument("--no-plot", action="store_true")
 
-    return p.parse_args()
+    args = p.parse_args()
+    if args.epochs < 1 and args.lbfgs_iters < 1:
+        p.error("nothing to train: need --epochs >= 1 or --lbfgs-iters >= 1")
+    if args.epochs < 0:
+        p.error("--epochs must be >= 0")
+    if args.lbfgs_iters < 0:
+        p.error("--lbfgs-iters must be >= 0")
+    # strictly-positive structural / cadence params (0 would divide-by-zero in
+    # the eval cadence or build a degenerate grid / network)
+    for name, val in [("--n-int", args.n_int), ("--n-bnd", args.n_bnd),
+                      ("--eval-every", args.eval_every), ("--fourier-m", args.fourier_m),
+                      ("--N", args.N), ("--n-layers", args.n_layers),
+                      ("--hidden-dim", args.hidden_dim)]:
+        if val < 1:
+            p.error(f"{name} must be >= 1")
+    return args
+
+
+def _verify_ckpt_args(ckpt, args, path):
+    """Sanity-check that a reused checkpoint was trained with the same
+    result-affecting parameters. The config-key hash already prevents cross-run
+    collisions, but this catches a hand-edited/renamed checkpoint directory."""
+    saved = ckpt.get("args")
+    if not saved:
+        return
+    mismatched = {k: (saved.get(k), getattr(args, k))
+                  for k in RESULT_AFFECTING_KEYS
+                  if k in saved and saved[k] != getattr(args, k)}
+    if mismatched:
+        raise SystemExit(
+            f"checkpoint {path} was trained with different parameters "
+            f"{mismatched} — refusing to reuse it (use --retrain).")
 
 
 def main():
     args = parse_args()
 
-    ckey = config_key(args.case, args.sigma, args.fourier_m, args.epochs,
-                      args.hidden_dim, args.n_layers, args.bc_weight)
+    ckey = config_key(args)
     paths = resolve_paths(ckey, args.N)
 
     # ---- problem instance: a(x,y) coefficients, independent of N ----
-    coeffs, denom = build_problem_def(args.case, args.sigma, args.fourier_m, args.seed)
+    coeffs, denom = build_problem_def(args.fourier_m, args.seed)
     u_target_fn = ANALYTIC_CASES_TORCH[args.case]
 
-    existing = paths["best_path"] if paths["best_path"].exists() else None
+    existing = paths["last_path"] if paths["last_path"].exists() else None
 
     if existing and not args.retrain:
         print("=" * 60)
@@ -800,10 +836,16 @@ def main():
         print(f"  Skipping training. Use --retrain to force retraining.")
         print("=" * 60)
         ckpt = torch.load(existing, map_location="cpu", weights_only=False)
+        _verify_ckpt_args(ckpt, args, existing)
         model = MLP(hidden_dim=args.hidden_dim, n_layers=args.n_layers)
         model.load_state_dict(ckpt["model_state_dict"])
         model.to(select_device(args.device))
         model.eval()
+        # evaluate on exactly the field the model trained on (stored in ckpt),
+        # not a freshly reseeded one — belt-and-suspenders against any key/seed
+        # drift.
+        if "coeffs" in ckpt and ckpt["coeffs"] is not None:
+            coeffs, denom = ckpt["coeffs"], ckpt["denom"]
     else:
         if args.retrain and existing:
             print(f"⟳ Retraining requested for {paths['config_name']}")
@@ -813,23 +855,28 @@ def main():
         print(f"  Output:       {paths['ckpt_dir']}")
         print("=" * 60)
 
-        model, history, best_val_loss = train(
+        model, history, adam_state, last_state, coeffs, denom = train(
             args, coeffs, denom, u_target_fn,
-            paths["best_path"], paths["last_path"], paths["history_path"],
         )
 
+        # Save both phase-end models directly (no best-by-validation selection):
+        # adam.pt = post-Adam, last.pt = final post-L-BFGS (the one reused).
         paths["last_path"].parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "model_state_dict": model.state_dict(),
-            "args": vars(args),
-        }, paths["last_path"])
-        print(f"saved final: {paths['last_path']}")
+        for path, state in [(paths["adam_path"], adam_state),
+                            (paths["last_path"], last_state)]:
+            torch.save({
+                "model_state_dict": state, "args": vars(args),
+                "coeffs": coeffs, "denom": denom,
+            }, path)
+        print(f"saved: {paths['adam_path'].name} (post-Adam), "
+              f"{paths['last_path'].name} (final)")
 
-        with open(str(paths["history_path"]), "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(history[0].keys()))
-            w.writeheader()
-            w.writerows(history)
-        print(f"saved history: {paths['history_path']}")
+        if history:
+            with open(str(paths["history_path"]), "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+                w.writeheader()
+                w.writerows(history)
+            print(f"saved history: {paths['history_path']}")
 
         if not args.no_plot:
             out_dir = paths["figure_dir"]

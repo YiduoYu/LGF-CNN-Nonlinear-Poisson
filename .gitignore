@@ -21,6 +21,8 @@ report_draft.*
 report.docx
 ~$*.docx
 方案设计.docx
+CNN结合LGF方案3.docx
+纯CNN 方案设计.docx
 
 # last experiments report (local copy from branch)
 Draft/
@@ -35,7 +37,7 @@ run_pinn_vs_cnn.sh
 
 EXPERIMENT_REPORT.md
 PROJECT_HISTORY.md
-
+AGENTS.md
 run_all.log
 
 

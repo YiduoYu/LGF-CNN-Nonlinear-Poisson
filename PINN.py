@@ -246,10 +246,13 @@ def build_problem_def(M, seed):
 
 def build_eval_grid(N, case, sigma, coeffs, denom, device):
     """FD reference (a_grid, u_target_grid, f_grid, g_grid) at grid size N,
-    for a fixed problem instance (coeffs, denom). f is the discrete
+    for a fixed problem instance (coeffs, denom). f is the DISCRETE
     flux-divergence of u_target under a_grid — same discretization
-    Baseline_mms.py's analytic suite uses, so predResRMSE/refResRMSE are
-    directly comparable to the CNN's numbers."""
+    Baseline_mms.py's analytic suite uses, so fdResRMSE/fdRefResRMSE are
+    directly comparable to the CNN's numbers. By construction fdRefResRMSE is
+    ~0 (float32 roundoff): it measures the FD operator applied to the exact
+    solution against its own output, NOT satisfaction of the continuous PDE —
+    for that, see contResRMSE (autodiff residual at independent points)."""
     x_t, y_t, bnd, interior, h = make_grid(N, device)
     xs = np.linspace(-1, 1, N + 2); ys = np.linspace(-1, 1, N + 2)
     xx, yy = np.meshgrid(xs, ys)
@@ -291,6 +294,12 @@ def _get_plt():
 #     checkpoint is re-evaluated at any --N without retraining)
 # ===========================================================================
 
+# Bump whenever the training algorithm or checkpoint format changes in a way
+# that makes old checkpoints non-comparable (sampling scheme, loss, optimizer
+# schedule, stored fields). Part of the config-key hash, so old-format
+# checkpoints land in different directories and can never be silently reused.
+CKPT_VERSION = 2
+
 # Every parameter that changes the PDE instance or the trained weights. --N is
 # excluded (mesh-free) and so are monitoring-only knobs (--eval-every) and
 # runtime flags (--device/--retrain/--no-plot), which do not affect the model.
@@ -308,6 +317,7 @@ def config_key(args) -> str:
               f"_h{args.hidden_dim}_l{args.n_layers}_s{args.seed}")
     payload = {k: getattr(args, k) for k in RESULT_AFFECTING_KEYS}
     payload["denom_grid_n"] = DENOM_GRID_N   # coefficient-field normalization grid
+    payload["ckpt_version"] = CKPT_VERSION   # algorithm/format version
     h = hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:8]
     return f"{prefix}_{h}"
 
@@ -456,7 +466,7 @@ def pinn_loss(model, x_int, y_int, f_int, x_bnd, y_bnd, g_bnd,
 
 @torch.no_grad()
 def _eval_grid_light(model, grid):
-    """Cheap training-monitor metrics (relL2, predResRMSE, bndErr) — no SciPy
+    """Cheap training-monitor metrics (relL2, fdResRMSE, bndErr) — no SciPy
     sparse solve and no constant/linear baselines, since those are independent
     of the network and only belong in the final evaluation (they were being
     recomputed on every periodic monitoring call)."""
@@ -471,7 +481,7 @@ def _eval_grid_light(model, grid):
     res_pred = pde_residual(u_pred, f, a, h)
     return {
         "relL2": float(err_flat.norm(p=2) / u_flat.norm(p=2).clamp_min(1e-12)),
-        "predResRMSE": float(res_pred.pow(2).mean().sqrt()),
+        "fdResRMSE": float(res_pred.pow(2).mean().sqrt()),
         "bndErr": float(((u_pred - g) * boundary).abs().max()),
     }, u_pred
 
@@ -514,8 +524,11 @@ def _eval_grid(model, grid):
         "RMSE": float(err_flat.pow(2).mean().sqrt()),
         "MAE": float(err_flat.abs().mean()),
         "maxError": float(err_flat.abs().max()),
-        "predResRMSE": float(res_pred.pow(2).mean().sqrt()),
-        "refResRMSE": float(res_exact.pow(2).mean().sqrt()),
+        # FD-operator residuals (comparable to the CNN pipeline's numbers).
+        # fdRefResRMSE is ~0 by construction — it does NOT certify the
+        # continuous PDE; contResRMSE (added in main) does.
+        "fdResRMSE": float(res_pred.pow(2).mean().sqrt()),
+        "fdRefResRMSE": float(res_exact.pow(2).mean().sqrt()),
         "bndErr": float(((u_pred - g) * boundary).abs().max()),
         "gradRelL2": float((p_grad - t_grad).norm(p=2)
                             / t_grad.norm(p=2).clamp_min(1e-12)),
@@ -526,6 +539,25 @@ def _eval_grid(model, grid):
                                       / u_flat.norm(p=2).clamp_min(1e-12)),
     }
     return m, u_pred
+
+
+def continuous_residual_rmse(model, coeffs, sigma, denom, u_target_fn,
+                             n_pts, seed, device):
+    """RMS of the CONTINUOUS PDE residual -div(a grad u_pred) - f via autodiff
+    at an independent LHS point set (disjoint seed from training/eval). This is
+    the residual of the PDE the PINN actually trains on; the fd* metrics use
+    the discrete FD operator instead and cannot certify the continuous PDE."""
+    eng = qmc.LatinHypercube(d=2, seed=seed)
+    pts = eng.random(n_pts) * 2.0 - 1.0
+    x = torch.tensor(pts[:, 0:1], dtype=torch.float32, device=device)
+    y = torch.tensor(pts[:, 1:2], dtype=torch.float32, device=device)
+    f = manufactured_forcing(x, y, coeffs, sigma, denom, u_target_fn)
+    xg = x.requires_grad_(True)
+    yg = y.requires_grad_(True)
+    u_pred = model(xg, yg)
+    a = a_field_torch(coeffs, sigma, denom, xg, yg)
+    res = _flux_div_continuous(u_pred, a, xg, yg) - f
+    return float(res.detach().pow(2).mean().sqrt())
 
 
 def save_summary_json(summary, path):
@@ -567,7 +599,7 @@ def train(args, coeffs, denom, u_target_fn):
     print(f"hidden_dim={args.hidden_dim}  n_layers={args.n_layers}  "
           f"lbfgs_iters={args.lbfgs_iters}")
     print(f"{'step':>8s}  {'loss_pde':>10s}  {'loss_bc':>10s}  "
-          f"{'relL2':>10s}  {'resRMSE':>10s}  {'time':>8s}")
+          f"{'relL2':>10s}  {'fdResRMSE':>10s}  {'time':>8s}")
 
     history: list[dict] = []
 
@@ -583,10 +615,10 @@ def train(args, coeffs, denom, u_target_fn):
         vm, _ = _eval_grid_light(model, eval_grid)
         history.append({
             "step": step, "loss_pde": float(lp), "loss_bc": float(lb),
-            "relL2": vm["relL2"], "resRMSE": vm["predResRMSE"], "bmax": vm["bndErr"],
+            "relL2": vm["relL2"], "fdResRMSE": vm["fdResRMSE"], "bmax": vm["bndErr"],
         })
         print(f"{step:8d}  {float(lp):10.3e}  {float(lb):10.3e}  "
-              f"{vm['relL2']:10.3e}  {vm['predResRMSE']:10.3e}  {time.time() - t0:7.1f}s")
+              f"{vm['relL2']:10.3e}  {vm['fdResRMSE']:10.3e}  {time.time() - t0:7.1f}s")
 
     # ---- Adam warm-up (full-batch on the fixed collocation set) ----
     for epoch in range(1, args.epochs + 1):
@@ -612,14 +644,17 @@ def train(args, coeffs, denom, u_target_fn):
     #      evaluation happens once, after step() returns. ----
     if args.lbfgs_iters > 0:
         print(f"\nL-BFGS to convergence (max_iter={args.lbfgs_iters})...")
+        # tolerances sized for float32 (eps ~1.2e-7): tighter values (1e-9/
+        # 1e-11) sit below the float32 gradient-noise floor, so the line
+        # search would grind against numerical noise instead of terminating.
         optimizer_lbfgs = torch.optim.LBFGS(
             model.parameters(),
             lr=1.0,
             max_iter=args.lbfgs_iters,
             max_eval=int(args.lbfgs_iters * 1.25),
             history_size=50,
-            tolerance_grad=1e-9,
-            tolerance_change=1e-11,
+            tolerance_grad=1e-7,
+            tolerance_change=1e-9,
             line_search_fn="strong_wolfe",
         )
 
@@ -634,7 +669,7 @@ def train(args, coeffs, denom, u_target_fn):
         _log(args.epochs + 1)             # one evaluation at the end of L-BFGS
 
     last_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    return model, history, adam_state, last_state, coeffs, denom
+    return model, history, adam_state, last_state
 
 
 # ===========================================================================
@@ -643,7 +678,8 @@ def train(args, coeffs, denom, u_target_fn):
 
 def _save_panel(u_true, u_pred, error, f_map, res_pred, res_exact,
                 path, title, full_ext, resid_ext, dpi=200):
-    """2x3 panel: true u | PINN pred | error || forcing | pred residual | exact residual."""
+    """2x3 panel: true u | PINN pred | error || forcing | pred FD residual |
+    ref FD residual (floor)."""
     plt = _get_plt()
 
     def _sym(v):
@@ -664,8 +700,8 @@ def _save_panel(u_true, u_pred, error, f_map, res_pred, res_exact,
         (0, 1, u_pred,     "PINN prediction",            "viridis",  full_ext,  u_min, u_max),
         (0, 2, error,      "signed error",               "coolwarm", full_ext,  *err_lim),
         (1, 0, f_map,      "forcing f",                  "coolwarm", full_ext,  *_sym(f_map)),
-        (1, 1, res_pred,   "pred PDE residual",          "coolwarm", resid_ext, -r_max, r_max),
-        (1, 2, res_exact,  "exact PDE residual (floor)", "coolwarm", resid_ext, -r_max, r_max),
+        (1, 1, res_pred,   "pred FD residual",           "coolwarm", resid_ext, -r_max, r_max),
+        (1, 2, res_exact,  "ref FD residual (floor)",    "coolwarm", resid_ext, -r_max, r_max),
     ]
     for r, c, vals, lbl, cmap, ext, v0, v1 in panels:
         ax = axes[r][c]
@@ -701,7 +737,7 @@ def _save_centerline(ue, up, path, title, dpi=150):
 
 
 def _save_training_curve(history, path, title, dpi=150):
-    """2-panel training curve: PDE/BC loss (log) | relL2 + resRMSE. Monitoring
+    """2-panel training curve: PDE/BC loss (log) | relL2 + fdResRMSE. Monitoring
     only — the final model is the converged L-BFGS model, not a selected best,
     so there is no best-checkpoint marker."""
     if len(history) < 2:
@@ -724,10 +760,10 @@ def _save_training_curve(history, path, title, dpi=150):
 
     ax2b = ax2.twinx()
     l1, = ax2.plot(steps, [h["relL2"] for h in history], "g-", label="relL2")
-    l2, = ax2b.plot(steps, [h["resRMSE"] for h in history], "m--", label="resRMSE")
+    l2, = ax2b.plot(steps, [h["fdResRMSE"] for h in history], "m--", label="fdResRMSE")
     ax2.set_xlabel("step (Adam epoch → L-BFGS end)")
     ax2.set_ylabel("relL2")
-    ax2b.set_ylabel("resRMSE")
+    ax2b.set_ylabel("fdResRMSE")
     ax2.legend(handles=[l1, l2], loc="upper right", fontsize="small")
     ax2.grid(True, alpha=0.3)
     ax2.set_title("Grid metrics (monitoring only)")
@@ -769,8 +805,9 @@ def parse_args():
     # model (Raissi Burgers architecture: 8 hidden layers x 20, Tanh)
     p.add_argument("--hidden-dim", type=int, default=20)
     p.add_argument("--n-layers", type=int, default=8)
-    # L-BFGS (single run to convergence)
-    p.add_argument("--lbfgs-iters", type=int, default=50000,
+    # L-BFGS (single run to convergence; cap sized for float32 — with eps
+    # ~1.2e-7 progress stalls long before 50k iterations would be useful)
+    p.add_argument("--lbfgs-iters", type=int, default=3000,
                    help="L-BFGS max iterations for the single to-convergence run "
                         "(tolerances stop it earlier; 0 to skip)")
     # system
@@ -792,12 +829,24 @@ def parse_args():
         p.error("--lbfgs-iters must be >= 0")
     # strictly-positive structural / cadence params (0 would divide-by-zero in
     # the eval cadence or build a degenerate grid / network)
-    for name, val in [("--n-int", args.n_int), ("--n-bnd", args.n_bnd),
+    for name, val in [("--n-int", args.n_int),
                       ("--eval-every", args.eval_every), ("--fourier-m", args.fourier_m),
                       ("--N", args.N), ("--n-layers", args.n_layers),
                       ("--hidden-dim", args.hidden_dim)]:
         if val < 1:
             p.error(f"{name} must be >= 1")
+    if args.n_bnd < 4:
+        p.error("--n-bnd must be >= 4 (at least one point per edge)")
+    # float params: finite, and signs that keep the objective bounded below
+    for name, val in [("--sigma", args.sigma), ("--lr", args.lr),
+                      ("--bc-weight", args.bc_weight)]:
+        if not math.isfinite(val):
+            p.error(f"{name} must be finite, got {val}")
+    if args.lr <= 0:
+        p.error("--lr must be > 0")
+    if args.bc_weight < 0:
+        p.error("--bc-weight must be >= 0 (negative would reward boundary "
+                "violation and unbound the objective)")
     return args
 
 
@@ -805,12 +854,23 @@ def _verify_ckpt_args(ckpt, args, path):
     """Sanity-check that a reused checkpoint was trained with the same
     result-affecting parameters. The config-key hash already prevents cross-run
     collisions, but this catches a hand-edited/renamed checkpoint directory."""
+    if ckpt.get("ckpt_version") != CKPT_VERSION:
+        raise SystemExit(
+            f"checkpoint {path} has version {ckpt.get('ckpt_version')!r}, "
+            f"expected {CKPT_VERSION} — trained by a different implementation; "
+            f"refusing to reuse it (use --retrain).")
     saved = ckpt.get("args")
     if not saved:
-        return
-    mismatched = {k: (saved.get(k), getattr(args, k))
+        raise SystemExit(f"checkpoint {path} has no saved args — refusing to "
+                         f"reuse it (use --retrain).")
+    missing = [k for k in RESULT_AFFECTING_KEYS if k not in saved]
+    if missing:
+        raise SystemExit(
+            f"checkpoint {path} is missing result-affecting args {missing} — "
+            f"refusing to reuse it (use --retrain).")
+    mismatched = {k: (saved[k], getattr(args, k))
                   for k in RESULT_AFFECTING_KEYS
-                  if k in saved and saved[k] != getattr(args, k)}
+                  if saved[k] != getattr(args, k)}
     if mismatched:
         raise SystemExit(
             f"checkpoint {path} was trained with different parameters "
@@ -833,9 +893,12 @@ def main():
         print("=" * 60)
         print(f"  PINN Config:  {paths['config_name']}")
         print(f"  ✓ Found trained model: {existing}")
-        print(f"  Skipping training. Use --retrain to force retraining.")
+        print("  Skipping training. Use --retrain to force retraining.")
         print("=" * 60)
-        ckpt = torch.load(existing, map_location="cpu", weights_only=False)
+        # weights_only=True: checkpoints are then plain tensors/primitives, so
+        # loading cannot execute arbitrary pickled code (coeffs are stored as a
+        # tensor for exactly this reason).
+        ckpt = torch.load(existing, map_location="cpu", weights_only=True)
         _verify_ckpt_args(ckpt, args, existing)
         model = MLP(hidden_dim=args.hidden_dim, n_layers=args.n_layers)
         model.load_state_dict(ckpt["model_state_dict"])
@@ -844,8 +907,8 @@ def main():
         # evaluate on exactly the field the model trained on (stored in ckpt),
         # not a freshly reseeded one — belt-and-suspenders against any key/seed
         # drift.
-        if "coeffs" in ckpt and ckpt["coeffs"] is not None:
-            coeffs, denom = ckpt["coeffs"], ckpt["denom"]
+        coeffs = ckpt["coeffs"].numpy().astype(np.float64)
+        denom = float(ckpt["denom"])
     else:
         if args.retrain and existing:
             print(f"⟳ Retraining requested for {paths['config_name']}")
@@ -855,7 +918,7 @@ def main():
         print(f"  Output:       {paths['ckpt_dir']}")
         print("=" * 60)
 
-        model, history, adam_state, last_state, coeffs, denom = train(
+        model, history, adam_state, last_state = train(
             args, coeffs, denom, u_target_fn,
         )
 
@@ -866,7 +929,11 @@ def main():
                             (paths["last_path"], last_state)]:
             torch.save({
                 "model_state_dict": state, "args": vars(args),
-                "coeffs": coeffs, "denom": denom,
+                "ckpt_version": CKPT_VERSION,
+                # tensor (not numpy) so the checkpoint round-trips under
+                # torch.load(weights_only=True)
+                "coeffs": torch.from_numpy(np.ascontiguousarray(coeffs)),
+                "denom": float(denom),
             }, path)
         print(f"saved: {paths['adam_path'].name} (post-Adam), "
               f"{paths['last_path'].name} (final)")
@@ -893,6 +960,11 @@ def main():
         metrics, u_pred = _eval_grid(model, eval_grid)
     solve_time = time.time() - t0
     metrics["solve_time_sec"] = solve_time
+    # continuous autodiff residual at independent points (needs grad, so
+    # outside the no_grad block; disjoint seed from the training/LHS sets)
+    metrics["contResRMSE"] = continuous_residual_rmse(
+        model, coeffs, args.sigma, denom, u_target_fn,
+        args.n_int, args.seed + 20_000, device)
 
     print(f"\nFinal metrics (N={args.N} grid, {solve_time:.1f}s):")
     for k in sorted(metrics.keys()):
@@ -929,8 +1001,8 @@ def main():
         title = (f"PINN {args.case} sigma={args.sigma:g} N={args.N} | "
                  f"relL2={metrics['relL2']:.3e}  "
                  f"maxErr={metrics['maxError']:.3e}  "
-                 f"resRMSE={metrics['predResRMSE']:.3e}  "
-                 f"refResRMSE={metrics['refResRMSE']:.3e}")
+                 f"fdResRMSE={metrics['fdResRMSE']:.3e}  "
+                 f"contResRMSE={metrics['contResRMSE']:.3e}")
 
         _save_panel(ui, up, err, eval_grid["f_grid"][0, 0], res_pred, res_exact,
                     out / "pinn_panel.png", title, full_ext, resid_ext)

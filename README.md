@@ -135,6 +135,13 @@ python Baseline_solver.py --predict --predict-from checkpoints/cnn/<key>/best.pt
 | `--retrain` | False | 覆盖已有 checkpoint |
 | `--mms-sanity`（mms）/ `--sanity`（solver） | False | 数据 + LGF 核函数库正确性预检后退出 |
 
+### `Baseline_solver.py` 独有
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--f-scale` | 6.0 | 随机 forcing `f` 的幅度 |
+| `--g-base` / `--g-scale` | 0.0 / 0.6 | 随机 Dirichlet 边界 `g` 的偏移/幅度（`u` 可带符号，不需要抬高边界） |
+
 ---
 
 ## 评估指标（逐样本计算再汇总，两条管线一致）
@@ -163,20 +170,39 @@ python Baseline_solver.py --predict --predict-from checkpoints/cnn/<key>/best.pt
   全部有限值且训练前后逐位不变、常数系数场下多核插值退化为单核响应（`--mms-sanity
   --model lgf` / `--sanity --model lgf` 会跑这两项）
 - **LGF 诊断按需计算**：`LGFNet.forward(collect_diagnostics=...)` 默认不算逐步
-  残差 trace（训练时的默认路径），只有 `evaluate()`/预测显式要看 trace 才算，且
-  trace 全程留在 device tensor 上、循环结束后才做一次 `.cpu()` 转换，避免污染
-  计时区间
+  残差 trace（训练时的默认路径，`train_one_epoch` 从不传 `return_diagnostics`）。
+  `evaluate()`/预测显式要看 trace 时，trace 在 T 步循环内留在 device tensor 上
+  （不逐步 `.item()`），循环结束后才一次性转换——**但这只是省掉了 T 次 host 同步**，
+  trace 本身的归约计算仍然算在 `_time_forward()` 计时区间内，所以 LGFNet 打开
+  diagnostics 时报告的 `cnn_ms_per_sample` 是"推理 + 诊断"而不是纯推理耗时；
+  `run_prediction()` 打印这行时会附一句 `(incl. per-step residual diagnostics)`
+  提醒这一点
 - **checkpoint key 防碰撞**：`ckpt_key()` 在可读的超参数字符串后面加一段
   `seed/lr/weight_decay/batch_size/val_samples/eval_every/grad_clip` 的 md5
   短哈希，这些参数变了不会误用别的 run 的 checkpoint 目录；`model_type` 字段
-  防止 mms/solver checkpoint 混用
+  （`cnn_mms` / `cnn`）防止 mms/solver checkpoint 混用
 - **训练/评估共享的辅助函数**：`create_model`/`create_optimizer`/`compute_loss`/
   `train_one_epoch`/`validate_and_checkpoint` 把训练循环拆成职责单一的小函数，
-  `--model cnn`/`--model lgf` 都走同一套；linear baseline 只在验证/预测/解析
-  测试第一次需要时惰性计算并缓存（`ensure_linear_baselines`），训练集从不计算
+  `--model cnn`/`--model lgf` 都走同一套；linear baseline 只在验证/预测/测试
+  套件第一次需要时惰性计算并缓存（`ensure_linear_baselines`），训练集从不读取
+  因此从不计算
+- **两条测试套件的含义不同**：MMS 的 `--predict-case analytic` 是**连续精度**
+  检验（`u_target` 直接就是 `u_ref`，oracle 残差在 float64 下是机器精度）；
+  solver 的 `--predict-case fixed-solver` 只是**离散一致性**检验——`u_target`
+  通过离散 flux 算子造出 `f,g`，再用稀疏求解器重新解出 `u_ref`，检查的是 torch
+  算子和 scipy 矩阵组装是否一致，并不测连续 PDE 的离散化误差本身（`solver_info`
+  里的 `target_vs_solver_ref_relL2` 超过 `1e-8` 会打印 WARNING）；两边用的原始
+  测试函数公式相同（sin/cos、多项式等），但含义不能混为一谈
+- **绘图/CSV/JSON 输出共用**：单样本的 panel + centerline 图（`_save_sample_figures`）、
+  逐样本 CSV（`_write_csv`）、汇总 JSON（`summarize_rows`）在 `Baseline_core.py`
+  里各只有一份实现，`--predict`、analytic 套件、fixed-solver 套件都调用同一套，
+  不会有三份互相漂移的绘图代码
 - **float64 数据管线**：数据生成与参考残差在 float64 计算，训练存 float32
 - **难度轴 sigma**：`sigma=0` 退化为常系数 Poisson（sanity check）；`sigma` 越大
   系数对比度 `exp(2*sigma)` 越大，问题越难
+- **显式全量重新导出**：两个入口脚本用 `from Baseline_core import (...)` 显式列出
+  完整的共享符号（哪怕脚本本身不直接调用），保证 `import Baseline_mms;
+  Baseline_mms.SimpleCNN(...)` 这类重构前的直接引用方式仍然可用
 
 ---
 

@@ -670,6 +670,27 @@ def _save_panel(u_true, u_pred, error, f_map, res_pred, res_exact,
     plt.close(fig)
 
 
+def _save_centerline(ue, up, path, title, dpi=150):
+    """1D cut along y≈0: u_ref vs u_pred."""
+    plt = _get_plt()
+
+    H, W = ue.shape[-2:]
+    iy = H // 2                       # grid row closest to y = 0
+    xs = np.linspace(-1., 1., W)
+    y_val = np.linspace(-1., 1., H)[iy]
+
+    fig, ax = plt.subplots(figsize=(7, 4.5), constrained_layout=True)
+    ax.plot(xs, ue[iy].detach().cpu().numpy(), "b-", label="u_ref")
+    ax.plot(xs, up[iy].detach().cpu().numpy(), "r--", label="u_pred")
+    ax.set_xlabel("x"); ax.set_ylabel("u")
+    ax.set_title(f"{title}  (centerline y={y_val:.3f})")
+    ax.grid(True, alpha=.3); ax.legend()
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _save_training_curve(history, path, title, dpi=150):
     """2-panel training curve: losses (log) | relL2 + resRMSE with best checkpoint."""
     if len(history) < 2:
@@ -866,7 +887,8 @@ def main():
 
         _save_panel(ui, up, err, eval_grid["f_grid"][0, 0], res_pred, res_exact,
                     out / "pinn_panel.png", title, full_ext, resid_ext)
-        print(f"saved panel: {out}")
+        _save_centerline(ui, up, out / "pinn_centerline.png", title)
+        print(f"saved panel + centerline: {out}")
 
     print(f"\nDone. Config: {paths['config_name']}")
     print(f"Checkpoints: {paths['ckpt_dir']}")

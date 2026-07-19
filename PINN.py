@@ -588,11 +588,28 @@ def train(args, coeffs, denom, u_target_fn, best_path, last_path, history_path):
                 val_loss = validation_loss(model, xv_int, yv_int, xv_bnd, yv_bnd,
                                            coeffs, args.sigma, denom, u_target_fn,
                                            args.bc_weight)
+                _, cur_loss_pde, cur_loss_bc = pinn_loss(
+                    model, x_int, y_int, x_bnd, y_bnd, coeffs, args.sigma, denom,
+                    u_target_fn, args.bc_weight,
+                )
                 elapsed = time.time() - t0
                 print(f"  lbfgs {i+1:4d}  loss={float(loss_lbfgs):.3e}  "
                       f"val_loss={val_loss:.3e}  "
                       f"relL2={vm['relL2']:.3e}  resRMSE={vm['predResRMSE']:.3e}  "
                       f"bndErr={vm['bndErr']:.3e}  {elapsed:.0f}s")
+
+                # numeric epoch (continues the Adam-phase axis) so the training
+                # curve stays on a single numeric x-axis instead of mixing in
+                # string labels, which forces matplotlib to treat epoch as
+                # categorical and garbles the tick labels.
+                history.append({
+                    "epoch": args.epochs + i + 1,
+                    "loss_pde": float(cur_loss_pde), "loss_bc": float(cur_loss_bc),
+                    "val_loss": val_loss,
+                    "relL2": vm["relL2"],
+                    "resRMSE": vm["predResRMSE"],
+                    "bmax": vm["bndErr"],
+                })
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -603,14 +620,6 @@ def train(args, coeffs, denom, u_target_fn, best_path, last_path, history_path):
                         "args": vars(args),
                         "best_val_loss": best_val_loss,
                     }, best_path)
-                    history.append({
-                        "epoch": f"lbfgs_{i+1}",
-                        "loss_pde": 0, "loss_bc": 0,
-                        "val_loss": val_loss,
-                        "relL2": vm["relL2"],
-                        "resRMSE": vm["predResRMSE"],
-                        "bmax": vm["bndErr"],
-                    })
 
         if best_state is not None:
             model.load_state_dict(best_state)

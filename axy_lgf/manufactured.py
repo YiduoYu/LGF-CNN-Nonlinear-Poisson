@@ -8,7 +8,7 @@ from typing import Callable
 
 import numpy as np
 
-from .grid import SquareGrid
+from .grid import DEFAULT_DOMAIN_MAX, DEFAULT_DOMAIN_MIN, SquareGrid
 from .operators import apply_div_a_grad
 
 
@@ -26,50 +26,86 @@ class ManufacturedProblem:
     u_fn: ArrayFn
 
 
-def _a_smooth(x: np.ndarray, y: np.ndarray, L: float = 1.0) -> np.ndarray:
+def _normalized(
+    x: np.ndarray,
+    y: np.ndarray,
+    x_min: float,
+    x_max: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    length = x_max - x_min
+    return (x - x_min) / length, (y - x_min) / length, length
+
+
+def _a_smooth(
+    x: np.ndarray,
+    y: np.ndarray,
+    x_min: float = DEFAULT_DOMAIN_MIN,
+    x_max: float = DEFAULT_DOMAIN_MAX,
+) -> np.ndarray:
     """Smooth positive diffusivity."""
-    return 1.0 + 0.5 * np.sin(2.0 * np.pi * x / L) * np.cos(2.0 * np.pi * y / L)
+    xi, yi, _ = _normalized(x, y, x_min, x_max)
+    return 1.0 + 0.5 * np.sin(2.0 * np.pi * xi) * np.cos(2.0 * np.pi * yi)
 
 
-def _a_mild(x: np.ndarray, y: np.ndarray, L: float = 1.0) -> np.ndarray:
+def _a_mild(
+    x: np.ndarray,
+    y: np.ndarray,
+    x_min: float = DEFAULT_DOMAIN_MIN,
+    x_max: float = DEFAULT_DOMAIN_MAX,
+) -> np.ndarray:
     """Milder contrast for easy first tests."""
-    return 1.0 + 0.2 * np.sin(np.pi * x / L) * np.sin(np.pi * y / L)
+    xi, yi, _ = _normalized(x, y, x_min, x_max)
+    return 1.0 + 0.2 * np.sin(np.pi * xi) * np.sin(np.pi * yi)
 
 
-def _u_sine(x: np.ndarray, y: np.ndarray, L: float = 1.0) -> np.ndarray:
+def _u_sine(
+    x: np.ndarray,
+    y: np.ndarray,
+    x_min: float = DEFAULT_DOMAIN_MIN,
+    x_max: float = DEFAULT_DOMAIN_MAX,
+) -> np.ndarray:
     """Homogeneous Dirichlet manufactured solution."""
-    return np.sin(np.pi * x / L) * np.sin(np.pi * y / L)
+    xi, yi, _ = _normalized(x, y, x_min, x_max)
+    return np.sin(np.pi * xi) * np.sin(np.pi * yi)
 
 
-def _u_sine2(x: np.ndarray, y: np.ndarray, L: float = 1.0) -> np.ndarray:
-    return np.sin(2.0 * np.pi * x / L) * np.sin(np.pi * y / L)
+def _u_sine2(
+    x: np.ndarray,
+    y: np.ndarray,
+    x_min: float = DEFAULT_DOMAIN_MIN,
+    x_max: float = DEFAULT_DOMAIN_MAX,
+) -> np.ndarray:
+    xi, yi, _ = _normalized(x, y, x_min, x_max)
+    return np.sin(2.0 * np.pi * xi) * np.sin(np.pi * yi)
 
 
 def _forcing_analytic_smooth_sine(
     x: np.ndarray,
     y: np.ndarray,
-    L: float = 1.0,
+    x_min: float = DEFAULT_DOMAIN_MIN,
+    x_max: float = DEFAULT_DOMAIN_MAX,
 ) -> np.ndarray:
     """Analytic f = -div(a grad u) for a=_a_smooth, u=_u_sine.
 
-    u = sin(pi x/L) sin(pi y/L)
-    a = 1 + 0.5 sin(2 pi x/L) cos(2 pi y/L)
+    u = sin(pi xi) sin(pi yi)
+    a = 1 + 0.5 sin(2 pi xi) cos(2 pi yi)
 
     Computed from expanded divergence form:
       f = -a Delta u - grad a · grad u
     """
-    k = np.pi / L
-    u = np.sin(k * x) * np.sin(k * y)
-    a = _a_smooth(x, y, L)
+    xi, yi, length = _normalized(x, y, x_min, x_max)
+    k = np.pi / length
+    u = np.sin(np.pi * xi) * np.sin(np.pi * yi)
+    a = _a_smooth(x, y, x_min, x_max)
 
-    # Delta u = -2 (pi/L)^2 u
+    # Delta u = -2 (pi/domain_length)^2 u
     lap_u = -2.0 * k**2 * u
 
-    ux = k * np.cos(k * x) * np.sin(k * y)
-    uy = k * np.sin(k * x) * np.cos(k * y)
+    ux = k * np.cos(np.pi * xi) * np.sin(np.pi * yi)
+    uy = k * np.sin(np.pi * xi) * np.cos(np.pi * yi)
 
-    ax = k * np.cos(2.0 * k * x) * np.cos(2.0 * k * y)
-    ay = -k * np.sin(2.0 * k * x) * np.sin(2.0 * k * y)
+    ax = k * np.cos(2.0 * np.pi * xi) * np.cos(2.0 * np.pi * yi)
+    ay = -k * np.sin(2.0 * np.pi * xi) * np.sin(2.0 * np.pi * yi)
 
     # -div(a grad u) = -a lap u - grad a · grad u
     return -a * lap_u - (ax * ux + ay * uy)
@@ -85,7 +121,8 @@ PROBLEMS = {
 def make_problem(
     name: str = "smooth_sine",
     n: int = 63,
-    L: float = 1.0,
+    x_min: float = DEFAULT_DOMAIN_MIN,
+    x_max: float = DEFAULT_DOMAIN_MAX,
     forcing: str | None = None,
 ) -> ManufacturedProblem:
     """Build a manufactured problem on an n x n interior grid.
@@ -101,17 +138,22 @@ def make_problem(
     a_base, u_base, default_forcing = PROBLEMS[name]
     mode = default_forcing if forcing is None else forcing
 
-    grid = SquareGrid(n=n, L=L)
+    grid = SquareGrid(n=n, x_min=x_min, x_max=x_max)
     X, Y = grid.mesh()
-    a_fn: ArrayFn = partial(a_base, L=L)
-    u_fn: ArrayFn = partial(u_base, L=L)
+    a_fn: ArrayFn = partial(a_base, x_min=x_min, x_max=x_max)
+    u_fn: ArrayFn = partial(u_base, x_min=x_min, x_max=x_max)
     a = a_fn(X, Y)
     u_exact = u_fn(X, Y)
 
     if mode == "analytic":
         if name != "smooth_sine":
             raise ValueError(f"No analytic forcing for problem {name!r}")
-        f = _forcing_analytic_smooth_sine(X, Y, L=L)
+        f = _forcing_analytic_smooth_sine(
+            X,
+            Y,
+            x_min=x_min,
+            x_max=x_max,
+        )
     elif mode == "discrete":
         f = apply_div_a_grad(u_exact, a, grid)
     else:

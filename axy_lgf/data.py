@@ -39,6 +39,8 @@ def sample_coefficient(
     _validate_contrast(contrast)
     rng = np.random.default_rng() if rng is None else rng
     X, Y = grid.mesh()
+    xi = (X - grid.x_min) / grid.L
+    yi = (Y - grid.x_min) / grid.L
     a = np.empty((batch_size, grid.n, grid.n), dtype=np.float64)
     for b in range(batch_size):
         field = np.zeros_like(X)
@@ -50,8 +52,8 @@ def sample_coefficient(
             amp = rng.uniform(0.3, 1.0)
             field += (
                 amp
-                * np.sin(2.0 * np.pi * px * X / grid.L + phase)
-                * np.cos(2.0 * np.pi * py * Y / grid.L)
+                * np.sin(2.0 * np.pi * px * xi + phase)
+                * np.cos(2.0 * np.pi * py * yi)
             )
         field = field / (np.max(np.abs(field)) + 1e-14)
         a[b] = np.maximum(1.0 + contrast * field, MIN_COEFFICIENT)
@@ -67,6 +69,8 @@ def sample_solution(
     _validate_batch_size(batch_size)
     rng = np.random.default_rng() if rng is None else rng
     X, Y = grid.mesh()
+    xi = (X - grid.x_min) / grid.L
+    yi = (Y - grid.x_min) / grid.L
     u = np.zeros((batch_size, grid.n, grid.n), dtype=np.float64)
     for b in range(batch_size):
         nmodes = int(rng.integers(1, 4))
@@ -74,9 +78,7 @@ def sample_solution(
             px = int(rng.integers(1, 4))
             py = int(rng.integers(1, 4))
             amp = rng.normal(scale=1.0)
-            u[b] += (
-                amp * np.sin(px * np.pi * X / grid.L) * np.sin(py * np.pi * Y / grid.L)
-            )
+            u[b] += amp * np.sin(px * np.pi * xi) * np.sin(py * np.pi * yi)
     return u
 
 

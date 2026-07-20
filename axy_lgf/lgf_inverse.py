@@ -1,7 +1,7 @@
 """
 Dirichlet lattice Green's function inverse on a rectangle via DST-I.
 
-On Omega = (0, L)^2 with homogeneous Dirichlet BC, the discrete inverse of
+On a configurable square with homogeneous Dirichlet BC, the discrete inverse of
 
     -a0 * Delta_h + sigma * I
 

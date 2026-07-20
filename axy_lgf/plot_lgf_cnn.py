@@ -71,7 +71,12 @@ def run_with_intermediates(
 
 def _extent(grid: SquareGrid) -> list[float]:
     h = grid.h
-    return [0.5 * h, grid.L - 0.5 * h, 0.5 * h, grid.L - 0.5 * h]
+    return [
+        grid.x_min + 0.5 * h,
+        grid.x_max - 0.5 * h,
+        grid.x_min + 0.5 * h,
+        grid.x_max - 0.5 * h,
+    ]
 
 
 def _imshow(ax, field, extent, title, cmap="viridis", vmin=None, vmax=None):
@@ -345,7 +350,13 @@ def main() -> None:
     plot_alpha_mean_bars(args.outdir / "heldout_alpha_means.png", info)
 
     # --- Manufactured smooth_sine ---
-    prob = make_problem("smooth_sine", n=grid.n, forcing="discrete")
+    prob = make_problem(
+        "smooth_sine",
+        n=grid.n,
+        x_min=grid.x_min,
+        x_max=grid.x_max,
+        forcing="discrete",
+    )
     a_t = torch.as_tensor(prob.a[None], dtype=torch.float64, device=device)
     f_t = torch.as_tensor(prob.f[None], dtype=torch.float64, device=device)
     info = run_with_intermediates(model, a_t, f_t)

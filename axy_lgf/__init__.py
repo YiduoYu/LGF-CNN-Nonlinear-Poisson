@@ -2,7 +2,7 @@
 axy_lgf: variable-coefficient elliptic solver on a rectangle via LGF/DST.
 
 Solves
-    -div(a(x,y) grad u) = f    in Omega = (0, L)^2
+    -div(a(x,y) grad u) = f    in Omega = (x_min, x_max)^2
     u = 0                      on the boundary of Omega
 
 using a discrete Dirichlet Green's function (DST) as the LGF inverse

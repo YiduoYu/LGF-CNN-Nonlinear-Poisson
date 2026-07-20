@@ -5,6 +5,8 @@ Usage:
     python -m axy_lgf.train_lgf_cnn
     python -m axy_lgf.train_lgf_cnn --epochs 100 --n 31 --K 6
     python -m axy_lgf.train_lgf_cnn --data-kind solver
+    python -m axy_lgf.train_lgf_cnn --loss-mode supervised
+    python -m axy_lgf.train_lgf_cnn --loss-mode physics
     python -m axy_lgf.train_lgf_cnn --predict \
         --predict-from axy_lgf/checkpoints/lgf_cnn_axy/<key>/best.pt
 
@@ -23,30 +25,42 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import hashlib
 import json
 import math
+import os
+import shutil
 import time
+from contextlib import contextmanager
 from dataclasses import asdict
+from numbers import Integral
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from .data import make_batch, sample_coefficient
-from .grid import SquareGrid
+from .grid import DEFAULT_DOMAIN_MAX, DEFAULT_DOMAIN_MIN, SquareGrid
 from .lgf_cnn import LGFCNN, LGFCNNTrainConfig
 from .operators import apply_div_a_grad, l2_norm
 from .manufactured import make_problem
 from .solvers import solve_axy_pcg, solve_axy_richardson
 
 MODEL_TYPE = "lgf_cnn_axy"
+CHECKPOINT_FORMAT_VERSION = 3
+EXPERIMENT_VERSION = 3
+PROJECT_DIR = Path(__file__).resolve().parent
+RUN_ARTIFACTS = ("best.pt", "last.pt", "history.csv")
+RUN_MANIFEST = "completed.json"
+MAX_TORCH_SEED = 2**64 - 1
+DEFAULT_PREDICT_OUTPUT_DIR = "results/lgf_cnn_axy/predict"
 
 
 def make_model(cfg: LGFCNNTrainConfig) -> LGFCNN:
     device = torch.device(cfg.device)
     model = LGFCNN(
-        SquareGrid(n=cfg.n),
+        SquareGrid(n=cfg.n, x_min=cfg.domain_min, x_max=cfg.domain_max),
         J=cfg.J,
         K=cfg.K,
         hidden=cfg.hidden,
@@ -74,24 +88,75 @@ def relative_metrics(
     return rel_r, rel_u
 
 
+def training_loss(
+    model: LGFCNN,
+    a: torch.Tensor,
+    f: torch.Tensor,
+    u_exact: torch.Tensor,
+    u_pred: torch.Tensor,
+    loss_mode: str,
+) -> torch.Tensor:
+    """Single training objective: squared discrete L2 solution error or residual."""
+    if loss_mode == "supervised":
+        error = u_pred - u_exact
+    elif loss_mode == "physics":
+        error = model.residual(u_pred, a, f)
+    else:
+        raise ValueError("loss_mode must be 'supervised' or 'physics'")
+    return torch.mean(model.ops.l2_norm(error) ** 2)
+
+
+def _training_config_payload(cfg: LGFCNNTrainConfig) -> dict:
+    """Canonical result-affecting config used for run identity checks."""
+    payload = asdict(cfg)
+    # Runtime placement does not define the trained model. The lambda fields
+    # remain only for loading legacy checkpoints and are not used by training.
+    payload.pop("device", None)
+    payload.pop("lambda_u", None)
+    payload.pop("lambda_r", None)
+    for name in (
+        "n",
+        "J",
+        "K",
+        "hidden",
+        "epochs",
+        "batch_size",
+        "samples_per_epoch",
+        "eval_every",
+        "val_samples",
+        "seed",
+    ):
+        payload[name] = int(payload[name])
+    for name in (
+        "eta_max",
+        "lr",
+        "contrast",
+        "domain_min",
+        "domain_max",
+    ):
+        payload[name] = float(payload[name])
+    payload["experiment_version"] = EXPERIMENT_VERSION
+    return payload
+
+
+def _payload_sha256(payload: dict) -> str:
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
 def experiment_key(cfg: LGFCNNTrainConfig) -> str:
-    """Readable run tag plus a digest of every other training-affecting arg."""
+    """Readable run tag plus a digest of every training-affecting argument."""
     visible = (
-        f"{cfg.data_kind}_n{cfg.n}_J{cfg.J}_K{cfg.K}_h{cfg.hidden}_c{cfg.contrast:g}"
+        f"{cfg.loss_mode}_{cfg.data_kind}_n{cfg.n}_J{cfg.J}_K{cfg.K}_"
+        f"h{cfg.hidden}_c{cfg.contrast:g}_"
+        f"dom{cfg.domain_min:g}to{cfg.domain_max:g}"
     )
-    affecting = (
-        cfg.epochs,
-        cfg.batch_size,
-        cfg.samples_per_epoch,
-        cfg.lr,
-        cfg.eta_max,
-        cfg.lambda_u,
-        cfg.lambda_r,
-        cfg.eval_every,
-        cfg.val_samples,
-        cfg.seed,
-    )
-    digest = hashlib.md5(repr(affecting).encode()).hexdigest()[:8]
+    digest = _payload_sha256(_training_config_payload(cfg))[:12]
     return f"{visible}_{digest}"
 
 
@@ -103,26 +168,62 @@ def save_checkpoint(
     best_metric: float,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "format_version": 2,
-            "model_type": MODEL_TYPE,
-            "config": asdict(cfg),
-            "state_dict": model.state_dict(),
-            "epoch": epoch,
-            "best_metric": best_metric,
-        },
-        path,
-    )
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(
+            {
+                "format_version": CHECKPOINT_FORMAT_VERSION,
+                "experiment_version": EXPERIMENT_VERSION,
+                "model_type": MODEL_TYPE,
+                "config": asdict(cfg),
+                "state_dict": model.state_dict(),
+                "epoch": epoch,
+                "best_metric": best_metric,
+            },
+            temporary,
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def load_model(ckpt_path: Path, device: str) -> tuple[LGFCNN, dict]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    format_version = ckpt.get("format_version", 1)
+    if (
+        type(format_version) is not int
+        or format_version < 1
+        or format_version > CHECKPOINT_FORMAT_VERSION
+    ):
+        raise ValueError(
+            f"unsupported checkpoint format_version={format_version!r}; "
+            f"maximum supported version is {CHECKPOINT_FORMAT_VERSION}"
+        )
+    checkpoint_experiment_version = ckpt.get("experiment_version")
+    invalid_experiment_version = checkpoint_experiment_version is not None and (
+        type(checkpoint_experiment_version) is not int
+        or checkpoint_experiment_version < 1
+        or checkpoint_experiment_version > EXPERIMENT_VERSION
+    )
+    if (format_version >= 3 and checkpoint_experiment_version is None) or (
+        invalid_experiment_version
+    ):
+        raise ValueError(
+            "unsupported checkpoint experiment_version="
+            f"{checkpoint_experiment_version!r}; maximum supported version "
+            f"is {EXPERIMENT_VERSION}"
+        )
     model_type = ckpt.get("model_type")
     # Checkpoints written before MODEL_TYPE existed carry no tag; accept them.
     if model_type is not None and model_type != MODEL_TYPE:
         raise ValueError(f"checkpoint type must be {MODEL_TYPE!r}, got {model_type!r}")
-    cfg = LGFCNNTrainConfig(**{**ckpt["config"], "device": device})
+    saved_config = dict(ckpt["config"])
+    # Checkpoints created before configurable domains used Omega=(0, 1)^2.
+    saved_config.setdefault("domain_min", 0.0)
+    saved_config.setdefault("domain_max", 1.0)
+    # Before pure loss modes were introduced, training used a mixed objective.
+    saved_config.setdefault("loss_mode", "legacy_mixed")
+    cfg = LGFCNNTrainConfig(**{**saved_config, "device": device})
     model = make_model(cfg)
     state_dict = dict(ckpt["state_dict"])
     # Legacy checkpoints registered the same TorchSquareOps module twice and
@@ -131,7 +232,7 @@ def load_model(ckpt_path: Path, device: str) -> tuple[LGFCNN, dict]:
         state_dict.pop(legacy_key, None)
     model.load_state_dict(state_dict)
     model.eval()
-    return model, ckpt["config"]
+    return model, saved_config
 
 
 def _validate_train_config(cfg: LGFCNNTrainConfig) -> None:
@@ -146,13 +247,27 @@ def _validate_train_config(cfg: LGFCNNTrainConfig) -> None:
         "eval_every": cfg.eval_every,
         "val_samples": cfg.val_samples,
     }
+    wrong_types = [
+        name
+        for name, value in positive_ints.items()
+        if not isinstance(value, Integral) or isinstance(value, bool)
+    ]
+    if wrong_types:
+        raise ValueError(f"{', '.join(wrong_types)} must be integers")
     invalid = [name for name, value in positive_ints.items() if value < 1]
     if invalid:
         raise ValueError(f"{', '.join(invalid)} must be positive")
+    if cfg.n < 2:
+        raise ValueError("n must be at least 2")
+    if (
+        not isinstance(cfg.seed, Integral)
+        or isinstance(cfg.seed, bool)
+        or cfg.seed < 0
+        or cfg.seed > MAX_TORCH_SEED
+    ):
+        raise ValueError(f"seed must be an integer in [0, {MAX_TORCH_SEED}]")
     finite_nonnegative = {
         "contrast": cfg.contrast,
-        "lambda_u": cfg.lambda_u,
-        "lambda_r": cfg.lambda_r,
     }
     for name, value in finite_nonnegative.items():
         if not math.isfinite(value) or value < 0.0:
@@ -161,8 +276,18 @@ def _validate_train_config(cfg: LGFCNNTrainConfig) -> None:
         raise ValueError("contrast must lie in [0, 1]")
     if not math.isfinite(cfg.lr) or cfg.lr <= 0.0:
         raise ValueError("lr must be finite and positive")
-    if cfg.lambda_u == 0.0 and cfg.lambda_r == 0.0:
-        raise ValueError("at least one loss weight must be positive")
+    if not math.isfinite(cfg.eta_max) or cfg.eta_max <= 0.0:
+        raise ValueError("eta_max must be finite and positive")
+    if not math.isfinite(cfg.domain_min) or not math.isfinite(cfg.domain_max):
+        raise ValueError("domain bounds must be finite")
+    if cfg.domain_max <= cfg.domain_min:
+        raise ValueError("domain_max must be greater than domain_min")
+    if not math.isfinite(cfg.domain_max - cfg.domain_min):
+        raise ValueError("domain length must be finite")
+    if cfg.loss_mode not in ("supervised", "physics"):
+        raise ValueError("loss_mode must be 'supervised' or 'physics'")
+    if cfg.data_kind not in ("mms", "solver"):
+        raise ValueError("data_kind must be 'mms' or 'solver'")
 
 
 def _batch_sizes(total: int, batch_size: int) -> list[int]:
@@ -186,15 +311,23 @@ def _write_csv(rows: list[dict], path: Path) -> None:
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(
-            [
-                {key: ("" if value is None else value) for key, value in row.items()}
-                for row in rows
-            ]
-        )
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(
+                [
+                    {
+                        key: ("" if value is None else value)
+                        for key, value in row.items()
+                    }
+                    for row in rows
+                ]
+            )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _file_sha256(path: Path) -> str:
@@ -205,15 +338,111 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _write_json_atomic(payload: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w") as file:
+            json.dump(payload, file, indent=2, sort_keys=True)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _completion_payload(cfg: LGFCNNTrainConfig, run_dir: Path) -> dict:
+    return {
+        "experiment_version": EXPERIMENT_VERSION,
+        "config_sha256": _payload_sha256(_training_config_payload(cfg)),
+        "artifacts": {
+            name: _file_sha256(run_dir / name) for name in RUN_ARTIFACTS
+        },
+    }
+
+
+def _run_completion_issue(run_dir: Path, cfg: LGFCNNTrainConfig) -> str | None:
+    manifest_path = run_dir / RUN_MANIFEST
+    if not manifest_path.is_file():
+        return f"{RUN_MANIFEST} is missing"
+    try:
+        with manifest_path.open() as file:
+            manifest = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"{RUN_MANIFEST} cannot be read: {exc}"
+    if manifest.get("experiment_version") != EXPERIMENT_VERSION:
+        return "identity: experiment version does not match the current code"
+    expected_config = _payload_sha256(_training_config_payload(cfg))
+    if manifest.get("config_sha256") != expected_config:
+        return "identity: training configuration digest does not match"
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return "artifact hashes are missing from completed.json"
+    for name in RUN_ARTIFACTS:
+        path = run_dir / name
+        expected_hash = artifacts.get(name)
+        if not path.is_file():
+            return f"{name} is missing"
+        if not isinstance(expected_hash, str) or _file_sha256(path) != expected_hash:
+            return f"{name} does not match completed.json"
+    return None
+
+
+def _promote_attempt(
+    attempt_dir: Path,
+    run_dir: Path,
+    cfg: LGFCNNTrainConfig,
+) -> None:
+    missing = [name for name in RUN_ARTIFACTS if not (attempt_dir / name).is_file()]
+    if missing:
+        raise RuntimeError(f"training attempt is missing: {', '.join(missing)}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # The marker is committed last. Any interruption during promotion therefore
+    # leaves a run that normal execution will refuse to reuse.
+    (run_dir / RUN_MANIFEST).unlink(missing_ok=True)
+    for name in RUN_ARTIFACTS:
+        os.replace(attempt_dir / name, run_dir / name)
+    _write_json_atomic(_completion_payload(cfg, run_dir), run_dir / RUN_MANIFEST)
+
+
+@contextmanager
+def _run_lock(checkpoint_root: Path, run_key: str):
+    """Serialize writers for one experiment; the OS releases the lock on exit."""
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    lock_path = checkpoint_root / f".{run_key}.lock"
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _cleanup_stale_attempts(checkpoint_root: Path, run_key: str) -> None:
+    """Remove orphan attempts left by a process killed without normal cleanup."""
+    prefix = f".{run_key}.attempt-"
+    for path in checkpoint_root.iterdir():
+        if path.name.startswith(prefix) and path.is_dir():
+            shutil.rmtree(path)
+
+
 @torch.no_grad()
 def _validate(
     model: LGFCNN,
     val_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-) -> tuple[float, float]:
+    loss_mode: str,
+) -> tuple[float, float, float, float]:
     model.eval()
     a, f, u_exact = val_batch
-    rel_r, rel_u = relative_metrics(model, a, f, u_exact, model(a, f))
-    return float(rel_r.mean()), float(rel_u.mean())
+    u_pred = model(a, f)
+    rel_r, rel_u = relative_metrics(model, a, f, u_exact, u_pred)
+    loss = training_loss(model, a, f, u_exact, u_pred, loss_mode)
+    residual = model.residual(u_pred, a, f)
+    fd_res_rmse = torch.sqrt(torch.mean(residual**2))
+    return (
+        float(loss),
+        float(rel_r.mean()),
+        float(rel_u.mean()),
+        float(fd_res_rmse),
+    )
 
 
 def train(
@@ -224,7 +453,7 @@ def train(
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
     device = torch.device(cfg.device)
-    grid = SquareGrid(n=cfg.n)
+    grid = SquareGrid(n=cfg.n, x_min=cfg.domain_min, x_max=cfg.domain_max)
     model = make_model(cfg)
 
     # Fixed validation batch for best.pt selection. The final test evaluation
@@ -246,7 +475,9 @@ def train(
     )
 
     print(
-        f"[train] data={cfg.data_kind}  n={cfg.n}  J={cfg.J}  K={cfg.K}  "
+        f"[train] loss={cfg.loss_mode}  data={cfg.data_kind}  "
+        f"n={cfg.n}  J={cfg.J}  K={cfg.K}  "
+        f"domain=[{cfg.domain_min:g}, {cfg.domain_max:g}]  "
         f"epochs={cfg.epochs}  batch={cfg.batch_size}  device={cfg.device}"
     )
     print(
@@ -283,9 +514,11 @@ def train(
             u_pred = model(a, f)
             rel_r, rel_u = relative_metrics(model, a, f, u_exact, u_pred)
 
-            loss = cfg.lambda_r * torch.mean(rel_r**2) + cfg.lambda_u * torch.mean(
-                rel_u**2
-            )
+            loss = training_loss(model, a, f, u_exact, u_pred, cfg.loss_mode)
+            if not bool(torch.isfinite(loss).detach()):
+                raise FloatingPointError(
+                    f"non-finite training loss at epoch {epoch}: {float(loss.detach())}"
+                )
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -301,9 +534,15 @@ def train(
 
         val_rel_res = None
         val_rel_u = None
+        val_fd_res_rmse = None
         if epoch == 1 or epoch % cfg.eval_every == 0 or epoch == cfg.epochs:
-            val_rel_res, val_rel_u = _validate(model, val_batch)
-            val_metric = cfg.lambda_r * val_rel_res**2 + cfg.lambda_u * val_rel_u**2
+            val_metric, val_rel_res, val_rel_u, val_fd_res_rmse = _validate(
+                model, val_batch, cfg.loss_mode
+            )
+            if not math.isfinite(val_metric):
+                raise FloatingPointError(
+                    f"non-finite validation loss at epoch {epoch}: {val_metric}"
+                )
             if val_metric < best_metric:
                 best_metric = val_metric
                 save_checkpoint(best_path, model, cfg, epoch, best_metric)
@@ -311,6 +550,7 @@ def train(
                 f"  epoch {epoch:4d}  loss={epoch_loss:.3e}  "
                 f"rel_res={epoch_res:.3e}  rel_u={epoch_uerr:.3e}  "
                 f"val_rel_res={val_rel_res:.3e}  val_rel_u={val_rel_u:.3e}  "
+                f"val_fdResRMSE={val_fd_res_rmse:.3e}  "
                 f"val_loss={val_metric:.3e}"
             )
 
@@ -322,6 +562,7 @@ def train(
                 "rel_u": epoch_uerr,
                 "val_rel_res": val_rel_res,
                 "val_rel_u": val_rel_u,
+                "val_fd_res_rmse": val_fd_res_rmse,
                 "val_loss": val_metric if val_rel_u is not None else None,
             }
         )
@@ -334,6 +575,8 @@ def train(
     print(f"[train] saved {best_path} / last.pt / history.csv")
 
     # Continue with the best validation checkpoint.
+    if not best_path.is_file():
+        raise RuntimeError("training finished without producing best.pt")
     model, _ = load_model(best_path, cfg.device)
     return model
 
@@ -418,7 +661,13 @@ def evaluate(
         print(f"  PCG reference labels:   rel_res={np.mean(rel_r_pcg):.3e}  rel_u=n/a")
 
     # Fixed manufactured problem
-    prob = make_problem("smooth_sine", n=grid.n, forcing="discrete")
+    prob = make_problem(
+        "smooth_sine",
+        n=grid.n,
+        x_min=grid.x_min,
+        x_max=grid.x_max,
+        forcing="discrete",
+    )
     a_t = torch.as_tensor(prob.a[None], dtype=torch.float64, device=device)
     f_t = torch.as_tensor(prob.f[None], dtype=torch.float64, device=device)
     u_t = torch.as_tensor(prob.u_exact[None], dtype=torch.float64, device=device)
@@ -436,20 +685,22 @@ def evaluate(
 
 
 def u1_u4_cases(grid: SquareGrid) -> tuple[list[str], np.ndarray]:
-    """Four fixed test solutions that vanish on the boundary of (0, L)^2.
+    """Four fixed test solutions that vanish on the configured square boundary.
 
     This makes every case consistent with the zero Dirichlet halo used by the
     discrete operator.
     """
     x, y = grid.mesh()
     L = grid.L
+    xi = (x - grid.x_min) / L
+    yi = (y - grid.x_min) / L
 
-    u1 = np.sin(np.pi * x / L) * np.sin(np.pi * y / L)
-    u2 = np.sin(2.0 * np.pi * x / L) * np.sin(np.pi * y / L)
-    u3 = np.sin(np.pi * x / L) * np.sin(2.0 * np.pi * y / L) - 0.5 * np.sin(
-        2.0 * np.pi * x / L
-    ) * np.sin(2.0 * np.pi * y / L)
-    u4 = np.sin(3.0 * np.pi * x / L) * np.sin(3.0 * np.pi * y / L)
+    u1 = np.sin(np.pi * xi) * np.sin(np.pi * yi)
+    u2 = np.sin(2.0 * np.pi * xi) * np.sin(np.pi * yi)
+    u3 = np.sin(np.pi * xi) * np.sin(2.0 * np.pi * yi) - 0.5 * np.sin(
+        2.0 * np.pi * xi
+    ) * np.sin(2.0 * np.pi * yi)
+    u4 = np.sin(3.0 * np.pi * xi) * np.sin(3.0 * np.pi * yi)
 
     cases = {"u1": u1, "u2": u2, "u3": u3, "u4": u4}
     return list(cases), np.stack(list(cases.values()), axis=0)
@@ -509,6 +760,7 @@ def run_prediction(args: argparse.Namespace) -> None:
         "prediction_data_kind": "mms",
         "coefficient_policy": "same_field_for_all_cases",
         "n": grid.n,
+        "domain": [grid.x_min, grid.x_max],
         "contrast": contrast,
         "test_seed": args.test_seed,
         "checkpoint_sha256": _file_sha256(Path(args.predict_from)),
@@ -552,6 +804,8 @@ def main() -> None:
     p.add_argument("--samples-per-epoch", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--contrast", type=float, default=0.8)
+    p.add_argument("--domain-min", type=float, default=DEFAULT_DOMAIN_MIN)
+    p.add_argument("--domain-max", type=float, default=DEFAULT_DOMAIN_MAX)
     p.add_argument(
         "--data-kind",
         choices=("mms", "solver"),
@@ -561,6 +815,15 @@ def main() -> None:
             "solver PCG-solves u_exact from f. Prediction always uses MMS u1-u4"
         ),
     )
+    p.add_argument(
+        "--loss-mode",
+        choices=("supervised", "physics"),
+        default="supervised",
+        help=(
+            "single training objective: supervised uses squared solution L2 error; "
+            "physics uses squared PDE-residual L2 error"
+        ),
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     p.add_argument("--eval-every", type=int, default=10)
@@ -568,14 +831,15 @@ def main() -> None:
     p.add_argument(
         "--checkpoint-root",
         type=Path,
-        default=Path("axy_lgf/checkpoints/lgf_cnn_axy"),
+        default=PROJECT_DIR / "checkpoints" / "lgf_cnn_axy",
         help="run directories are created under this root",
     )
     p.add_argument("--retrain", action="store_true")
-    p.add_argument(
+    run_mode = p.add_mutually_exclusive_group()
+    run_mode.add_argument(
         "--eval-only", type=Path, default=None, help="load checkpoint and eval"
     )
-    p.add_argument("--predict", action="store_true")
+    run_mode.add_argument("--predict", action="store_true")
     p.add_argument("--predict-from", type=Path, default=None)
     p.add_argument(
         "--test-seed",
@@ -584,14 +848,67 @@ def main() -> None:
         help="independent test/prediction seed (validation always uses seed+1)",
     )
     p.add_argument("--predict-save", default="")
-    p.add_argument("--output-dir", default="results/lgf_cnn_axy/predict")
+    p.add_argument("--output-dir", default=DEFAULT_PREDICT_OUTPUT_DIR)
+    p.add_argument(
+        "--result-root",
+        type=Path,
+        default=PROJECT_DIR / "result",
+        help="PINN-style figures are saved below this directory",
+    )
+    p.add_argument(
+        "--plot-case",
+        choices=("u1", "u2", "u3", "u4"),
+        default="u2",
+        help="fixed MMS case used for the panel and centerline figures",
+    )
+    p.add_argument("--no-plot", action="store_true")
     args = p.parse_args()
+
+    if args.predict and args.predict_from is None:
+        p.error("--predict requires --predict-from")
+    if not args.predict and args.predict_from is not None:
+        p.error("--predict-from requires --predict")
+    if not args.predict and (
+        args.predict_save or args.output_dir != DEFAULT_PREDICT_OUTPUT_DIR
+    ):
+        p.error("--predict-save and --output-dir require --predict")
+    if args.retrain and (args.predict or args.eval_only is not None):
+        p.error("--retrain cannot be combined with --predict or --eval-only")
+    if args.test_seed < 0:
+        p.error("--test-seed must be nonnegative")
 
     if args.predict:
         return run_prediction(args)
 
     if args.eval_only is not None:
         model, saved = load_model(args.eval_only, args.device)
+        if not args.no_plot:
+            from .pinn_style_plots import generate_pinn_style_figures
+
+            checkpoint_name = (
+                args.eval_only.parent.name
+                if args.eval_only.name in ("best.pt", "last.pt")
+                else args.eval_only.stem
+            )
+            figure_dir = (
+                args.result_root
+                / checkpoint_name
+                / f"N{model.grid.n}"
+                / args.plot_case
+                / f"s{args.test_seed}"
+                / "figures"
+            )
+            generate_pinn_style_figures(
+                model=model,
+                history_path=args.eval_only.parent / "history.csv",
+                figure_dir=figure_dir,
+                experiment_name=checkpoint_name,
+                case=args.plot_case,
+                contrast=saved.get("contrast", 0.5),
+                seed=args.test_seed,
+                loss_mode=saved.get("loss_mode", "supervised"),
+            )
+            print(f"[plot] PINN-style figures saved to {figure_dir}")
         evaluate(
             model,
             contrast=saved.get("contrast", 0.5),
@@ -612,16 +929,79 @@ def main() -> None:
         val_samples=args.val_samples,
         lr=args.lr,
         contrast=args.contrast,
+        domain_min=args.domain_min,
+        domain_max=args.domain_max,
         seed=args.seed,
         device=args.device,
+        loss_mode=args.loss_mode,
         data_kind=args.data_kind,
     )
     _validate_train_config(cfg)
-    run_dir = args.checkpoint_root / experiment_key(cfg)
-    if (run_dir / "best.pt").exists() and not args.retrain:
-        print(f"found {run_dir / 'best.pt'}; use --retrain to overwrite")
-        return
-    model = train(cfg, run_dir)
+    run_key = experiment_key(cfg)
+    run_dir = args.checkpoint_root / run_key
+    best_path = run_dir / "best.pt"
+    with _run_lock(args.checkpoint_root, run_key):
+        _cleanup_stale_attempts(args.checkpoint_root, run_key)
+        completion_issue = _run_completion_issue(run_dir, cfg)
+        if (
+            not args.retrain
+            and completion_issue is not None
+            and completion_issue.startswith("identity: ")
+        ):
+            raise ValueError(
+                f"refusing to overwrite {run_dir}: "
+                f"{completion_issue.removeprefix('identity: ')}"
+            )
+        if completion_issue is None and not args.retrain:
+            print(f"found complete run {best_path}; loading it without retraining")
+            model, saved = load_model(best_path, cfg.device)
+            saved_cfg = LGFCNNTrainConfig(**{**saved, "device": cfg.device})
+            if _training_config_payload(saved_cfg) != _training_config_payload(cfg):
+                raise ValueError(
+                    "existing checkpoint config does not match the requested "
+                    "training config; choose another --checkpoint-root or use "
+                    "--retrain to replace it"
+                )
+        else:
+            if run_dir.exists() and not args.retrain:
+                print(
+                    f"[train] existing run is incomplete ({completion_issue}); "
+                    "starting a clean training attempt"
+                )
+            attempt_dir = args.checkpoint_root / (
+                f".{run_key}.attempt-{os.getpid()}-{time.time_ns()}"
+            )
+            try:
+                model = train(cfg, attempt_dir)
+                _promote_attempt(attempt_dir, run_dir, cfg)
+                model, _ = load_model(best_path, cfg.device)
+                print(f"[train] committed complete run to {run_dir}")
+            finally:
+                shutil.rmtree(attempt_dir, ignore_errors=True)
+        # Keep the run lock while reading history so a concurrent --retrain
+        # cannot pair an older in-memory model with a newly promoted curve.
+        if not args.no_plot:
+            from .pinn_style_plots import generate_pinn_style_figures
+
+            figure_dir = (
+                args.result_root
+                / run_key
+                / f"N{cfg.n}"
+                / args.plot_case
+                / f"s{args.test_seed}"
+                / "figures"
+            )
+            generate_pinn_style_figures(
+                model=model,
+                history_path=run_dir / "history.csv",
+                figure_dir=figure_dir,
+                experiment_name=run_key,
+                case=args.plot_case,
+                contrast=cfg.contrast,
+                seed=args.test_seed,
+                loss_mode=cfg.loss_mode,
+            )
+            print(f"[plot] PINN-style figures saved to {figure_dir}")
     evaluate(
         model,
         contrast=cfg.contrast,

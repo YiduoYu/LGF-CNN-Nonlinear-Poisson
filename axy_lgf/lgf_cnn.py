@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from .grid import SquareGrid
+from .grid import DEFAULT_DOMAIN_MAX, DEFAULT_DOMAIN_MIN, SquareGrid
 from .torch_ops import ScreenedLGFBankTorch, TorchSquareOps
 
 
@@ -222,6 +222,11 @@ class LGFCNNTrainConfig:
     seed: int = 0
     device: str = "cpu"
     contrast: float = 0.5
+    domain_min: float = DEFAULT_DOMAIN_MIN
+    domain_max: float = DEFAULT_DOMAIN_MAX
+    loss_mode: str = "supervised"  # "supervised" or "physics"
+    # Retained only so older checkpoints/configs can still be loaded.
+    # Training no longer uses a weighted combination of these values.
     lambda_u: float = 1.0
     lambda_r: float = 1.0
     data_kind: str = "mms"  # "mms" or "solver", see data.make_batch

@@ -4,12 +4,13 @@
 
 \[
 -\nabla\cdot\left(a(x,y)\nabla u\right)=f
-\quad\text{in }(0,L)^2,
+\quad\text{in }(x_{\min},x_{\max})^2,
 \qquad
 u=0\quad\text{on }\partial\Omega.
 \]
 
-项目包含 PCG、Richardson、LGF bank 和 LGF-CNN。矩形区域上的
+项目包含 PCG、Richardson、LGF bank 和 LGF-CNN。默认区域为
+\([-1,1]^2\)，也可通过 `--domain-min` 和 `--domain-max` 统一配置。矩形区域上的
 Dirichlet LGF 由 DST-I 实现，不使用 BAE。
 
 ## 环境
@@ -59,10 +60,14 @@ python -m axy_lgf.run_demo --conv --problem smooth_sine
 ```bash
 python -m axy_lgf.train_lgf_cnn \
   --data-kind mms \
+  --loss-mode supervised \
+  --domain-min -1 --domain-max 1 \
   --epochs 120 --n 31 --K 6 --contrast 0.8
 
 python -m axy_lgf.train_lgf_cnn \
   --data-kind solver \
+  --loss-mode physics \
+  --domain-min -1 --domain-max 1 \
   --epochs 120 --n 31 --K 6 --contrast 0.8
 ```
 
@@ -71,11 +76,24 @@ python -m axy_lgf.train_lgf_cnn \
 ```text
 axy_lgf/checkpoints/lgf_cnn_axy/<实验参数和哈希>/best.pt
 axy_lgf/checkpoints/lgf_cnn_axy/<实验参数和哈希>/last.pt
+axy_lgf/checkpoints/lgf_cnn_axy/<实验参数和哈希>/completed.json
 ```
 
 实验目录名包含 `mms` 或 `solver`，两次训练不会相互覆盖。每个 epoch
 会严格使用 `--samples-per-epoch` 指定的样本数；不足一个整 batch 的
 最后部分会作为短 batch 处理。
+
+每次新训练结束后会自动按照 PINN 的布局生成以下图片：
+
+```text
+axy_lgf/result/<实验参数和哈希>/N<n>/<case>/s<test-seed>/figures/training_curve.png
+axy_lgf/result/<实验参数和哈希>/N<n>/<case>/s<test-seed>/figures/lgf_cnn_centerline.png
+axy_lgf/result/<实验参数和哈希>/N<n>/<case>/s<test-seed>/figures/lgf_cnn_panel.png
+```
+
+默认绘制 `u2`；可通过 `--plot-case u1|u2|u3|u4` 修改。使用
+`--no-plot` 可关闭自动绘图。所有图的坐标范围均来自 checkpoint 中保存的
+`domain_min/domain_max`，不会在绘图代码中写死。
 
 ### 在同一组 MMS u1–u4 上比较
 
@@ -153,18 +171,15 @@ LGF-CNN 使用同样的 \(a_0/a\) 缩放，并学习逐点混合权重
 
 ## 检查点安全
 
-新检查点为格式版本 2，可通过
+新检查点为格式版本 3，可通过
 `torch.load(..., weights_only=True)` 加载，不再保存重复算子或稠密 DST
 矩阵。包内示例检查点已经迁移。
-
-如需转换自己确认可信的旧检查点：
-
-```bash
-python tools/migrate_checkpoint.py old.pt new.pt
-```
-
-迁移工具仅用于可信的旧文件，因为读取旧格式时必须使用完整反序列化。
-普通训练、评估、预测和绘图路径始终使用安全加载。
+普通训练、评估、预测和绘图路径始终使用安全加载；旧版 checkpoint
+缺少纯 loss 元数据时会明确标记为 `legacy_mixed`。
+训练先写入独立的临时实验目录，只有 `best.pt`、`last.pt` 和
+`history.csv` 全部完成并通过哈希记录后才写入 `completed.json` 并提交。
+同一参数的并发训练由文件锁串行化；中断训练不会被下一次普通运行误当作
+完整实验。
 
 ## 测试
 
@@ -180,7 +195,7 @@ python -m compileall -q axy_lgf tests tools
 - NumPy/Torch 离散算子与 LGF bank 一致性；
 - FFT-DST 数值正确性和自动微分；
 - LGF 系数缩放不变性和真实残差历史；
-- 非默认 \(L\) 下的二阶收敛；
+- 非默认区域边界下的收敛；
 - `J=1` 绘图和安全检查点往返加载。
 
 ## 主要文件

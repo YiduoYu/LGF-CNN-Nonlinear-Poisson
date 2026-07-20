@@ -1,19 +1,22 @@
 """
-Neural solver for -div(a(x,y) grad u) = f on [-1,1]^2, Dirichlet BC u=g.
-a(x,y) = exp(sigma*psi) is a given smooth positive coefficient field
-(sigma controls contrast).  MMS data: u_ref -> f = -div_h(a grad_h u_ref).
-u may take either sign. Supports --loss {supervised, physics} and
---model {unet, lgf}.
+LGF+UNet solver (scheme 3) for -div(a(x,y) grad u) = f on [-1,1]^2,
+Dirichlet BC u=g. a(x,y) = exp(sigma*psi) is a given smooth positive
+coefficient field (sigma controls contrast).  MMS data:
+u_ref -> f = -div_h(a grad_h u_ref). u may take either sign.
+Supports --loss {supervised, physics}.
+
+The model is an unrolled residual iteration (T steps, scheme §2) whose
+per-step correction network Phi is the multiscale LGF-UNet of scheme §7:
+an encoder/decoder with skip connections in which every spatial block is a
+fixed multi-kappa LGF stencil bank (one bank per resolution level,
+h_s = 2^s h), downsampling by fixed average pooling, upsampling bilinear.
+Only 1x1 convs / GroupNorm / per-step step sizes eta_t are learnable.
 
 This is a self-contained build (see the import section below); it owns the
-MMS data generation, the analytic test suite, and the cnn_mms
-checkpoint/output layout.
+MMS data generation, the analytic test suite, and the lgf_unet_mms
+checkpoint/output layout. 
 """
 
-# Self-contained build: the shared grid/operator/model/metric/training helpers
-# (factored into Baseline_core.py in the CNN+LGF layout) are inlined below, so
-# this script has no Baseline_core dependency. LGFNet still needs LGF_python at
-# the repo root; the sys.path line makes it importable from any working dir.
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -81,7 +84,7 @@ def pde_residual(u, f, a, h):
     """R = -div_h(a grad_h u) - f, interior nodes only."""
     return flux_divergence(u, a, h) - f[:, :, 1:-1, 1:-1]
 
-# -- UNet (one-shot baseline) ------------------------------------------------
+# -- shared model helpers -----------------------------------------------------
 
 def _make_groupnorm(channels):
     """GroupNorm with up to 8 groups, reduced until it divides `channels`."""
@@ -90,54 +93,7 @@ def _make_groupnorm(channels):
         g -= 1
     return nn.GroupNorm(g, channels)
 
-def _double_conv(c_in, c_out):
-    """2x (Conv3x3 -> GroupNorm -> GELU), replicate padding."""
-    return nn.Sequential(
-        nn.Conv2d(c_in, c_out, 3, padding=1, padding_mode="replicate"),
-        _make_groupnorm(c_out),
-        nn.GELU(),
-        nn.Conv2d(c_out, c_out, 3, padding=1, padding_mode="replicate"),
-        _make_groupnorm(c_out),
-        nn.GELU(),
-    )
-
-class UNet(nn.Module):
-    """Encoder-decoder with skip connections. depth = number of resolution
-    levels, i.e. depth-1 poolings: depth=3 with base_ch=32 gives channels
-    32 -> 64 -> 128 and, on the 34x34 grid, sizes 34 -> 17 -> 8. Upsampling
-    aligns to each skip's actual spatial size, so odd sizes are fine."""
-    def __init__(self, in_ch=6, out_ch=1, base_ch=32, depth=3):
-        super().__init__()
-        if depth < 1:
-            raise ValueError(f"unet depth must be >= 1, got {depth}")
-        chs = [base_ch * 2 ** i for i in range(depth)]
-        self.enc = nn.ModuleList()
-        c_prev = in_ch
-        for c in chs:
-            self.enc.append(_double_conv(c_prev, c))
-            c_prev = c
-        self.pool = nn.MaxPool2d(2)
-        # decoder runs deepest -> shallowest: level lvl consumes the upsampled
-        # chs[lvl] features + the chs[lvl-1] skip and emits chs[lvl-1]
-        self.dec = nn.ModuleList([
-            _double_conv(chs[lvl] + chs[lvl - 1], chs[lvl - 1])
-            for lvl in range(depth - 1, 0, -1)])
-        self.head = nn.Conv2d(chs[0], out_ch, 1)
-
-    def forward(self, x):
-        skips = []
-        for i, enc in enumerate(self.enc):
-            if i:
-                x = self.pool(x)
-            x = enc(x)
-            skips.append(x)
-        for dec, skip in zip(self.dec, reversed(skips[:-1])):
-            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear",
-                              align_corners=False)
-            x = dec(torch.cat([x, skip], dim=1))
-        return self.head(x)
-
-# -- LGFNet: multi-kappa LGF unrolled model ----------------------------------
+# -- LGFUNet: multi-kappa multiscale LGF unrolled model -----------------------
 
 LGF_BANK_DIR = Path("checkpoints") / "lgf_bank"
 LGF_LOG_A_RANGE = (-1.5, 1.5)   # a_m in [exp(-1.5), exp(1.5)], covers sigma in [0.5, 1.5]
@@ -225,12 +181,28 @@ class MultiKappaLGFBlock(nn.Module):
         Zc = _interp_kernel_response(Z, idx_lo, idx_hi, w)
         return X + self.act(self.norm(self.proj(Zc)))
 
-class LGFPhi(nn.Module):
-    """1x1 lift -> [MultiKappaLGFBlock]^L -> 1x1 head."""
-    def __init__(self, in_ch, hidden_ch, L):
+class MultiScaleLGFPhi(nn.Module):
+    """UNet-shaped correction network (scheme §7): encoder/decoder with skip
+    connections in which every spatial block is a MultiKappaLGFBlock driven
+    by that scale's own fixed LGF kernel bank. Downsampling is fixed 2x2
+    average pooling, upsampling bilinear interpolation; the learnable ops are
+    1x1 convs + GroupNorm only — no learnable spatial convs at any scale.
+    S = number of resolution levels (S-1 poolings), L = LGF blocks per scale
+    on each of the encoder and decoder paths."""
+    def __init__(self, in_ch, hidden_ch, S, L):
         super().__init__()
+        self.S = S
         self.lift = nn.Conv2d(in_ch, hidden_ch, 1)
-        self.blocks = nn.ModuleList([MultiKappaLGFBlock(hidden_ch) for _ in range(L)])
+        self.enc = nn.ModuleList(
+            nn.ModuleList(MultiKappaLGFBlock(hidden_ch) for _ in range(L))
+            for _ in range(S))
+        # after bilinear upsample + skip concat, a 1x1 conv mixes channels
+        # back down (scheme §7: "随后只使用 1x1 卷积")
+        self.merge = nn.ModuleList(
+            nn.Conv2d(2 * hidden_ch, hidden_ch, 1) for _ in range(S - 1))
+        self.dec = nn.ModuleList(
+            nn.ModuleList(MultiKappaLGFBlock(hidden_ch) for _ in range(L))
+            for _ in range(S - 1))
         self.head = nn.Conv2d(hidden_ch, 1, 1)
         # zero-init: du=Phi(X)=0 at step 0, so the unrolled iteration starts as
         # an identity map (u_t raw-fed back each step would otherwise compound
@@ -238,31 +210,78 @@ class LGFPhi(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def forward(self, X, kernel_bank, idx_lo, idx_hi, w):
-        h = self.lift(X)
-        for blk in self.blocks:
-            h = blk(h, kernel_bank, idx_lo, idx_hi, w)
-        return self.head(h)
+    def forward(self, X, scales):
+        """scales[s] = (kernel_bank, idx_lo, idx_hi, w) at resolution level s
+        (spatial sizes must match the feature pyramid: full res at s=0, then
+        one 2x2 avg-pool per level)."""
+        z = self.lift(X)
+        skips = []
+        for s in range(self.S):
+            if s:
+                z = F.avg_pool2d(z, 2)
+            bank, idx_lo, idx_hi, w = scales[s]
+            for blk in self.enc[s]:
+                z = blk(z, bank, idx_lo, idx_hi, w)
+            skips.append(z)
+        for s in range(self.S - 2, -1, -1):
+            z = F.interpolate(z, size=skips[s].shape[-2:], mode="bilinear",
+                              align_corners=False)
+            z = self.merge[s](torch.cat([z, skips[s]], dim=1))
+            bank, idx_lo, idx_hi, w = scales[s]
+            for blk in self.dec[s]:
+                z = blk(z, bank, idx_lo, idx_hi, w)
+        return self.head(z)
 
-class LGFNet(nn.Module):
-    """Unrolled residual iteration: spatial propagation via a fixed bank of 3x3
-    LGF stencils of P_h(kappa) = -Delta_h + kappa^2 I, selected per grid point by
-    the local coefficient kappa_ij^2 = a_ij. Only the 1x1 convs / GroupNorm /
-    per-step step-size eta_t are learnable."""
-    def __init__(self, hidden_ch=32, T=12, M=8, L=4, N=64, N_fft=512):
+class LGFUNet(nn.Module):
+    """Scheme-3 model: unrolled residual iteration (scheme §2 — T steps,
+    per-step step size eta_t, hard Dirichlet projection every update) whose
+    per-step correction network Phi is the multiscale LGF-UNet of §7.
+    Spatial propagation at every scale comes from a fixed bank of 3x3 LGF
+    stencils of P_h_s(kappa) = -Delta_h_s + kappa^2 I with h_s = 2^s h,
+    selected per grid point by the local coefficient kappa^2 = a^(s), where
+    a^(s) is the geometric-mean downsampling exp(AvgPool(log a)). Only the
+    1x1 convs / GroupNorm / eta_t are learnable."""
+    def __init__(self, hidden_ch=32, T=12, M=8, L=4, S=3, N=64, N_fft=512):
         super().__init__()
-        self.T, self.M, self.L = T, M, L
+        self.T, self.M, self.L, self.S = T, M, L, S
         h = 2.0 / (N + 1)
-        bank, a_nodes = build_lgf_kernel_bank(N, h, M, N_fft)
-        assert torch.isfinite(bank).all(), "LGF kernel bank contains non-finite values"
-        assert not bank.requires_grad
-        self.register_buffer("kernel_bank", bank)          # (M,1,3,3), fixed
-        self.register_buffer("a_nodes", a_nodes)            # (M,)
+        a_nodes = None
+        for s in range(S):
+            bank, nodes = build_lgf_kernel_bank(N, h * (2 ** s), M, N_fft)
+            assert torch.isfinite(bank).all(), (
+                f"LGF kernel bank (scale {s}) contains non-finite values")
+            assert not bank.requires_grad
+            self.register_buffer(f"kernel_bank_s{s}", bank)   # (M,1,3,3), fixed
+            if a_nodes is None:
+                a_nodes = nodes    # nodes are h-independent: same for every scale
+        self.register_buffer("a_nodes", a_nodes)              # (M,)
         self.register_buffer("log_a_nodes", a_nodes.log())
-        self._bank_snapshot = bank.clone()
+        self._bank_snapshots = [getattr(self, f"kernel_bank_s{s}").clone()
+                                for s in range(S)]
 
-        self.phi = LGFPhi(in_ch=9, hidden_ch=hidden_ch, L=L)
+        self.phi = MultiScaleLGFPhi(in_ch=9, hidden_ch=hidden_ch, S=S, L=L)
         self.eta = nn.Parameter(torch.ones(T))
+
+    def _banks_unchanged(self):
+        """Scheme §10 check 1: every fixed kernel, at every scale, must be
+        bit-identical after training."""
+        return all(
+            torch.equal(getattr(self, f"kernel_bank_s{s}").cpu(), snap.cpu())
+            for s, snap in enumerate(self._bank_snapshots))
+
+    def _scale_pyramid(self, a):
+        """Per-scale (bank, idx_lo, idx_hi, w), computed once per forward and
+        reused by all T steps and all LGF blocks. a^(s+1) = exp(AvgPool2d(
+        log a^(s))) — the geometric-mean downsampling of scheme §7."""
+        scales = []
+        a_s = a
+        for s in range(self.S):
+            idx_lo, idx_hi, w = _select_kernel_weights(a_s, self.log_a_nodes)
+            scales.append((getattr(self, f"kernel_bank_s{s}"),
+                           idx_lo, idx_hi, w))
+            if s + 1 < self.S:
+                a_s = torch.exp(F.avg_pool2d(a_s.clamp_min(1e-12).log(), 2))
+        return scales
 
     def forward(self, batch, stats, collect_diagnostics=False):
         f, g, a, bnd = batch["f"], batch["g"], batch["a"], batch["mask"]
@@ -272,7 +291,7 @@ class LGFNet(nn.Module):
                           _expand_to_batch(y, B))
         f_norm = (f - stats.f_mean) / stats.f_std
         log_a_norm = (a.clamp_min(1e-12).log() - stats.loga_mean) / stats.loga_std
-        idx_lo, idx_hi, w = _select_kernel_weights(a, self.log_a_nodes)
+        scales = self._scale_pyramid(a)   # per-scale (bank, idx, w), fixed across steps
 
         u = enforce_dirichlet(torch.zeros_like(g), g, bnd)
         # res_trace is only computed when requested, and kept as tensors (no
@@ -292,7 +311,7 @@ class LGFNet(nn.Module):
             t_channel = torch.full_like(f, t / self.T)
             X = torch.cat([u, q_norm, f_norm, g, bnd_b, log_a_norm, x_b, y_b,
                            t_channel], dim=1)
-            du = (1. - bnd) * self.phi(X, self.kernel_bank, idx_lo, idx_hi, w)
+            du = (1. - bnd) * self.phi(X, scales)
             u = enforce_dirichlet(u + self.eta[t] * du, g, bnd)
 
         if collect_diagnostics:
@@ -467,13 +486,6 @@ def _expand_to_batch(t, B):
     no-op if it's already batched."""
     return t.expand(B, -1, -1, -1) if t.shape[0] == 1 else t
 
-def build_input(f_norm, g, bnd, a_norm, x, y):
-    """Assemble the 6-channel one-shot model input: [f_norm, g, bnd, log_a_norm, x, y].
-    a_norm is a full-grid field (B,1,H,W)."""
-    B = f_norm.shape[0]
-    return torch.cat([f_norm, g, _expand_to_batch(bnd, B), _expand_to_batch(a_norm, B),
-                      _expand_to_batch(x, B), _expand_to_batch(y, B)], dim=1)
-
 @dataclass
 class NormalizationStats:
     f_mean: float
@@ -499,12 +511,7 @@ def _take_batch(data, idx):
             **{k: data[k][:1] for k in ("mask", "interior_mask", "x", "y")}}
 
 def _forward(model, batch, stats, return_diagnostics=False):
-    if isinstance(model, LGFNet):
-        return model(batch, stats, collect_diagnostics=return_diagnostics)
-    fn = (batch["f"] - stats.f_mean) / stats.f_std
-    loga_n = (batch["a"].clamp_min(1e-12).log() - stats.loga_mean) / stats.loga_std
-    inp = build_input(fn, batch["g"], batch["mask"], loga_n, batch["x"], batch["y"])
-    return enforce_dirichlet(model(inp), batch["g"], batch["mask"])
+    return model(batch, stats, collect_diagnostics=return_diagnostics)
 
 def _set_seed(seed):
     random.seed(seed)
@@ -532,10 +539,10 @@ def _sync(device):
 def _time_forward(model, batch, stats, return_diagnostics=False):
     """Model inference wall time (model forward only, after one warm-up forward).
     Returns (u_pred, ms_per_batch, ms_per_sample), or with
-    return_diagnostics=True on an LGFNet, (u_pred, ms_per_batch, ms_per_sample,
-    res_trace). Note: with return_diagnostics=True the timed region also
-    computes the per-step residual-RMS trace, so it measures inference +
-    diagnostics, not pure inference."""
+    return_diagnostics=True, (u_pred, ms_per_batch, ms_per_sample, res_trace).
+    Note: with return_diagnostics=True the timed region also computes the
+    per-step residual-RMS trace, so it measures inference + diagnostics, not
+    pure inference."""
     device = batch["f"].device
     with torch.no_grad():
         _forward(model, batch, stats)          # warm-up
@@ -545,7 +552,7 @@ def _time_forward(model, batch, stats, return_diagnostics=False):
         _sync(device)
         ms = (time.perf_counter() - t0) * 1e3
     ms_per_sample = ms / batch["f"].shape[0]
-    if return_diagnostics and isinstance(model, LGFNet):
+    if return_diagnostics:
         u_pred, res_trace = result
         return u_pred, ms, ms_per_sample, res_trace.cpu().tolist()   # after timing stops
     return result, ms, ms_per_sample
@@ -553,29 +560,27 @@ def _time_forward(model, batch, stats, return_diagnostics=False):
 # -- training helpers ---------------------------------------------------------
 
 def create_model(args, device):
-    # the "cnn" fallback is deliberate: legacy checkpoints without an
-    # args["model"] key are from the cnn era, so they fall through to the
-    # clear "no longer supported" error below instead of building the wrong
-    # model and dying with a state-dict mismatch
-    model_name = getattr(args, "model", "cnn")
-    if model_name == "lgf":
-        return LGFNet(hidden_ch=args.base_ch, T=args.lgf_T, M=args.lgf_M,
-                      L=args.lgf_L, N=args.N).to(device)
-    if model_name == "unet":
-        depth = args.unet_depth
-        size = args.N + 2
-        for _ in range(depth - 1):
-            size //= 2
-        if size < 1:
-            raise ValueError(
-                f"--unet-depth {depth} is too deep for N={args.N}: the "
-                f"{args.N + 2}x{args.N + 2} grid shrinks to zero after "
-                f"{depth - 1} poolings")
-        return UNet(base_ch=args.base_ch, depth=depth).to(device)
-    raise ValueError(
-        f"unsupported model '{model_name}': this script supports 'unet' and "
-        f"'lgf'. Checkpoints trained with --model cnn are no longer "
-        f"supported here — use Baseline_mms.py for those.")
+    # this script is single-model; legacy checkpoints from the cnn/unet/lgf
+    # scripts carry an args["model"] key, so anything but the default is a
+    # foreign checkpoint and gets a clear error instead of a state-dict
+    # mismatch
+    model_name = getattr(args, "model", "lgf_unet")
+    if model_name != "lgf_unet":
+        raise ValueError(
+            f"unsupported model '{model_name}': this script implements only "
+            f"the scheme-3 LGF+UNet model. Use Baseline_mms.py for cnn/lgf "
+            f"checkpoints.")
+    depth = args.unet_depth
+    size = args.N + 2
+    for _ in range(depth - 1):
+        size //= 2
+    if size < 1:
+        raise ValueError(
+            f"--unet-depth {depth} is too deep for N={args.N}: the "
+            f"{args.N + 2}x{args.N + 2} grid shrinks to zero after "
+            f"{depth - 1} poolings")
+    return LGFUNet(hidden_ch=args.base_ch, T=args.lgf_T, M=args.lgf_M,
+                   L=args.lgf_L, S=depth, N=args.N).to(device)
 
 def create_optimizer(model, args):
     decay, no_decay = [], []
@@ -624,7 +629,7 @@ def train_one_epoch(model, train_data, stats, opt, sched, args, device):
 
 # -- evaluation -------------------------------------------------------------
 
-def _print_res_trace(trace, label="LGFNet per-step residual RMS"):
+def _print_res_trace(trace, label="LGFUNet per-step residual RMS"):
     print(f"  {label}: " + " ".join(f"{v:.3e}" for v in trace))
 
 def _aggregate_metrics(all_rows):
@@ -660,11 +665,8 @@ def evaluate(model, data, stats, batch_size):
 
     for start in range(0, n, batch_size):
         b = _take_batch(data, slice(start, start + batch_size))
-        if isinstance(model, LGFNet):
-            up, res_trace = _forward(model, b, stats, return_diagnostics=True)
-            res_traces.append((res_trace.cpu().tolist(), up.shape[0]))
-        else:
-            up = _forward(model, b, stats)
+        up, res_trace = _forward(model, b, stats, return_diagnostics=True)
+        res_traces.append((res_trace.cpu().tolist(), up.shape[0]))
         rows = per_sample_metrics(up, b, start_id=start)
         all_rows.extend(rows)
 
@@ -943,7 +945,7 @@ def validate_and_checkpoint(model, val_data, stats, args, epoch, epoch_loss,
         best_metric = val_m[val_key]
         best_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
-            "model_type": "cnn_mms",
+            "model_type": "lgf_unet_mms",
             "model_state_dict": model.state_dict(),
             "stats": astuple(stats),   # plain tuple: robust to future
             "args": vars(args),        # NormalizationStats renames/moves
@@ -999,7 +1001,8 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
     model = create_model(args, device) if model is None else model.to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model={args.model}  parameters={n_params:,}")
+    print(f"model=lgf_unet(T={args.lgf_T}, M={args.lgf_M}, L={args.lgf_L}, "
+          f"S={args.unet_depth})  parameters={n_params:,}")
 
     opt = create_optimizer(model, args)
 
@@ -1033,12 +1036,11 @@ def train(args, best_path, last_path, history_path, convergence_path, model=None
                 model, val_data, stats, args, epoch, epoch_loss,
                 best_metric, best_path, history)
 
-    if isinstance(model, LGFNet):
-        assert torch.equal(model.kernel_bank.cpu(), model._bank_snapshot.cpu()), (
-            "LGF kernel bank changed during training (should be frozen)")
+    assert model._banks_unchanged(), (
+        "an LGF kernel bank changed during training (all scales should be frozen)")
 
     last_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_type": "cnn_mms",
+    torch.save({"model_type": "lgf_unet_mms",
                  "model_state_dict": model.state_dict(),
                  "stats": astuple(stats), "args": vars(args)}, last_path)
     _write_csv(history, history_path)
@@ -1141,11 +1143,11 @@ def run_prediction(args):
 
     ckpt = torch.load(args.predict_from, map_location=device, weights_only=False)
     ckpt_type = ckpt.get("model_type")
-    if ckpt_type and ckpt_type != "cnn_mms":
+    if ckpt_type and ckpt_type != "lgf_unet_mms":
         raise ValueError(
-            f"checkpoint type mismatch: expected 'cnn_mms', got '{ckpt_type}'. "
-            f"Use the correct prediction script (Baseline_mms.py for "
-            f"'cnn_mms', Baseline_solver.py for 'cnn').")
+            f"checkpoint type mismatch: expected 'lgf_unet_mms', got "
+            f"'{ckpt_type}'. Use the correct prediction script "
+            f"(Baseline_mms.py for 'cnn_mms', Baseline_solver.py for 'cnn').")
     if "sigma" not in ckpt["args"]:
         raise ValueError(
             "checkpoint predates the a(x,y)/sigma refactor (has 'k', not "
@@ -1183,13 +1185,9 @@ def run_prediction(args):
                              seed=args.test_seed)
     ensure_linear_baselines(batch)
 
-    want_trace = isinstance(model, LGFNet)
-    timing = _time_forward(model, batch, stats, return_diagnostics=want_trace)
-    if want_trace:
-        u_pred, model_ms_batch, model_ms_sample, res_trace = timing
-        _print_res_trace(res_trace)
-    else:
-        u_pred, model_ms_batch, model_ms_sample = timing
+    u_pred, model_ms_batch, model_ms_sample, res_trace = _time_forward(
+        model, batch, stats, return_diagnostics=True)
+    _print_res_trace(res_trace)
 
     rows = per_sample_metrics(u_pred, batch)
     vm = _aggregate_metrics(rows)
@@ -1204,7 +1202,7 @@ def run_prediction(args):
     print(f"linear baseline (a≡1) relL2 = {vm['linearBaselineRelL2']:.4e}  "
           f"(CNN must beat this to have learned a(x,y))  "
           f"const baseline relL2 = {vm['constBaselineRelL2']:.4e}")
-    diag_note = " (incl. per-step residual diagnostics)" if want_trace else ""
+    diag_note = " (incl. per-step residual diagnostics)"
     print(f"timing: cnn={model_ms_batch:.2f} ms/batch  "
           f"cnn_ms_per_sample={model_ms_sample:.3f}{diag_note}  "
           f"fd_solver_ms_per_sample=nan (no FD solve in MMS pipeline)")
@@ -1255,14 +1253,8 @@ def ckpt_key(args):
     else:
         sig_str = f"sig{args.sigma:g}"
     loss_suffix = "_sup" if getattr(args, "loss", "physics") == "supervised" else ""
-    if args.model == "lgf":   # only called on fresh parse_args results
-        # unchanged from the LGF+CNN layout so existing LGF checkpoint paths
-        # stay valid (n_layers is dead for LGFNet but was always in the key)
-        n_layers = getattr(args, "n_layers", 6)
-        arch = (f"L{n_layers}{loss_suffix}"
-                f"_lgf_T{args.lgf_T}_M{args.lgf_M}_L{args.lgf_L}")
-    else:
-        arch = f"unet_d{args.unet_depth}{loss_suffix}"
+    arch = (f"lgfunet_d{args.unet_depth}_T{args.lgf_T}"
+            f"_M{args.lgf_M}_L{args.lgf_L}{loss_suffix}")
     extra = (args.seed, args.lr, args.weight_decay, args.batch_size,
              args.val_samples, args.eval_every, args.grad_clip)
     cfg = hashlib.md5(repr(extra).encode()).hexdigest()[:8]
@@ -1283,22 +1275,20 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--base-ch", type=int, default=32)
-    p.add_argument("--n-layers", type=int, default=6)
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=1234)
 
-    # Model selection
-    p.add_argument("--model", default="unet", choices=["unet", "lgf"],
-                   help="unet: UNet one-shot map | lgf: LGFNet multi-kappa "
-                        "LGF unrolled iteration")
+    # LGF+UNet model (scheme 3: single model, no --model switch)
     p.add_argument("--unet-depth", type=int, default=3,
-                   help="UNet: number of resolution levels (depth-1 poolings)")
+                   help="number of resolution levels S in the multiscale "
+                        "LGF-UNet Phi (S-1 poolings, one kernel bank per level)")
     p.add_argument("--lgf-T", type=int, default=12,
-                   help="LGFNet: number of unrolled iteration steps")
+                   help="number of unrolled residual-iteration steps")
     p.add_argument("--lgf-M", type=int, default=8,
-                   help="LGFNet: number of kernel-bank nodes")
+                   help="number of kernel-bank nodes per scale")
     p.add_argument("--lgf-L", type=int, default=4,
-                   help="LGFNet: number of multi-kappa LGF blocks in Phi_theta")
+                   help="multi-kappa LGF blocks per scale on each of the "
+                        "encoder and decoder paths of Phi")
 
     # Linear variable coefficient a(x,y) = exp(sigma * psi)
     p.add_argument("--sigma", type=float, default=0.5)
@@ -1400,19 +1390,21 @@ def main():
         else:
             print("  OK — MMS residual is near machine precision.")
 
-        if args.model == "lgf":
-            print("-" * 60)
-            print(f"LGF kernel bank (M={args.lgf_M}) sanity checks:")
-            bank, _ = build_lgf_kernel_bank(args.N, data["h"], args.lgf_M)
+        print("-" * 60)
+        print(f"LGF kernel bank (M={args.lgf_M}) sanity checks:")
+        h_grid = data["h"]
+        for s in range(args.unet_depth):
+            bank, _ = build_lgf_kernel_bank(args.N, h_grid * (2 ** s), args.lgf_M)
             assert torch.isfinite(bank).all()
-            print(f"  bank finite: OK  (shape={tuple(bank.shape)})")
-            _lgf_const_coeff_sanity_check(args.N, args.lgf_M)
+            print(f"  scale {s} (h={h_grid * 2 ** s:.4g}) bank finite: OK  "
+                  f"(shape={tuple(bank.shape)})")
+        _lgf_const_coeff_sanity_check(args.N, args.lgf_M)
 
         # model smoke check: one real forward + backward + hard-boundary
-        # assertion, so --mms-sanity also validates the selected architecture
-        # (skip sizes, 6-channel input, autograd), not just the MMS data
+        # assertion, so --mms-sanity also validates the architecture (scale
+        # pyramid, 9-channel step input, autograd), not just the MMS data
         print("-" * 60)
-        print(f"model smoke check ({args.model}):")
+        print("model smoke check (lgf_unet):")
         model = create_model(args, device)
         stats = compute_stats(data)
         batch = _take_batch(data, slice(0, min(2, args.train_samples)))
@@ -1434,7 +1426,7 @@ def main():
         return run_prediction(args)
 
     key = ckpt_key(args)
-    ckpt_dir = Path("checkpoints") / "cnn_mms" / key
+    ckpt_dir = Path("checkpoints") / "lgf_unet_mms" / key
     best_path = ckpt_dir / "best.pt"
 
     if best_path.exists() and not args.retrain:
@@ -1449,7 +1441,7 @@ def main():
         print(f"saved → {ckpt_dir}")
 
     if args.plot:
-        figures_dir = Path("results") / "cnn_mms" / key / "figures"
+        figures_dir = Path("results") / "lgf_unet_mms" / key / "figures"
         figures_dir.mkdir(parents=True, exist_ok=True)
         pa = argparse.Namespace(**vars(args))
         pa.predict_from = str(best_path)
@@ -1459,7 +1451,7 @@ def main():
         pa.test_seed = args.seed + 100000   # disjoint from train RNG stream
         run_prediction(pa)
 
-    print(f"done: checkpoints/cnn_mms/{key}")
+    print(f"done: checkpoints/lgf_unet_mms/{key}")
 
 if __name__ == "__main__":
     main()

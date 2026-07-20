@@ -83,15 +83,31 @@ axy_lgf/checkpoints/lgf_cnn_axy/<实验参数和哈希>/completed.json
 会严格使用 `--samples-per-epoch` 指定的样本数；不足一个整 batch 的
 最后部分会作为短 batch 处理。
 
-每次新训练结束后会自动按照 PINN 的布局生成以下图片：
+每次训练或载入已有训练结果后，程序都会把图片和数值数据归纳到同一个
+测试结果目录。训练参数由实验名和哈希区分，测试随机种子由末尾的
+`s<test-seed>` 区分：
 
 ```text
-axy_lgf/result/<实验参数和哈希>/s<test-seed>/training_curve.png
-axy_lgf/result/<实验参数和哈希>/s<test-seed>/u1_centerline.png
-axy_lgf/result/<实验参数和哈希>/s<test-seed>/u1_panel.png
-...
-axy_lgf/result/<实验参数和哈希>/s<test-seed>/u4_centerline.png
-axy_lgf/result/<实验参数和哈希>/s<test-seed>/u4_panel.png
+axy_lgf/result/<实验参数和哈希>_s<test-seed>/
+├── data/
+│   ├── training_history.csv
+│   ├── u1_u4_metrics.csv
+│   ├── u1_u4_summary.json
+│   ├── u1_u4_solver_comparison.csv
+│   ├── u1_u4_residual_history.csv
+│   ├── u1_u4_predictions.pt
+│   ├── heldout_metrics.csv
+│   ├── heldout_summary.json
+│   ├── heldout_solver_comparison.csv
+│   ├── heldout_residual_history.csv
+│   └── heldout_predictions.pt
+└── figures/
+    ├── training_curve.png
+    ├── u1_centerline.png
+    ├── u1_panel.png
+    ├── ...
+    ├── u4_centerline.png
+    └── u4_panel.png
 ```
 
 默认一次绘制 `u1`–`u4`，四组图共享同一个测试系数场。可通过
@@ -117,10 +133,20 @@ python -m axy_lgf.train_lgf_cnn \
   --output-dir results/predict_solver_model
 ```
 
-预测命令不需要 `--data-kind`。输出包括：
+预测命令不需要 `--data-kind`。如果不指定 `--output-dir`，输出会自动放到
+上面的参数安全结果目录；如果指定了该参数，其目录下仍按 `data/` 和
+`figures/` 分类。
 
-- `metrics.csv`：u1–u4 各自的相对残差和相对解误差；
-- `summary.json`：均值、最大值、训练数据模式、测试种子及检查点哈希。
+`u1_u4_metrics.csv` 和 `heldout_metrics.csv` 保存逐例的 `relL2`、RMSE、
+MAE、最大误差、预测/参考离散残差、边界误差、梯度误差、常数基线、
+常系数 Poisson 基线、右端项 RMS 和 CNN 推理耗时。对应的
+`*_summary.json` 保存每项指标的 mean/std/min/max。
+
+`*_solver_comparison.csv` 保存 LGF-CNN、相同迭代步数的 Richardson 和
+高精度 PCG 的误差、残差、耗时、迭代次数及收敛状态；
+`*_residual_history.csv` 保存三种方法的逐步相对残差；
+`*_predictions.pt` 保存系数场、右端项、参考解、网络预测和三种基线解。
+齐次 Dirichlet 边界由零 halo 精确施加，因此 `bndErr` 应为零。
 
 两个命令必须使用相同的 `--test-seed`，这样系数场和 u1–u4 完全一致，
 结果才可以直接比较。
@@ -131,15 +157,12 @@ python -m axy_lgf.train_lgf_cnn \
 python -m axy_lgf.train_lgf_cnn \
   --eval-only path/to/best.pt \
   --test-seed 123
-
-python -m axy_lgf.plot_lgf_cnn \
-  --ckpt path/to/best.pt \
-  --outdir results/figures
 ```
 
 训练中的固定验证集使用 `seed + 1`，最终评估默认使用独立的
-`--test-seed 123`，避免验证集和测试集复用。绘图要求显式传入检查点，
-防止误用旧模型。
+`--test-seed 123`，避免验证集和测试集复用。`--eval-only` 会载入指定
+checkpoint，并通过唯一的 `plots.py` 自动生成 training curve、
+u1–u4 panel 和 centerline；使用 `--no-plot` 可以只保存数据。
 
 ## 数学与实现要点
 
@@ -216,4 +239,4 @@ python -m compileall -q axy_lgf tests tools
 | `lgf_cnn.py` | 展开的 LGF-CNN |
 | `data.py` | MMS/solver 随机训练数据 |
 | `train_lgf_cnn.py` | 训练、评估和固定 u1–u4 预测 |
-| `plot_lgf_cnn.py` | 解、残差和混合权重绘图 |
+| `plots.py` | training curve、panel 和 centerline 绘图 |

@@ -18,7 +18,8 @@ Checkpoint / result bookkeeping:
   - run directory  <checkpoint-root>/<experiment_key>/
   - best.pt selected on a fixed held-out validation batch, last.pt at the end
   - history.csv; --retrain guards an existing best.pt
-  - --predict writes per-case u1-u4 metrics.csv + summary.json
+  - result/<experiment_key>_s<test-seed>/{data,figures}/
+  - complete u1-u4 and held-out metrics, solver comparisons, histories, tensors
 """
 
 from __future__ import annotations
@@ -41,11 +42,12 @@ import numpy as np
 import torch
 
 from .data import make_batch, sample_coefficient
+from .evaluation import evaluate_batch
 from .grid import DEFAULT_DOMAIN_MAX, DEFAULT_DOMAIN_MIN, SquareGrid
 from .lgf_cnn import LGFCNN, LGFCNNTrainConfig
 from .operators import apply_div_a_grad, l2_norm
 from .manufactured import make_problem
-from .solvers import solve_axy_pcg, solve_axy_richardson
+from .solvers import solve_axy_richardson
 
 MODEL_TYPE = "lgf_cnn_axy"
 CHECKPOINT_FORMAT_VERSION = 3
@@ -54,7 +56,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 RUN_ARTIFACTS = ("best.pt", "last.pt", "history.csv")
 RUN_MANIFEST = "completed.json"
 MAX_TORCH_SEED = 2**64 - 1
-DEFAULT_PREDICT_OUTPUT_DIR = "results/lgf_cnn_axy/predict"
+DEFAULT_PREDICT_OUTPUT_DIR = None
 
 
 def make_model(cfg: LGFCNNTrainConfig) -> LGFCNN:
@@ -298,15 +300,6 @@ def _batch_sizes(total: int, batch_size: int) -> list[int]:
     return [batch_size] * full + ([remainder] if remainder else [])
 
 
-def _relative_l2(
-    error: np.ndarray,
-    reference: np.ndarray,
-    grid: SquareGrid,
-) -> float:
-    denominator = max(l2_norm(reference, grid), np.finfo(np.float64).tiny)
-    return l2_norm(error, grid) / denominator
-
-
 def _write_csv(rows: list[dict], path: Path) -> None:
     if not rows:
         return
@@ -343,8 +336,77 @@ def _write_json_atomic(payload: dict, path: Path) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         with temporary.open("w") as file:
-            json.dump(payload, file, indent=2, sort_keys=True)
+            json.dump(payload, file, indent=2, sort_keys=True, ensure_ascii=False)
         os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _save_prediction_tensor(bundle: dict, path: Path, metadata: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(
+            {
+                "names": bundle["names"],
+                "a": torch.from_numpy(bundle["a"]),
+                "f": torch.from_numpy(bundle["f"]),
+                "u_exact": torch.from_numpy(bundle["u_exact"]),
+                "u_pred": torch.from_numpy(bundle["u_pred"]),
+                "u_linear_baseline": torch.from_numpy(
+                    bundle["u_linear_baseline"]
+                ),
+                "u_richardson": torch.from_numpy(bundle["u_richardson"]),
+                "u_pcg": torch.from_numpy(bundle["u_pcg"]),
+                "metrics": bundle["metrics"],
+                "metadata": metadata,
+            },
+            temporary,
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _save_evaluation_outputs(
+    bundle: dict,
+    data_dir: Path,
+    prefix: str,
+    metadata: dict,
+) -> Path:
+    """Save one evaluation set as CSV, JSON, and a tensor archive."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    _write_csv(bundle["metrics"], data_dir / f"{prefix}_metrics.csv")
+    _write_csv(
+        bundle["solver_comparison"],
+        data_dir / f"{prefix}_solver_comparison.csv",
+    )
+    _write_csv(
+        bundle["residual_history"],
+        data_dir / f"{prefix}_residual_history.csv",
+    )
+    _write_json_atomic(
+        {
+            **metadata,
+            "metrics": bundle["metric_summary"],
+            "solvers": bundle["solver_summary"],
+        },
+        data_dir / f"{prefix}_summary.json",
+    )
+    predictions_path = data_dir / f"{prefix}_predictions.pt"
+    _save_prediction_tensor(bundle, predictions_path, metadata)
+    return predictions_path
+
+
+def _copy_training_history(history_path: Path, data_dir: Path) -> None:
+    if not history_path.is_file():
+        return
+    data_dir.mkdir(parents=True, exist_ok=True)
+    target = data_dir / "training_history.csv"
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        shutil.copy2(history_path, temporary)
+        os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -589,16 +651,17 @@ def evaluate(
     seed: int = 123,
     richardson_steps: int | None = None,
     data_kind: str = "mms",
-) -> None:
+    output_dir: Path | None = None,
+    checkpoint_path: Path | None = None,
+) -> dict:
     """Compare LGF-CNN vs Richardson (same K) and PCG on held-out batches."""
     if n_eval < 1:
         raise ValueError("n_eval must be positive")
     device = model.bank.lambdas.device
     grid = model.grid
     rng = np.random.default_rng(seed)
-    K = model.K
     if richardson_steps is None:
-        richardson_steps = K
+        richardson_steps = model.K
     if richardson_steps < 0:
         raise ValueError("richardson_steps must be nonnegative")
 
@@ -613,52 +676,47 @@ def evaluate(
         dtype=torch.float64,
         data_kind=data_kind,
     )
-    rel_r, rel_u = relative_metrics(model, a, f, u_exact, model(a, f))
-    rel_r_nn = rel_r.mean()
-    rel_u_nn = rel_u.mean()
-
-    # Classical baselines on the same batch (numpy path)
-    rel_r_rich = []
-    rel_u_rich = []
-    rel_r_pcg = []
-    rel_u_pcg = []
-    iters_pcg = []
-    for b in range(n_eval):
-        aa = a[b].cpu().numpy()
-        ff = f[b].cpu().numpy()
-        ue = u_exact[b].cpu().numpy()
-
-        rich = solve_axy_richardson(
-            aa, ff, grid, omega=1.0, tol=0.0, maxiter=richardson_steps
-        )
-        rel_r_rich.append(rich.residual_history[-1])
-        rel_u_rich.append(_relative_l2(rich.u - ue, ue, grid))
-
-        if data_kind == "mms":
-            pcg = solve_axy_pcg(aa, ff, grid, tol=1e-10, maxiter=500)
-            rel_r_pcg.append(pcg.residual_history[-1])
-            rel_u_pcg.append(_relative_l2(pcg.u - ue, ue, grid))
-            iters_pcg.append(pcg.iterations)
-        else:
-            # In solver mode ue is already the PCG-generated reference. Do not
-            # rerun the same algorithm and report the tautological zero error.
-            reference_residual = ff - apply_div_a_grad(ue, aa, grid)
-            rel_r_pcg.append(_relative_l2(reference_residual, ff, grid))
-
-    print(f"[eval] held-out random batch (data={data_kind})")
-    print(f"  LGF-CNN (K={K}):          rel_res={rel_r_nn:.3e}  rel_u={rel_u_nn:.3e}")
-    print(
-        f"  Richardson (K={richardson_steps}):  rel_res={np.mean(rel_r_rich):.3e}  "
-        f"rel_u={np.mean(rel_u_rich):.3e}"
+    names = [f"sample_{index:03d}" for index in range(n_eval)]
+    bundle = evaluate_batch(
+        model,
+        names,
+        a,
+        f,
+        u_exact,
+        richardson_steps=richardson_steps,
     )
-    if data_kind == "mms":
+    print(f"[eval] held-out random batch (data={data_kind})")
+    for method in ("LGF-CNN", "Richardson", "PCG"):
+        summary = bundle["solver_summary"][method]
         print(
-            f"  PCG (to 1e-10):         rel_res={np.mean(rel_r_pcg):.3e}  "
-            f"rel_u={np.mean(rel_u_pcg):.3e}  "
-            f"mean_iters={np.mean(iters_pcg):.1f}"
+            f"  {method:12s}  rel_res={summary['relRes']['mean']:.3e}  "
+            f"rel_u={summary['relL2']['mean']:.3e}  "
+            f"time={summary['time_ms']['mean']:.3f} ms/sample"
         )
-    else:
-        print(f"  PCG reference labels:   rel_res={np.mean(rel_r_pcg):.3e}  rel_u=n/a")
+
+    if output_dir is not None:
+        metadata = {
+            "model_type": MODEL_TYPE,
+            "evaluation": "heldout_random",
+            "data_kind": data_kind,
+            "n": grid.n,
+            "domain": [grid.x_min, grid.x_max],
+            "h": grid.h,
+            "contrast": contrast,
+            "test_seed": seed,
+            "samples": n_eval,
+            "richardson_steps": richardson_steps,
+            "pcg_tolerance": 1e-10,
+        }
+        if checkpoint_path is not None:
+            metadata["checkpoint_sha256"] = _file_sha256(checkpoint_path)
+        _save_evaluation_outputs(
+            bundle,
+            output_dir,
+            "heldout",
+            metadata,
+        )
+        print(f"[eval] data saved to {output_dir}")
 
     # Fixed manufactured problem
     prob = make_problem(
@@ -672,7 +730,14 @@ def evaluate(
     f_t = torch.as_tensor(prob.f[None], dtype=torch.float64, device=device)
     u_t = torch.as_tensor(prob.u_exact[None], dtype=torch.float64, device=device)
     rel_r_t, rel_u_t = relative_metrics(model, a_t, f_t, u_t, model(a_t, f_t))
-    rich = solve_axy_richardson(prob.a, prob.f, grid, omega=1.0, tol=0.0, maxiter=K)
+    rich = solve_axy_richardson(
+        prob.a,
+        prob.f,
+        grid,
+        omega=1.0,
+        tol=0.0,
+        maxiter=model.K,
+    )
     r_rich = prob.f - apply_div_a_grad(rich.u, prob.a, grid)
     print("[eval] manufactured smooth_sine (discrete f)")
     print(
@@ -682,6 +747,7 @@ def evaluate(
         f"  Richardson:  rel_res={l2_norm(r_rich, grid) / l2_norm(prob.f, grid):.3e}  "
         f"rel_u={l2_norm(rich.u - prob.u_exact, grid) / l2_norm(prob.u_exact, grid):.3e}"
     )
+    return bundle
 
 
 def u1_u4_cases(grid: SquareGrid) -> tuple[list[str], np.ndarray]:
@@ -706,9 +772,41 @@ def u1_u4_cases(grid: SquareGrid) -> tuple[list[str], np.ndarray]:
     return list(cases), np.stack(list(cases.values()), axis=0)
 
 
+def _result_dir(result_root: Path, run_name: str, test_seed: int) -> Path:
+    """One compact, seed-isolated result directory per trained model."""
+    return result_root / f"{run_name}_s{test_seed}"
+
+
+def _checkpoint_run_name(checkpoint_path: Path) -> str:
+    parent = checkpoint_path.parent
+    return parent.parent.name if parent.name == "checkpoints" else parent.name
+
+
+@torch.no_grad()
+def _evaluate_u1_u4(
+    model: LGFCNN,
+    contrast: float,
+    seed: int,
+) -> dict:
+    grid = model.grid
+    device = model.bank.lambdas.device
+    names, u_exact_np = u1_u4_cases(grid)
+    a_single = sample_coefficient(
+        grid,
+        batch_size=1,
+        contrast=contrast,
+        rng=np.random.default_rng(seed),
+    )
+    a_np = np.repeat(a_single, len(names), axis=0)
+    a = torch.as_tensor(a_np, dtype=torch.float64, device=device)
+    u_exact = torch.as_tensor(u_exact_np, dtype=torch.float64, device=device)
+    f = model.ops.apply_div_a_grad(u_exact, a)
+    return evaluate_batch(model, names, a, f, u_exact)
+
+
 @torch.no_grad()
 def run_prediction(args: argparse.Namespace) -> None:
-    """Predict fixed MMS u1-u4 with a trained model and save their metrics.
+    """Predict fixed MMS u1-u4 and save complete data plus matching figures.
 
     The u1-u4 cases are fixed manufactured solutions (f = A_h u by
     definition), independent of the data kind the model was trained on.
@@ -718,79 +816,68 @@ def run_prediction(args: argparse.Namespace) -> None:
     print("[predict] using fixed MMS u1-u4 cases for cross-model comparison")
     model, saved = load_model(args.predict_from, args.device)
     grid = model.grid
-    device = model.bank.lambdas.device
     contrast = saved.get("contrast", 0.5)
-
-    names, u_exact_np = u1_u4_cases(grid)
-    # Use one fixed coefficient field for all four solutions so the comparison
-    # isolates solution complexity rather than coefficient variation.
-    a_single = sample_coefficient(
-        grid,
-        batch_size=1,
-        contrast=contrast,
-        rng=np.random.default_rng(args.test_seed),
-    )
-    a_np = np.repeat(a_single, len(names), axis=0)
-    a = torch.as_tensor(a_np, dtype=torch.float64, device=device)
-    u_exact = torch.as_tensor(u_exact_np, dtype=torch.float64, device=device)
-    f = model.ops.apply_div_a_grad(u_exact, a)
-    u_pred = model(a, f)
-    rel_r, rel_u = relative_metrics(model, a, f, u_exact, u_pred)
-
-    rows = [
-        {
-            "case": name,
-            "rel_res": float(rel_r[i]),
-            "rel_u": float(rel_u[i]),
-        }
-        for i, name in enumerate(names)
-    ]
-    for row in rows:
+    bundle = _evaluate_u1_u4(model, contrast, args.test_seed)
+    for row in bundle["metrics"]:
         print(
-            f"[predict] {row['case']}: rel_res={row['rel_res']:.3e} "
-            f"rel_u={row['rel_u']:.3e}"
+            f"[predict] {row['case']}: rel_res={row['relRes']:.3e} "
+            f"rel_u={row['relL2']:.3e}  RMSE={row['RMSE']:.3e}  "
+            f"maxErr={row['maxError']:.3e}"
         )
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _write_csv(rows, output_dir / "metrics.csv")
-    summary = {
+    run_name = _checkpoint_run_name(args.predict_from)
+    output_dir = (
+        args.output_dir
+        if args.output_dir is not None
+        else _result_dir(args.result_root, run_name, args.test_seed)
+    )
+    data_dir = output_dir / "data"
+    figure_dir = output_dir / "figures"
+    metadata = {
         "model_type": MODEL_TYPE,
+        "evaluation": "fixed_u1_u4",
         "train_data_kind": saved.get("data_kind", "mms"),
         "prediction_data_kind": "mms",
         "coefficient_policy": "same_field_for_all_cases",
         "n": grid.n,
         "domain": [grid.x_min, grid.x_max],
+        "h": grid.h,
         "contrast": contrast,
         "test_seed": args.test_seed,
         "checkpoint_sha256": _file_sha256(Path(args.predict_from)),
-        "relResMean": float(rel_r.mean()),
-        "relResMax": float(rel_r.max()),
-        "relUMean": float(rel_u.mean()),
-        "relUMax": float(rel_u.max()),
-        "cases": {
-            row["case"]: {"rel_res": row["rel_res"], "rel_u": row["rel_u"]}
-            for row in rows
-        },
     }
-    with (output_dir / "summary.json").open("w") as file:
-        json.dump(summary, file, indent=2, ensure_ascii=False)
+    predictions_path = _save_evaluation_outputs(
+        bundle,
+        data_dir,
+        "u1_u4",
+        metadata,
+    )
+    _copy_training_history(
+        args.predict_from.parent / "history.csv",
+        data_dir,
+    )
 
     if args.predict_save:
-        target = Path(args.predict_save)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "names": names,
-                "a": a.cpu(),
-                "f": f.cpu(),
-                "u_exact": u_exact.cpu(),
-                "u_pred": u_pred.cpu(),
-                "metrics": summary,
-            },
-            target,
+        _save_prediction_tensor(bundle, Path(args.predict_save), metadata)
+
+    if not args.no_plot:
+        from .plots import generate_pinn_style_figures
+
+        generate_pinn_style_figures(
+            model=model,
+            history_path=args.predict_from.parent / "history.csv",
+            figure_dir=figure_dir,
+            experiment_name=run_name,
+            case=args.plot_case,
+            contrast=contrast,
+            seed=args.test_seed,
+            loss_mode=saved.get("loss_mode", "supervised"),
+            evaluation=bundle,
         )
-    print(f"saved metrics to {output_dir}")
+    print(f"[predict] data: {data_dir}")
+    if not args.no_plot:
+        print(f"[predict] figures: {figure_dir}")
+    print(f"[predict] predictions: {predictions_path}")
 
 
 def main() -> None:
@@ -848,7 +935,15 @@ def main() -> None:
         help="independent test/prediction seed (validation always uses seed+1)",
     )
     p.add_argument("--predict-save", default="")
-    p.add_argument("--output-dir", default=DEFAULT_PREDICT_OUTPUT_DIR)
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_PREDICT_OUTPUT_DIR,
+        help=(
+            "prediction result directory; default derives a parameter-safe "
+            "directory below --result-root"
+        ),
+    )
     p.add_argument(
         "--result-root",
         type=Path,
@@ -868,9 +963,7 @@ def main() -> None:
         p.error("--predict requires --predict-from")
     if not args.predict and args.predict_from is not None:
         p.error("--predict-from requires --predict")
-    if not args.predict and (
-        args.predict_save or args.output_dir != DEFAULT_PREDICT_OUTPUT_DIR
-    ):
+    if not args.predict and (args.predict_save or args.output_dir is not None):
         p.error("--predict-save and --output-dir require --predict")
     if args.retrain and (args.predict or args.eval_only is not None):
         p.error("--retrain cannot be combined with --predict or --eval-only")
@@ -882,19 +975,42 @@ def main() -> None:
 
     if args.eval_only is not None:
         model, saved = load_model(args.eval_only, args.device)
+        checkpoint_name = _checkpoint_run_name(args.eval_only)
+        result_dir = _result_dir(
+            args.result_root,
+            checkpoint_name,
+            args.test_seed,
+        )
+        data_dir = result_dir / "data"
+        figure_dir = result_dir / "figures"
+        fixed_bundle = _evaluate_u1_u4(
+            model,
+            saved.get("contrast", 0.5),
+            args.test_seed,
+        )
+        fixed_metadata = {
+            "model_type": MODEL_TYPE,
+            "evaluation": "fixed_u1_u4",
+            "train_data_kind": saved.get("data_kind", "mms"),
+            "prediction_data_kind": "mms",
+            "coefficient_policy": "same_field_for_all_cases",
+            "n": model.grid.n,
+            "domain": [model.grid.x_min, model.grid.x_max],
+            "h": model.grid.h,
+            "contrast": saved.get("contrast", 0.5),
+            "test_seed": args.test_seed,
+            "checkpoint_sha256": _file_sha256(args.eval_only),
+        }
+        _save_evaluation_outputs(
+            fixed_bundle,
+            data_dir,
+            "u1_u4",
+            fixed_metadata,
+        )
+        _copy_training_history(args.eval_only.parent / "history.csv", data_dir)
         if not args.no_plot:
-            from .pinn_style_plots import generate_pinn_style_figures
+            from .plots import generate_pinn_style_figures
 
-            checkpoint_name = (
-                args.eval_only.parent.name
-                if args.eval_only.name in ("best.pt", "last.pt")
-                else args.eval_only.stem
-            )
-            figure_dir = (
-                args.result_root
-                / checkpoint_name
-                / f"s{args.test_seed}"
-            )
             generate_pinn_style_figures(
                 model=model,
                 history_path=args.eval_only.parent / "history.csv",
@@ -904,6 +1020,7 @@ def main() -> None:
                 contrast=saved.get("contrast", 0.5),
                 seed=args.test_seed,
                 loss_mode=saved.get("loss_mode", "supervised"),
+                evaluation=fixed_bundle,
             )
             print(f"[plot] PINN-style figures saved to {figure_dir}")
         evaluate(
@@ -911,6 +1028,8 @@ def main() -> None:
             contrast=saved.get("contrast", 0.5),
             seed=args.test_seed,
             data_kind=saved.get("data_kind", "mms"),
+            output_dir=data_dir,
+            checkpoint_path=args.eval_only,
         )
         return
 
@@ -977,14 +1096,32 @@ def main() -> None:
                 shutil.rmtree(attempt_dir, ignore_errors=True)
         # Keep the run lock while reading history so a concurrent --retrain
         # cannot pair an older in-memory model with a newly promoted curve.
+        result_dir = _result_dir(args.result_root, run_key, args.test_seed)
+        data_dir = result_dir / "data"
+        figure_dir = result_dir / "figures"
+        fixed_bundle = _evaluate_u1_u4(model, cfg.contrast, args.test_seed)
+        _save_evaluation_outputs(
+            fixed_bundle,
+            data_dir,
+            "u1_u4",
+            {
+                "model_type": MODEL_TYPE,
+                "evaluation": "fixed_u1_u4",
+                "train_data_kind": cfg.data_kind,
+                "prediction_data_kind": "mms",
+                "coefficient_policy": "same_field_for_all_cases",
+                "n": model.grid.n,
+                "domain": [model.grid.x_min, model.grid.x_max],
+                "h": model.grid.h,
+                "contrast": cfg.contrast,
+                "test_seed": args.test_seed,
+                "checkpoint_sha256": _file_sha256(best_path),
+            },
+        )
+        _copy_training_history(run_dir / "history.csv", data_dir)
         if not args.no_plot:
-            from .pinn_style_plots import generate_pinn_style_figures
+            from .plots import generate_pinn_style_figures
 
-            figure_dir = (
-                args.result_root
-                / run_key
-                / f"s{args.test_seed}"
-            )
             generate_pinn_style_figures(
                 model=model,
                 history_path=run_dir / "history.csv",
@@ -994,6 +1131,7 @@ def main() -> None:
                 contrast=cfg.contrast,
                 seed=args.test_seed,
                 loss_mode=cfg.loss_mode,
+                evaluation=fixed_bundle,
             )
             print(f"[plot] PINN-style figures saved to {figure_dir}")
     evaluate(
@@ -1001,7 +1139,12 @@ def main() -> None:
         contrast=cfg.contrast,
         seed=args.test_seed,
         data_kind=cfg.data_kind,
+        output_dir=data_dir,
+        checkpoint_path=best_path,
     )
+    print(f"[result] data: {data_dir}")
+    if not args.no_plot:
+        print(f"[result] figures: {figure_dir}")
     print(f"done: {run_dir}")
 
 

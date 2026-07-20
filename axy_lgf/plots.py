@@ -1,4 +1,4 @@
-"""PINN-style training, panel, and centerline figures for LGF-CNN."""
+"""training, panel, and centerline figures for LGF-CNN."""
 
 from __future__ import annotations
 
@@ -273,6 +273,7 @@ def generate_pinn_style_figures(
     contrast: float,
     seed: int,
     loss_mode: str,
+    evaluation: dict | None = None,
 ) -> None:
     """Create one training curve and panel/centerline figures for selected cases."""
     selected_cases = ("u1", "u2", "u3", "u4") if case == "all" else (case,)
@@ -287,13 +288,23 @@ def generate_pinn_style_figures(
     model.eval()
     grid = model.grid
     device = model.bank.lambdas.device
-    a_np = sample_coefficient(
-        grid,
-        batch_size=1,
-        contrast=contrast,
-        rng=np.random.default_rng(seed),
-    )[0]
-    a = torch.as_tensor(a_np[None], dtype=torch.float64, device=device)
+    if evaluation is None:
+        a_np = sample_coefficient(
+            grid,
+            batch_size=1,
+            contrast=contrast,
+            rng=np.random.default_rng(seed),
+        )[0]
+        evaluation_names = None
+    else:
+        evaluation_names = list(evaluation["names"])
+        missing = [
+            selected_case
+            for selected_case in selected_cases
+            if selected_case not in evaluation_names
+        ]
+        if missing:
+            raise ValueError(f"evaluation is missing plot case: {missing[0]}")
     full_extent = [grid.x_min, grid.x_max, grid.x_min, grid.x_max]
     residual_extent = [
         grid.x_min + grid.h,
@@ -311,14 +322,34 @@ def generate_pinn_style_figures(
     )
 
     for selected_case in selected_cases:
-        u_true_np = _fixed_case(grid, selected_case)
+        if evaluation is None:
+            u_true_np = _fixed_case(grid, selected_case)
+            current_a_np = a_np
+            u_pred_np = None
+        else:
+            index = evaluation_names.index(selected_case)
+            u_true_np = evaluation["u_exact"][index]
+            current_a_np = evaluation["a"][index]
+            u_pred_np = evaluation["u_pred"][index]
+        a = torch.as_tensor(
+            current_a_np[None],
+            dtype=torch.float64,
+            device=device,
+        )
         u_true = torch.as_tensor(
             u_true_np[None],
             dtype=torch.float64,
             device=device,
         )
         f = model.ops.apply_div_a_grad(u_true, a)
-        u_pred = model(a, f)
+        if u_pred_np is None:
+            u_pred = model(a, f)
+        else:
+            u_pred = torch.as_tensor(
+                u_pred_np[None],
+                dtype=torch.float64,
+                device=device,
+            )
         res_pred = model.residual(u_pred, a, f)
         res_exact = model.residual(u_true, a, f)
 

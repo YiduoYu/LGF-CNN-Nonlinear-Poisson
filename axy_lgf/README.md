@@ -86,13 +86,17 @@ axy_lgf/checkpoints/lgf_cnn_axy/<实验参数和哈希>/completed.json
 每次新训练结束后会自动按照 PINN 的布局生成以下图片：
 
 ```text
-axy_lgf/result/<实验参数和哈希>/N<n>/<case>/s<test-seed>/figures/training_curve.png
-axy_lgf/result/<实验参数和哈希>/N<n>/<case>/s<test-seed>/figures/lgf_cnn_centerline.png
-axy_lgf/result/<实验参数和哈希>/N<n>/<case>/s<test-seed>/figures/lgf_cnn_panel.png
+axy_lgf/result/<实验参数和哈希>/s<test-seed>/training_curve.png
+axy_lgf/result/<实验参数和哈希>/s<test-seed>/u1_centerline.png
+axy_lgf/result/<实验参数和哈希>/s<test-seed>/u1_panel.png
+...
+axy_lgf/result/<实验参数和哈希>/s<test-seed>/u4_centerline.png
+axy_lgf/result/<实验参数和哈希>/s<test-seed>/u4_panel.png
 ```
 
-默认绘制 `u2`；可通过 `--plot-case u1|u2|u3|u4` 修改。使用
-`--no-plot` 可关闭自动绘图。所有图的坐标范围均来自 checkpoint 中保存的
+默认一次绘制 `u1`–`u4`，四组图共享同一个测试系数场。可通过
+`--plot-case u1|u2|u3|u4` 只绘制某一个 case；使用 `--no-plot`
+可关闭自动绘图。所有图的坐标范围均来自 checkpoint 中保存的
 `domain_min/domain_max`，不会在绘图代码中写死。
 
 ### 在同一组 MMS u1–u4 上比较

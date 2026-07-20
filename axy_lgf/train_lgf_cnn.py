@@ -857,9 +857,9 @@ def main() -> None:
     )
     p.add_argument(
         "--plot-case",
-        choices=("u1", "u2", "u3", "u4"),
-        default="u2",
-        help="fixed MMS case used for the panel and centerline figures",
+        choices=("all", "u1", "u2", "u3", "u4"),
+        default="all",
+        help="MMS case(s) used for figures; default generates u1-u4",
     )
     p.add_argument("--no-plot", action="store_true")
     args = p.parse_args()
@@ -893,10 +893,7 @@ def main() -> None:
             figure_dir = (
                 args.result_root
                 / checkpoint_name
-                / f"N{model.grid.n}"
-                / args.plot_case
                 / f"s{args.test_seed}"
-                / "figures"
             )
             generate_pinn_style_figures(
                 model=model,
@@ -986,10 +983,7 @@ def main() -> None:
             figure_dir = (
                 args.result_root
                 / run_key
-                / f"N{cfg.n}"
-                / args.plot_case
                 / f"s{args.test_seed}"
-                / "figures"
             )
             generate_pinn_style_figures(
                 model=model,

@@ -274,46 +274,26 @@ def generate_pinn_style_figures(
     seed: int,
     loss_mode: str,
 ) -> None:
-    """Create training_curve, LGF-CNN panel, and centerline figures."""
+    """Create one training curve and panel/centerline figures for selected cases."""
+    selected_cases = ("u1", "u2", "u3", "u4") if case == "all" else (case,)
+    invalid_cases = [
+        selected_case
+        for selected_case in selected_cases
+        if selected_case not in ("u1", "u2", "u3", "u4")
+    ]
+    if invalid_cases:
+        raise ValueError(f"unknown plot case: {invalid_cases[0]}")
+
     model.eval()
     grid = model.grid
     device = model.bank.lambdas.device
-    u_true_np = _fixed_case(grid, case)
     a_np = sample_coefficient(
         grid,
         batch_size=1,
         contrast=contrast,
         rng=np.random.default_rng(seed),
     )[0]
-
     a = torch.as_tensor(a_np[None], dtype=torch.float64, device=device)
-    u_true = torch.as_tensor(u_true_np[None], dtype=torch.float64, device=device)
-    f = model.ops.apply_div_a_grad(u_true, a)
-    u_pred = model(a, f)
-    res_pred = model.residual(u_pred, a, f)
-    res_exact = model.residual(u_true, a, f)
-
-    u_true_np = u_true.cpu().numpy()[0]
-    u_pred_np = u_pred.cpu().numpy()[0]
-    f_np = f.cpu().numpy()[0]
-    res_pred_np = res_pred.cpu().numpy()[0]
-    res_exact_np = res_exact.cpu().numpy()[0]
-    error_np = u_pred_np - u_true_np
-
-    rel_l2 = float(
-        np.linalg.norm(error_np.ravel())
-        / max(np.linalg.norm(u_true_np.ravel()), 1e-14)
-    )
-    max_error = float(np.max(np.abs(error_np)))
-    fd_res_rmse = float(np.sqrt(np.mean(res_pred_np**2)))
-    fd_ref_res_rmse = float(np.sqrt(np.mean(res_exact_np**2)))
-
-    title = (
-        f"LGF-CNN {case} contrast={contrast:g} N={grid.n} | "
-        f"relL2={rel_l2:.3e}  maxErr={max_error:.3e}  "
-        f"fdResRMSE={fd_res_rmse:.3e}  "
-        f"fdRefResRMSE={fd_ref_res_rmse:.3e}"
-    )
     full_extent = [grid.x_min, grid.x_max, grid.x_min, grid.x_max]
     residual_extent = [
         grid.x_min + grid.h,
@@ -329,23 +309,57 @@ def generate_pinn_style_figures(
         f"LGF-CNN training — {experiment_name}",
         loss_mode,
     )
-    save_panel(
-        _with_zero_boundary(u_true_np),
-        _with_zero_boundary(u_pred_np),
-        _with_zero_boundary(error_np),
-        _with_zero_boundary(f_np),
-        res_pred_np,
-        res_exact_np,
-        figure_dir / "lgf_cnn_panel.png",
-        title,
-        full_extent,
-        residual_extent,
-    )
-    save_centerline(
-        _with_zero_boundary(u_true_np),
-        _with_zero_boundary(u_pred_np),
-        figure_dir / "lgf_cnn_centerline.png",
-        title,
-        grid.x_min,
-        grid.x_max,
-    )
+
+    for selected_case in selected_cases:
+        u_true_np = _fixed_case(grid, selected_case)
+        u_true = torch.as_tensor(
+            u_true_np[None],
+            dtype=torch.float64,
+            device=device,
+        )
+        f = model.ops.apply_div_a_grad(u_true, a)
+        u_pred = model(a, f)
+        res_pred = model.residual(u_pred, a, f)
+        res_exact = model.residual(u_true, a, f)
+
+        u_true_np = u_true.cpu().numpy()[0]
+        u_pred_np = u_pred.cpu().numpy()[0]
+        f_np = f.cpu().numpy()[0]
+        res_pred_np = res_pred.cpu().numpy()[0]
+        res_exact_np = res_exact.cpu().numpy()[0]
+        error_np = u_pred_np - u_true_np
+
+        rel_l2 = float(
+            np.linalg.norm(error_np.ravel())
+            / max(np.linalg.norm(u_true_np.ravel()), 1e-14)
+        )
+        max_error = float(np.max(np.abs(error_np)))
+        fd_res_rmse = float(np.sqrt(np.mean(res_pred_np**2)))
+        fd_ref_res_rmse = float(np.sqrt(np.mean(res_exact_np**2)))
+
+        title = (
+            f"LGF-CNN {selected_case} contrast={contrast:g} N={grid.n} | "
+            f"relL2={rel_l2:.3e}  maxErr={max_error:.3e}  "
+            f"fdResRMSE={fd_res_rmse:.3e}  "
+            f"fdRefResRMSE={fd_ref_res_rmse:.3e}"
+        )
+        save_panel(
+            _with_zero_boundary(u_true_np),
+            _with_zero_boundary(u_pred_np),
+            _with_zero_boundary(error_np),
+            _with_zero_boundary(f_np),
+            res_pred_np,
+            res_exact_np,
+            figure_dir / f"{selected_case}_panel.png",
+            title,
+            full_extent,
+            residual_extent,
+        )
+        save_centerline(
+            _with_zero_boundary(u_true_np),
+            _with_zero_boundary(u_pred_np),
+            figure_dir / f"{selected_case}_centerline.png",
+            title,
+            grid.x_min,
+            grid.x_max,
+        )

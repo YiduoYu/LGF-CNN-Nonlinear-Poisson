@@ -758,7 +758,7 @@ def test_cases_u1_u4(grid: SquareGrid) -> tuple[list[str], np.ndarray]:
     return names, values
 
 
-@torch.no_grad()
+@torch.no_grad() 
 def predict_u1_u4(
     model: LGFCNN,
     contrast: float,

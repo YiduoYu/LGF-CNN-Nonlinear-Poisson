@@ -18,10 +18,10 @@ class SquareGrid:
     L: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.n < 2:
-            raise ValueError("n must be >= 2")
-        if self.L <= 0:
-            raise ValueError("L must be positive")
+        if not isinstance(self.n, (int, np.integer)) or self.n < 2:
+            raise ValueError("n must be an integer >= 2")
+        if not np.isfinite(self.L) or self.L <= 0:
+            raise ValueError("L must be finite and positive")
 
     @property
     def h(self) -> float:

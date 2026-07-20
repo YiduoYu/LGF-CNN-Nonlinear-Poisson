@@ -2,24 +2,33 @@
 """Plot LGF-CNN predictions, errors, residuals, and mixing fields.
 
 Usage:
-    source ~/myenv/bin/activate
-    cd /Users/qing/Dropbox/Research/LGFNN
-    python -m axy_lgf.plot_lgf_cnn
-    python -m axy_lgf.plot_lgf_cnn --ckpt axy_lgf/checkpoints/lgf_cnn_axy.pt
+    python -m axy_lgf.plot_lgf_cnn --ckpt path/to/best.pt
+    python -m axy_lgf.plot_lgf_cnn \
+        --ckpt path/to/best.pt --outdir results/figures
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import tempfile
 from pathlib import Path
 
-# Prefer a writable Matplotlib config dir inside the workspace.
-os.environ.setdefault(
-    "MPLCONFIGDIR",
-    str(Path(__file__).resolve().parent / ".mplconfig"),
-)
+if "MPLCONFIGDIR" not in os.environ:
+    cache_root = Path(
+        os.environ.get(
+            "XDG_CACHE_HOME",
+            Path(tempfile.gettempdir()) / "axy_lgf_cache",
+        )
+    )
+    mpl_config = cache_root / "matplotlib"
+    mpl_config.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("XDG_CACHE_HOME", str(cache_root))
+    os.environ["MPLCONFIGDIR"] = str(mpl_config)
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -30,26 +39,7 @@ from .lgf_cnn import LGFCNN
 from .manufactured import make_problem
 from .operators import apply_div_a_grad, l2_norm
 from .solvers import solve_axy_richardson
-
-
-def load_model(ckpt_path: Path, device: str = "cpu") -> tuple[LGFCNN, dict]:
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg = ckpt["config"]
-    grid = SquareGrid(n=cfg["n"])
-    model = LGFCNN(
-        grid,
-        J=cfg["J"],
-        K=cfg["K"],
-        hidden=cfg["hidden"],
-        eta_max=cfg.get("eta_max", 1.0),
-        dtype=torch.float64,
-        device=torch.device(device),
-    )
-    model.load_state_dict(ckpt["state_dict"])
-    model.mixers.to(device)
-    model.bank.to(device)
-    model.eval()
-    return model, cfg
+from .train_lgf_cnn import load_model
 
 
 @torch.no_grad()
@@ -59,28 +49,13 @@ def run_with_intermediates(
     f: torch.Tensor,
 ) -> dict:
     """Forward pass collecting per-block fields for plotting."""
-    u = torch.zeros_like(f)
-    hist_u = [u.cpu().numpy()[0].copy()]
-    hist_res = []
-    alphas = []
-    etas = []
-
-    for k in range(model.K):
-        r = f - model.ops.apply_div_a_grad(u, a)
-        hist_res.append(r.cpu().numpy()[0].copy())
-        z = model.bank.apply(r)
-        inv_a = 1.0 / a.clamp_min(1e-8)
-        feats = torch.cat([torch.stack([a, inv_a, r], dim=1), z], dim=1)
-        alpha, eta = model._mixer(k)(feats.float())
-        alpha = alpha.to(dtype=u.dtype)
-        eta = eta.to(dtype=u.dtype)
-        mixed = torch.sum(alpha * z, dim=1)
-        if model.use_inv_a_scale:
-            mixed = inv_a * mixed
-        u = u + model.eta_max * eta.squeeze(1) * mixed
-        hist_u.append(u.cpu().numpy()[0].copy())
-        alphas.append(alpha.cpu().numpy()[0].copy())
-        etas.append(eta.cpu().numpy()[0, 0].copy())
+    u_initial = torch.zeros_like(f)
+    u, diagnostics = model.forward_with_diagnostics(a, f, u0=u_initial)
+    hist_u = [u_initial.cpu().numpy()[0].copy()]
+    hist_u.extend(step["u"].cpu().numpy()[0].copy() for step in diagnostics)
+    hist_res = [step["residual"].cpu().numpy()[0].copy() for step in diagnostics]
+    alphas = [step["alpha"].cpu().numpy()[0].copy() for step in diagnostics]
+    etas = [step["eta"].cpu().numpy()[0, 0].copy() for step in diagnostics]
 
     r_final = (f - model.ops.apply_div_a_grad(u, a)).cpu().numpy()[0]
     return {
@@ -96,7 +71,7 @@ def run_with_intermediates(
 
 def _extent(grid: SquareGrid) -> list[float]:
     h = grid.h
-    return [h, grid.L - h, h, grid.L - h]
+    return [0.5 * h, grid.L - 0.5 * h, 0.5 * h, grid.L - 0.5 * h]
 
 
 def _imshow(ax, field, extent, title, cmap="viridis", vmin=None, vmax=None):
@@ -143,7 +118,7 @@ def plot_solution_panel(
         err_nn,
         extent,
         r"$u_{\mathrm{CNN}}-u_{\mathrm{exact}}$"
-        f"\nrel$_u$={l2_norm(err_nn, grid)/l2_norm(u_exact, grid):.2e}",
+        f"\nrel$_u$={l2_norm(err_nn, grid) / l2_norm(u_exact, grid):.2e}",
         cmap="coolwarm",
         vmin=-emax,
         vmax=emax,
@@ -153,12 +128,14 @@ def plot_solution_panel(
         err_rich,
         extent,
         r"$u_{\mathrm{Rich}}-u_{\mathrm{exact}}$"
-        f"\nrel$_u$={l2_norm(err_rich, grid)/l2_norm(u_exact, grid):.2e}",
+        f"\nrel$_u$={l2_norm(err_rich, grid) / l2_norm(u_exact, grid):.2e}",
         cmap="coolwarm",
         vmin=-emax,
         vmax=emax,
     )
-    _imshow(axes[1, 2], r_nn, extent, r"residual $f-A u_{\mathrm{CNN}}$", cmap="coolwarm")
+    _imshow(
+        axes[1, 2], r_nn, extent, r"residual $f-A u_{\mathrm{CNN}}$", cmap="coolwarm"
+    )
 
     fig.savefig(out, dpi=160)
     plt.close(fig)
@@ -184,16 +161,14 @@ def plot_residual_history(
         r = f - apply_div_a_grad(u, a, grid)
         cnn_res.append(l2_norm(r, grid) / f_norm)
 
-    rich_res = [1.0]
-    u = np.zeros_like(f)
-    P = None
-    from .lgf_inverse import DirichletLGF
-
-    P = DirichletLGF(grid, a0=float(np.mean(a)), sigma=0.0)
-    for _ in range(model.K):
-        r = f - apply_div_a_grad(u, a, grid)
-        u = u + P(r)
-        rich_res.append(l2_norm(f - apply_div_a_grad(u, a, grid), grid) / f_norm)
+    rich_res = solve_axy_richardson(
+        a,
+        f,
+        grid,
+        omega=1.0,
+        tol=0.0,
+        maxiter=model.K,
+    ).residual_history
 
     fig, ax = plt.subplots(figsize=(6.5, 4), constrained_layout=True)
     ks = np.arange(0, model.K + 1)
@@ -222,15 +197,23 @@ def plot_mixer_fields(
     lambdas = info["lambdas"]
     J = alpha.shape[0]
 
-    ncols = min(J, 3)
+    ncols = min(max(J, 2), 3)
     nrows = int(np.ceil(J / ncols)) + 1
-    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 2.8 * nrows), constrained_layout=True)
-    if nrows == 1:
-        axes = np.array([axes])
-    axes = np.atleast_2d(axes)
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(3.2 * ncols, 2.8 * nrows), constrained_layout=True
+    )
+    axes = np.asarray(axes, dtype=object).reshape(nrows, ncols)
 
     _imshow(axes[0, 0], a, extent, r"$a(x,y)$", cmap="plasma")
-    _imshow(axes[0, 1], eta, extent, rf"$\eta(x)$ (block {block})", cmap="viridis", vmin=0, vmax=1)
+    _imshow(
+        axes[0, 1],
+        eta,
+        extent,
+        rf"$\eta(x)$ (block {block})",
+        cmap="viridis",
+        vmin=0,
+        vmax=1,
+    )
     for c in range(2, ncols):
         axes[0, c].axis("off")
 
@@ -290,12 +273,13 @@ def main() -> None:
     p.add_argument(
         "--ckpt",
         type=Path,
-        default=Path("axy_lgf/checkpoints/lgf_cnn_axy.pt"),
+        required=True,
+        help="checkpoint to plot; pass an explicit best.pt or last.pt",
     )
     p.add_argument(
         "--outdir",
         type=Path,
-        default=Path("axy_lgf/figures"),
+        default=Path("results/lgf_cnn_axy/figures"),
     )
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--device", default="cpu")
@@ -305,6 +289,7 @@ def main() -> None:
     model, cfg = load_model(args.ckpt, device=args.device)
     grid = model.grid
     contrast = cfg.get("contrast", 0.8)
+    data_kind = cfg.get("data_kind", "mms")
     device = torch.device(args.device)
 
     # --- Held-out random sample ---
@@ -317,6 +302,7 @@ def main() -> None:
         rng=rng,
         device=device,
         dtype=torch.float64,
+        data_kind=data_kind,
     )
     info = run_with_intermediates(model, a_t, f_t)
     a = a_t.cpu().numpy()[0]

@@ -19,7 +19,7 @@ import numpy as np
 from .grid import SquareGrid
 from .lgf_inverse import apply_dirichlet_lgf
 from .manufactured import make_problem
-from .operators import apply_div_a_grad, apply_minus_laplacian, l2_norm
+from .operators import apply_minus_laplacian, l2_norm
 from .solvers import solve_axy_pcg, solve_axy_richardson, solve_axy_lgf_bank
 
 
@@ -36,7 +36,9 @@ def check_constant_coefficient_lgf(n: int = 63) -> None:
         raise RuntimeError("Dirichlet LGF failed constant-coefficient check")
 
 
-def run_once(problem: str, n: int, solver: str, tol: float, forcing: str | None) -> None:
+def run_once(
+    problem: str, n: int, solver: str, tol: float, forcing: str | None
+) -> None:
     prob = make_problem(name=problem, n=n, forcing=forcing)
     grid = prob.grid
 

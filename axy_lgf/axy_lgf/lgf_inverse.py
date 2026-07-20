@@ -56,12 +56,14 @@ def apply_dirichlet_lgf(
     -------
     u : (n, n) solution
     """
-    if a0 <= 0:
-        raise ValueError("a0 must be positive")
-    if sigma < 0:
-        raise ValueError("sigma must be nonnegative")
+    if not np.isfinite(a0) or a0 <= 0:
+        raise ValueError("a0 must be finite and positive")
+    if not np.isfinite(sigma) or sigma < 0:
+        raise ValueError("sigma must be finite and nonnegative")
     if rhs.shape != (grid.n, grid.n):
         raise ValueError("rhs shape mismatch")
+    if not np.all(np.isfinite(rhs)):
+        raise ValueError("rhs must contain only finite values")
 
     mu = _laplacian_eigenvalues(grid)
     denom = a0 * mu + sigma
@@ -77,6 +79,10 @@ class DirichletLGF:
     """Callable preconditioner / LGF inverse for -a0 Delta (+ optional sigma)."""
 
     def __init__(self, grid: SquareGrid, a0: float = 1.0, sigma: float = 0.0):
+        if not np.isfinite(a0) or a0 <= 0.0:
+            raise ValueError("a0 must be finite and positive")
+        if not np.isfinite(sigma) or sigma < 0.0:
+            raise ValueError("sigma must be finite and nonnegative")
         self.grid = grid
         self.a0 = float(a0)
         self.sigma = float(sigma)
@@ -84,5 +90,9 @@ class DirichletLGF:
         self._denom = self.a0 * self._mu + self.sigma
 
     def __call__(self, rhs: np.ndarray) -> np.ndarray:
+        if rhs.shape != (self.grid.n, self.grid.n):
+            raise ValueError("rhs shape mismatch")
+        if not np.all(np.isfinite(rhs)):
+            raise ValueError("rhs must contain only finite values")
         rhs_hat = dstn(rhs, type=1, norm="ortho")
         return idstn(rhs_hat / self._denom, type=1, norm="ortho")

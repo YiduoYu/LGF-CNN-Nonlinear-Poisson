@@ -10,8 +10,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .data import sample_coefficient
 from .lgf_cnn import LGFCNN
+from .manufactured import FIXED_CASES
 
 
 def _get_plt():
@@ -24,23 +24,6 @@ def _get_plt():
     import matplotlib.pyplot as plt
 
     return plt
-
-
-def _fixed_case(grid, case: str) -> np.ndarray:
-    x, y = grid.mesh()
-    L = grid.L
-    xi = (x - grid.x_min) / L
-    yi = (y - grid.x_min) / L
-    cases = {
-        "u1": np.sin(np.pi * xi) * np.sin(np.pi * yi),
-        "u2": np.sin(2.0 * np.pi * xi) * np.sin(np.pi * yi),
-        "u3": np.sin(np.pi * xi) * np.sin(2.0 * np.pi * yi)
-        - 0.5
-        * np.sin(2.0 * np.pi * xi)
-        * np.sin(2.0 * np.pi * yi),
-        "u4": np.sin(3.0 * np.pi * xi) * np.sin(3.0 * np.pi * yi),
-    }
-    return cases[case]
 
 
 def _with_zero_boundary(field: np.ndarray) -> np.ndarray:
@@ -105,7 +88,9 @@ def save_panel(
             f_map,
             "forcing f",
             "coolwarm",
-            full_extent,
+            # f does not vanish on the boundary, so it is drawn on the
+            # interior nodes rather than padded with a fabricated zero ring.
+            residual_extent,
             *_sym(f_map),
         ),
         (
@@ -271,16 +256,15 @@ def generate_pinn_style_figures(
     experiment_name: str,
     case: str,
     contrast: float,
-    seed: int,
     loss_mode: str,
-    evaluation: dict | None = None,
+    evaluation: dict,
 ) -> None:
     """Create one training curve and panel/centerline figures for selected cases."""
-    selected_cases = ("u1", "u2", "u3", "u4") if case == "all" else (case,)
+    selected_cases = FIXED_CASES if case == "all" else (case,)
     invalid_cases = [
         selected_case
         for selected_case in selected_cases
-        if selected_case not in ("u1", "u2", "u3", "u4")
+        if selected_case not in FIXED_CASES
     ]
     if invalid_cases:
         raise ValueError(f"unknown plot case: {invalid_cases[0]}")
@@ -288,23 +272,14 @@ def generate_pinn_style_figures(
     model.eval()
     grid = model.grid
     device = model.bank.lambdas.device
-    if evaluation is None:
-        a_np = sample_coefficient(
-            grid,
-            batch_size=1,
-            contrast=contrast,
-            rng=np.random.default_rng(seed),
-        )[0]
-        evaluation_names = None
-    else:
-        evaluation_names = list(evaluation["names"])
-        missing = [
-            selected_case
-            for selected_case in selected_cases
-            if selected_case not in evaluation_names
-        ]
-        if missing:
-            raise ValueError(f"evaluation is missing plot case: {missing[0]}")
+    evaluation_names = list(evaluation["names"])
+    missing = [
+        selected_case
+        for selected_case in selected_cases
+        if selected_case not in evaluation_names
+    ]
+    if missing:
+        raise ValueError(f"evaluation is missing plot case: {missing[0]}")
     full_extent = [grid.x_min, grid.x_max, grid.x_min, grid.x_max]
     residual_extent = [
         grid.x_min + grid.h,
@@ -322,34 +297,23 @@ def generate_pinn_style_figures(
     )
 
     for selected_case in selected_cases:
-        if evaluation is None:
-            u_true_np = _fixed_case(grid, selected_case)
-            current_a_np = a_np
-            u_pred_np = None
-        else:
-            index = evaluation_names.index(selected_case)
-            u_true_np = evaluation["u_exact"][index]
-            current_a_np = evaluation["a"][index]
-            u_pred_np = evaluation["u_pred"][index]
+        index = evaluation_names.index(selected_case)
         a = torch.as_tensor(
-            current_a_np[None],
+            evaluation["a"][index][None],
             dtype=torch.float64,
             device=device,
         )
         u_true = torch.as_tensor(
-            u_true_np[None],
+            evaluation["u_exact"][index][None],
+            dtype=torch.float64,
+            device=device,
+        )
+        u_pred = torch.as_tensor(
+            evaluation["u_pred"][index][None],
             dtype=torch.float64,
             device=device,
         )
         f = model.ops.apply_div_a_grad(u_true, a)
-        if u_pred_np is None:
-            u_pred = model(a, f)
-        else:
-            u_pred = torch.as_tensor(
-                u_pred_np[None],
-                dtype=torch.float64,
-                device=device,
-            )
         res_pred = model.residual(u_pred, a, f)
         res_exact = model.residual(u_true, a, f)
 
@@ -378,7 +342,7 @@ def generate_pinn_style_figures(
             _with_zero_boundary(u_true_np),
             _with_zero_boundary(u_pred_np),
             _with_zero_boundary(error_np),
-            _with_zero_boundary(f_np),
+            f_np,
             res_pred_np,
             res_exact_np,
             figure_dir / f"{selected_case}_panel.png",

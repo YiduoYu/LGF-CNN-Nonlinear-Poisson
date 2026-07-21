@@ -10,13 +10,17 @@ of -a0 * Delta, with no BAE. Includes screened LGF banks and LGF-CNN.
 """
 
 from .solvers import solve_axy_pcg, solve_axy_richardson, solve_axy_lgf_bank
-from .manufactured import make_problem
+from .manufactured import fixed_case_solutions, make_problem
 from .lgf_bank import ScreenedLGFBank
+from .lgf_cnn import LGFCNN, LGFCNNTrainConfig
 
 __all__ = [
     "solve_axy_pcg",
     "solve_axy_richardson",
     "solve_axy_lgf_bank",
     "make_problem",
+    "fixed_case_solutions",
     "ScreenedLGFBank",
+    "LGFCNN",
+    "LGFCNNTrainConfig",
 ]

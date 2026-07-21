@@ -120,8 +120,8 @@ class TorchSquareOps(nn.Module):
         return dst2_ortho(u_hat)
 
     def l2_norm(self, v: torch.Tensor) -> torch.Tensor:
-        """Per-batch discrete L2 norm. v: (B, n, n) -> (B,)."""
-        return torch.sqrt(torch.sum(v * v, dim=(1, 2)) * self.h**2)
+        """Discrete L2 norm over the trailing grid axes, e.g. (B, n, n) -> (B,)."""
+        return torch.sqrt(torch.sum(v * v, dim=(-2, -1)) * self.h**2)
 
 
 class ScreenedLGFBankTorch(nn.Module):
@@ -132,7 +132,6 @@ class ScreenedLGFBankTorch(nn.Module):
         grid: SquareGrid,
         lambdas: np.ndarray | None = None,
         J: int = 6,
-        a0: float = 1.0,
         include_poisson: bool = True,
         dtype=torch.float64,
         device=None,
@@ -148,20 +147,31 @@ class ScreenedLGFBankTorch(nn.Module):
             raise ValueError("lambdas must be a nonempty one-dimensional array")
         if not torch.all(torch.isfinite(lam)) or torch.any(lam < 0.0):
             raise ValueError("lambdas must be finite and nonnegative")
-        if not math.isfinite(a0) or a0 <= 0.0:
-            raise ValueError("a0 must be finite and positive")
         self.register_buffer("lambdas", lam, persistent=True)
-        self.a0 = float(a0)
 
     @property
     def J(self) -> int:
         return int(self.lambdas.numel())
 
-    def apply(self, r: torch.Tensor) -> torch.Tensor:
-        """r: (B, n, n) -> z: (B, J, n, n)."""
+    def apply(self, r: torch.Tensor, a0: torch.Tensor) -> torch.Tensor:
+        """Apply the bank with a per-sample reference coefficient.
+
+        z[b, j] = (a0[b] ((-Delta_h) + lambda_j I))^{-1} r[b]
+
+        Factoring a0 out of the whole operator (rather than screening with a
+        bare lambda_j) keeps every filter shape fixed and makes z exactly
+        (-1)-homogeneous in a0, which is what makes the surrounding block
+        exactly equivariant under a -> c a.  At a0 = 1 this is identical to
+        the unscaled bank.
+
+        r: (B, n, n), a0: (B,) positive -> z: (B, J, n, n)
+        """
         if r.ndim != 3 or r.shape[-2:] != (self.ops.n, self.ops.n):
             raise ValueError("r must have shape (B, n, n)")
+        if a0.ndim != 1 or a0.shape[0] != r.shape[0]:
+            raise ValueError("a0 must have shape (B,)")
         r_hat = dst2_ortho(r)
-        denominators = self.a0 * self.ops.mu[None, :, :] + self.lambdas[:, None, None]
-        z_hat = r_hat[:, None, :, :] / denominators[None, :, :, :]
+        screened = self.ops.mu[None, :, :] + self.lambdas[:, None, None]
+        denominators = a0[:, None, None, None] * screened[None, :, :, :]
+        z_hat = r_hat[:, None, :, :] / denominators
         return dst2_ortho(z_hat)

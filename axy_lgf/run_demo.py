@@ -36,6 +36,19 @@ def check_constant_coefficient_lgf(n: int = 63) -> None:
         raise RuntimeError("Dirichlet LGF failed constant-coefficient check")
 
 
+SOLVERS = {
+    "pcg": solve_axy_pcg,
+    "richardson": solve_axy_richardson,
+    "lgf_bank": solve_axy_lgf_bank,
+}
+
+
+def _solve(prob, solver: str, tol: float):
+    if solver not in SOLVERS:
+        raise ValueError(f"unknown solver {solver!r}; choose from {list(SOLVERS)}")
+    return SOLVERS[solver](prob.a, prob.f, prob.grid, tol=tol)
+
+
 def run_once(
     problem: str, n: int, solver: str, tol: float, forcing: str | None
 ) -> None:
@@ -43,14 +56,7 @@ def run_once(
     grid = prob.grid
 
     t0 = time.perf_counter()
-    if solver == "pcg":
-        result = solve_axy_pcg(prob.a, prob.f, grid, tol=tol)
-    elif solver == "richardson":
-        result = solve_axy_richardson(prob.a, prob.f, grid, omega=1.0, tol=tol)
-    elif solver == "lgf_bank":
-        result = solve_axy_lgf_bank(prob.a, prob.f, grid, tol=tol)
-    else:
-        raise ValueError(solver)
+    result = _solve(prob, solver, tol)
     elapsed = time.perf_counter() - t0
 
     err = l2_norm(result.u - prob.u_exact, grid)
@@ -68,20 +74,33 @@ def run_once(
 
 
 def run_convergence(problem: str, solver: str, tol: float) -> None:
+    """Grid refinement study.
+
+    Only the analytic-forcing table measures discretization error.  With
+    discrete forcing f = A_h u_exact holds exactly, so the solver reproduces
+    u_exact down to its own tolerance and the resulting "error" is a solver
+    floor, not an O(h^p) quantity -- a convergence rate from that column would
+    be meaningless, so none is printed.
+    """
     print(f"[conv] problem={problem}  solver={solver}")
-    print(f"{'n':>6}  {'iters':>6}  {'L2_err':>12}  {'rate':>8}")
+
+    print(f"{'n':>6}  {'iters':>6}  {'L2_err':>12}   (discrete f: solver floor)")
+    for n in (15, 31, 63, 127):
+        prob = make_problem(name=problem, n=n, forcing="discrete")
+        result = _solve(prob, solver, tol)
+        err = l2_norm(result.u - prob.u_exact, prob.grid)
+        print(f"{n:6d}  {result.iterations:6d}  {err:12.3e}")
+
+    if problem != "smooth_sine":
+        print("        (analytic convergence only implemented for smooth_sine)")
+        return
+
+    print(f"{'n':>6}  {'iters':>6}  {'L2_err':>12}  {'rate':>8}   (analytic f)")
     prev_err = None
     prev_h = None
     for n in (15, 31, 63, 127):
-        prob = make_problem(name=problem, n=n, forcing="discrete")
-        if solver == "pcg":
-            result = solve_axy_pcg(prob.a, prob.f, prob.grid, tol=tol)
-        elif solver == "lgf_bank":
-            result = solve_axy_lgf_bank(prob.a, prob.f, prob.grid, tol=tol)
-        else:
-            result = solve_axy_richardson(prob.a, prob.f, prob.grid, tol=tol)
-        # For discrete forcing, A u_exact = f, so solver should recover u_exact
-        # up to tol. Use analytic forcing for true discretization error study.
+        prob = make_problem(name=problem, n=n, forcing="analytic")
+        result = _solve(prob, solver, tol)
         err = l2_norm(result.u - prob.u_exact, prob.grid)
         rate_str = ""
         if prev_err is not None and err > 0:
@@ -90,28 +109,6 @@ def run_convergence(problem: str, solver: str, tol: float) -> None:
         print(f"{n:6d}  {result.iterations:6d}  {err:12.3e}  {rate_str:>8}")
         prev_err = err
         prev_h = prob.grid.h
-
-    print(f"{'n':>6}  {'iters':>6}  {'L2_err':>12}  {'rate':>8}   (analytic f)")
-    prev_err = None
-    prev_h = None
-    for n in (15, 31, 63, 127):
-        if problem != "smooth_sine":
-            print("        (analytic convergence only implemented for smooth_sine)")
-            break
-        prob = make_problem(name=problem, n=n, forcing="analytic")
-        if solver == "pcg":
-            result = solve_axy_pcg(prob.a, prob.f, prob.grid, tol=tol)
-        elif solver == "lgf_bank":
-            result = solve_axy_lgf_bank(prob.a, prob.f, prob.grid, tol=tol)
-        else:
-            result = solve_axy_richardson(prob.a, prob.f, prob.grid, tol=tol)
-        err = l2_norm(result.u - prob.u_exact, prob.grid)
-        rate_str = ""
-        if prev_err is not None and err > 0:
-            rate = np.log(prev_err / err) / np.log(prev_h / prob.grid.h)
-            rate_str = f"{rate:8.2f}"
-        print(f"{n:6d}  {result.iterations:6d}  {err:12.3e}  {rate_str:>8}")
-        prev_err = err
         prev_h = prob.grid.h
 
 

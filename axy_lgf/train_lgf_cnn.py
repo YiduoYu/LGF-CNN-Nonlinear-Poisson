@@ -42,16 +42,20 @@ import numpy as np
 import torch
 
 from .data import make_batch, sample_coefficient
-from .evaluation import evaluate_batch
+from .evaluation import evaluate_batch, run_ood_sweeps
 from .grid import DEFAULT_DOMAIN_MAX, DEFAULT_DOMAIN_MIN, SquareGrid
 from .lgf_cnn import LGFCNN, LGFCNNTrainConfig
 from .operators import apply_div_a_grad, l2_norm
-from .manufactured import make_problem
+from .manufactured import fixed_case_solutions, make_problem
+from .plot_lgf_cnn import generate_pinn_style_figures
 from .solvers import solve_axy_richardson
 
 MODEL_TYPE = "lgf_cnn_axy"
-CHECKPOINT_FORMAT_VERSION = 3
-EXPERIMENT_VERSION = 3
+# Version 4 rescaled the mixer inputs and the LGF bank by per-sample scales.
+# The weights of an older checkpoint mean something different under the new
+# block, so those checkpoints are rejected rather than silently mis-evaluated.
+CHECKPOINT_FORMAT_VERSION = 4
+EXPERIMENT_VERSION = 4
 PROJECT_DIR = Path(__file__).resolve().parent
 RUN_ARTIFACTS = ("best.pt", "last.pt", "history.csv")
 RUN_MANIFEST = "completed.json"
@@ -98,11 +102,19 @@ def training_loss(
     u_pred: torch.Tensor,
     loss_mode: str,
 ) -> torch.Tensor:
-    """Single training objective: squared discrete L2 solution error or residual."""
+    """Single training objective: squared discrete L2 solution or residual error.
+
+    The physics objective minimises the *preconditioned* residual ||G_0 r||
+    rather than ||r||.  Applying G_0 = (a0 (-Delta_h))^{-1} undoes the two
+    orders of the elliptic operator, so the Gauss-Newton Hessian goes from
+    A^T A (condition number O(N^4)) to roughly the identity.  This is one
+    extra DST and is what closes most of the gap to the supervised loss.
+    """
     if loss_mode == "supervised":
         error = u_pred - u_exact
     elif loss_mode == "physics":
-        error = model.residual(u_pred, a, f)
+        residual = model.residual(u_pred, a, f)
+        error = model.ops.apply_lgf(residual, a0=a.mean(dim=(1, 2)))
     else:
         raise ValueError("loss_mode must be 'supervised' or 'physics'")
     return torch.mean(model.ops.l2_norm(error) ** 2)
@@ -111,11 +123,8 @@ def training_loss(
 def _training_config_payload(cfg: LGFCNNTrainConfig) -> dict:
     """Canonical result-affecting config used for run identity checks."""
     payload = asdict(cfg)
-    # Runtime placement does not define the trained model. The lambda fields
-    # remain only for loading legacy checkpoints and are not used by training.
+    # Runtime placement does not define the trained model.
     payload.pop("device", None)
-    payload.pop("lambda_u", None)
-    payload.pop("lambda_r", None)
     for name in (
         "n",
         "J",
@@ -191,48 +200,22 @@ def save_checkpoint(
 
 def load_model(ckpt_path: Path, device: str) -> tuple[LGFCNN, dict]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    format_version = ckpt.get("format_version", 1)
-    if (
-        type(format_version) is not int
-        or format_version < 1
-        or format_version > CHECKPOINT_FORMAT_VERSION
+    for field, expected in (
+        ("format_version", CHECKPOINT_FORMAT_VERSION),
+        ("experiment_version", EXPERIMENT_VERSION),
+        ("model_type", MODEL_TYPE),
     ):
-        raise ValueError(
-            f"unsupported checkpoint format_version={format_version!r}; "
-            f"maximum supported version is {CHECKPOINT_FORMAT_VERSION}"
-        )
-    checkpoint_experiment_version = ckpt.get("experiment_version")
-    invalid_experiment_version = checkpoint_experiment_version is not None and (
-        type(checkpoint_experiment_version) is not int
-        or checkpoint_experiment_version < 1
-        or checkpoint_experiment_version > EXPERIMENT_VERSION
-    )
-    if (format_version >= 3 and checkpoint_experiment_version is None) or (
-        invalid_experiment_version
-    ):
-        raise ValueError(
-            "unsupported checkpoint experiment_version="
-            f"{checkpoint_experiment_version!r}; maximum supported version "
-            f"is {EXPERIMENT_VERSION}"
-        )
-    model_type = ckpt.get("model_type")
-    # Checkpoints written before MODEL_TYPE existed carry no tag; accept them.
-    if model_type is not None and model_type != MODEL_TYPE:
-        raise ValueError(f"checkpoint type must be {MODEL_TYPE!r}, got {model_type!r}")
+        found = ckpt.get(field)
+        if found != expected:
+            raise ValueError(
+                f"{ckpt_path}: {field}={found!r}, expected {expected!r}. "
+                "Checkpoints from an earlier architecture cannot be reused; "
+                "retrain with the current code."
+            )
     saved_config = dict(ckpt["config"])
-    # Checkpoints created before configurable domains used Omega=(0, 1)^2.
-    saved_config.setdefault("domain_min", 0.0)
-    saved_config.setdefault("domain_max", 1.0)
-    # Before pure loss modes were introduced, training used a mixed objective.
-    saved_config.setdefault("loss_mode", "legacy_mixed")
     cfg = LGFCNNTrainConfig(**{**saved_config, "device": device})
     model = make_model(cfg)
-    state_dict = dict(ckpt["state_dict"])
-    # Legacy checkpoints registered the same TorchSquareOps module twice and
-    # stored a dense DST matrix. Neither is needed by the FFT implementation.
-    for legacy_key in ("ops.S", "ops.mu", "bank.ops.S"):
-        state_dict.pop(legacy_key, None)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(ckpt["state_dict"])
     model.eval()
     return model, saved_config
 
@@ -718,6 +701,19 @@ def evaluate(
         )
         print(f"[eval] data saved to {output_dir}")
 
+    ood_rows = run_ood_sweeps(model, contrast=contrast, seed=seed)
+    print("[eval] out-of-distribution sweeps (relL2, Richardson at the same K)")
+    for sweep in ("frequency", "amplitude", "contrast"):
+        for row in (r for r in ood_rows if r["sweep"] == sweep):
+            marker = " " if row["in_distribution"] else "*"
+            print(
+                f"  {marker}{sweep:10s} {row['setting']:12s} "
+                f"relL2={row['relL2']:.3e}  rich={row['richardsonRelL2']:.3e}"
+            )
+    print("  (* = outside the training distribution)")
+    if output_dir is not None:
+        _write_csv(ood_rows, output_dir / "ood_sweeps.csv")
+
     # Fixed manufactured problem
     prob = make_problem(
         "smooth_sine",
@@ -750,28 +746,6 @@ def evaluate(
     return bundle
 
 
-def u1_u4_cases(grid: SquareGrid) -> tuple[list[str], np.ndarray]:
-    """Four fixed test solutions that vanish on the configured square boundary.
-
-    This makes every case consistent with the zero Dirichlet halo used by the
-    discrete operator.
-    """
-    x, y = grid.mesh()
-    L = grid.L
-    xi = (x - grid.x_min) / L
-    yi = (y - grid.x_min) / L
-
-    u1 = np.sin(np.pi * xi) * np.sin(np.pi * yi)
-    u2 = np.sin(2.0 * np.pi * xi) * np.sin(np.pi * yi)
-    u3 = np.sin(np.pi * xi) * np.sin(2.0 * np.pi * yi) - 0.5 * np.sin(
-        2.0 * np.pi * xi
-    ) * np.sin(2.0 * np.pi * yi)
-    u4 = np.sin(3.0 * np.pi * xi) * np.sin(3.0 * np.pi * yi)
-
-    cases = {"u1": u1, "u2": u2, "u3": u3, "u4": u4}
-    return list(cases), np.stack(list(cases.values()), axis=0)
-
-
 def _result_dir(result_root: Path, run_name: str, test_seed: int) -> Path:
     """One compact, seed-isolated result directory per trained model."""
     return result_root / f"{run_name}_s{test_seed}"
@@ -790,7 +764,7 @@ def _evaluate_u1_u4(
 ) -> dict:
     grid = model.grid
     device = model.bank.lambdas.device
-    names, u_exact_np = u1_u4_cases(grid)
+    names, u_exact_np = fixed_case_solutions(grid)
     a_single = sample_coefficient(
         grid,
         batch_size=1,
@@ -861,8 +835,6 @@ def run_prediction(args: argparse.Namespace) -> None:
         _save_prediction_tensor(bundle, Path(args.predict_save), metadata)
 
     if not args.no_plot:
-        from .plots import generate_pinn_style_figures
-
         generate_pinn_style_figures(
             model=model,
             history_path=args.predict_from.parent / "history.csv",
@@ -870,7 +842,6 @@ def run_prediction(args: argparse.Namespace) -> None:
             experiment_name=run_name,
             case=args.plot_case,
             contrast=contrast,
-            seed=args.test_seed,
             loss_mode=saved.get("loss_mode", "supervised"),
             evaluation=bundle,
         )
@@ -1009,8 +980,6 @@ def main() -> None:
         )
         _copy_training_history(args.eval_only.parent / "history.csv", data_dir)
         if not args.no_plot:
-            from .plots import generate_pinn_style_figures
-
             generate_pinn_style_figures(
                 model=model,
                 history_path=args.eval_only.parent / "history.csv",
@@ -1018,7 +987,6 @@ def main() -> None:
                 experiment_name=checkpoint_name,
                 case=args.plot_case,
                 contrast=saved.get("contrast", 0.5),
-                seed=args.test_seed,
                 loss_mode=saved.get("loss_mode", "supervised"),
                 evaluation=fixed_bundle,
             )
@@ -1120,8 +1088,6 @@ def main() -> None:
         )
         _copy_training_history(run_dir / "history.csv", data_dir)
         if not args.no_plot:
-            from .plots import generate_pinn_style_figures
-
             generate_pinn_style_figures(
                 model=model,
                 history_path=run_dir / "history.csv",
@@ -1129,7 +1095,6 @@ def main() -> None:
                 experiment_name=run_key,
                 case=args.plot_case,
                 contrast=cfg.contrast,
-                seed=args.test_seed,
                 loss_mode=cfg.loss_mode,
                 evaluation=fixed_bundle,
             )

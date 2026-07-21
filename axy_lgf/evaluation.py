@@ -8,6 +8,7 @@ from collections.abc import Sequence
 import numpy as np
 import torch
 
+from .data import sample_coefficient
 from .grid import SquareGrid
 from .lgf_cnn import LGFCNN
 from .lgf_inverse import DirichletLGF
@@ -22,13 +23,18 @@ METRIC_KEYS = (
     "predResRMSE",
     "refResRMSE",
     "relRes",
-    "bndErr",
     "gradRelL2",
     "gradLinf",
     "constBaselineRelL2",
     "linearBaselineRelL2",
     "f_RMSE",
 )
+
+# Training samples p, q in {1, 2, 3}; everything beyond 3 is extrapolation.
+OOD_FREQUENCIES = (1, 2, 3, 4, 5, 6, 8)
+# Training solutions carry N(0, 1) modal amplitudes, i.e. |f| ~ O(1).
+OOD_FORCING_SCALES = (1e-2, 1e-1, 1.0, 1e1, 1e2)
+OOD_CONTRASTS = (0.2, 0.5, 0.8, 0.95, 1.0)
 
 COMPARISON_METRIC_KEYS = (
     "relL2",
@@ -122,28 +128,12 @@ def _full_metrics(
         float(np.linalg.norm(grad_exact.ravel())),
         np.finfo(np.float64).tiny,
     )
-    # Both the reference and the network solution have an explicit zero halo.
-    # The boundary metric is retained for direct comparison with Baseline_mms.
-    full_error = np.pad(u_pred - u_exact, 1, mode="constant")
-    boundary_error = float(
-        np.max(
-            np.abs(
-                np.concatenate(
-                    (
-                        full_error[0, :],
-                        full_error[-1, :],
-                        full_error[:, 0],
-                        full_error[:, -1],
-                    )
-                )
-            )
-        )
-    )
+    # No bndErr here: both fields carry an explicit zero Dirichlet halo, so a
+    # boundary error metric is identically zero and measures nothing.
     metrics.update(
         {
             "predResRMSE": metrics.pop("resRMSE"),
             "refResRMSE": float(np.sqrt(np.mean(ref_residual**2))),
-            "bndErr": boundary_error,
             "gradRelL2": float(np.linalg.norm(grad_error.ravel()))
             / grad_denominator,
             "gradLinf": float(np.max(np.abs(grad_error))),
@@ -161,6 +151,82 @@ def _full_metrics(
         }
     )
     return metrics
+
+
+@torch.no_grad()
+def run_ood_sweeps(
+    model: LGFCNN,
+    contrast: float = 0.8,
+    seed: int = 123,
+) -> list[dict]:
+    """Probe generalisation along one axis of the training distribution at a time.
+
+    The fixed u1-u4 cases and the held-out batch both live inside the training
+    family (1-3 separable sin/cos modes with p, q in {1,2,3}, N(0,1) amplitudes,
+    one contrast), so neither of them actually tests extrapolation.  Each sweep
+    here steps outside exactly one axis and reports the same-budget Richardson
+    result alongside, so a degradation can be attributed to the network rather
+    than to the problem simply getting harder.
+    """
+    model.eval()
+    device = model.bank.lambdas.device
+    grid = model.grid
+    x, y = grid.mesh()
+    xi = (x - grid.x_min) / grid.L
+    yi = (y - grid.x_min) / grid.L
+
+    def as_batch(field: np.ndarray) -> torch.Tensor:
+        return torch.as_tensor(field[None], dtype=torch.float64, device=device)
+
+    def probe(sweep: str, setting: str, in_distribution: bool, a_np, u_np) -> dict:
+        a_t = as_batch(a_np)
+        f_t = model.ops.apply_div_a_grad(as_batch(u_np), a_t)
+        f_np = f_t.cpu().numpy()[0]
+        pred = model(a_t, f_t).cpu().numpy()[0]
+        rich = solve_axy_richardson(
+            a_np, f_np, grid, omega=1.0, tol=0.0, maxiter=model.K
+        )
+        residual = f_np - apply_div_a_grad(pred, a_np, grid)
+        return {
+            "sweep": sweep,
+            "setting": setting,
+            "in_distribution": in_distribution,
+            "relL2": _relative_l2(pred - u_np, u_np, grid),
+            "relRes": l2_norm(residual, grid)
+            / max(l2_norm(f_np, grid), np.finfo(np.float64).tiny),
+            "richardsonRelL2": _relative_l2(rich.u - u_np, u_np, grid),
+        }
+
+    a_ref = sample_coefficient(
+        grid, 1, contrast=contrast, rng=np.random.default_rng(seed)
+    )[0]
+    rows = []
+
+    # 1. Frequency: the LGF filters are global spectral operators and the mixer
+    #    is pointwise, so there is no fixed receptive field to limit the model.
+    for mode in OOD_FREQUENCIES:
+        u_np = np.sin(mode * np.pi * xi) * np.sin(mode * np.pi * yi)
+        rows.append(probe("frequency", f"p=q={mode}", mode <= 3, a_ref, u_np))
+
+    # 2. Forcing amplitude: exact by construction now that the mixer inputs are
+    #    normalised, so this sweep is a regression guard on that property.
+    u_unit = np.sin(np.pi * xi) * np.sin(np.pi * yi)
+    for scale in OOD_FORCING_SCALES:
+        rows.append(
+            probe("amplitude", f"|f| x {scale:g}", scale == 1.0, a_ref, scale * u_unit)
+        )
+
+    # 3. Contrast: genuinely harder problems, and beyond ~0.95 the coefficient
+    #    floor in sample_coefficient starts to flatten a(x, y).
+    for value in OOD_CONTRASTS:
+        a_np = sample_coefficient(
+            grid, 1, contrast=value, rng=np.random.default_rng(seed)
+        )[0]
+        rows.append(
+            probe("contrast", f"c={value:g}", value == contrast, a_np, u_unit)
+        )
+
+    return rows
 
 
 @torch.no_grad()
@@ -188,13 +254,20 @@ def evaluate_batch(
     if steps < 0:
         raise ValueError("richardson_steps must be nonnegative")
 
-    _synchronize(device)
-    started = time.perf_counter()
+    # Time a plain per-sample forward pass, matching how Richardson and PCG are
+    # timed below. Batching and the diagnostic tensors would otherwise make the
+    # LGF-CNN column optimistic and not comparable across methods.
+    cnn_ms = []
+    for index in range(len(names)):
+        sample_a = a[index : index + 1]
+        sample_f = f[index : index + 1]
+        _synchronize(device)
+        started = time.perf_counter()
+        model(sample_a, sample_f)
+        _synchronize(device)
+        cnn_ms.append(1000.0 * (time.perf_counter() - started))
+
     u_pred, diagnostics = model.forward_with_diagnostics(a, f)
-    _synchronize(device)
-    cnn_ms_per_sample = (
-        1000.0 * (time.perf_counter() - started) / len(names)
-    )
 
     a_np = a.detach().cpu().numpy()
     f_np = f.detach().cpu().numpy()
@@ -222,7 +295,7 @@ def evaluate_batch(
                 "sample_id": index,
                 "case": name,
                 **full,
-                "cnn_ms_per_sample": cnn_ms_per_sample,
+                "cnn_ms_per_sample": cnn_ms[index],
             }
         )
 
@@ -253,7 +326,7 @@ def evaluate_batch(
             (
                 "LGF-CNN",
                 up,
-                cnn_ms_per_sample,
+                cnn_ms[index],
                 model.K,
                 full["relRes"] <= pcg_tol,
             ),

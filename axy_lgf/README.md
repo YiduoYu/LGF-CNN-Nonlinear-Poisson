@@ -21,7 +21,7 @@ Dirichlet LGF 由 DST-I 实现，不使用 BAE。
 - PyTorch
 - Matplotlib（仅绘图需要）
 
-以下命令都应在包含 `axy_lgf/`、`tests/` 和 `tools/` 的目录中运行。
+以下命令都应在包含 `axy_lgf/` 的父目录中运行。
 
 ## 数据与预测约定
 
@@ -138,15 +138,31 @@ python -m axy_lgf.train_lgf_cnn \
 `figures/` 分类。
 
 `u1_u4_metrics.csv` 和 `heldout_metrics.csv` 保存逐例的 `relL2`、RMSE、
-MAE、最大误差、预测/参考离散残差、边界误差、梯度误差、常数基线、
+MAE、最大误差、预测/参考离散残差、梯度误差、常数基线、
 常系数 Poisson 基线、右端项 RMS 和 CNN 推理耗时。对应的
 `*_summary.json` 保存每项指标的 mean/std/min/max。
+（不再输出 `bndErr`：齐次 Dirichlet 边界由零 halo 精确施加，该指标
+恒为零，不构成任何检验。）
 
 `*_solver_comparison.csv` 保存 LGF-CNN、相同迭代步数的 Richardson 和
 高精度 PCG 的误差、残差、耗时、迭代次数及收敛状态；
 `*_residual_history.csv` 保存三种方法的逐步相对残差；
 `*_predictions.pt` 保存系数场、右端项、参考解、网络预测和三种基线解。
-齐次 Dirichlet 边界由零 halo 精确施加，因此 `bndErr` 应为零。
+三种方法的 `time_ms` 均按**逐样本**计时，CNN 使用不带诊断张量的
+普通前向，以便跨方法直接比较。
+
+### 分布外（OOD）扫描
+
+固定的 u1–u4 和 heldout 批次都落在训练函数族内部
+（\(p,q\in\{1,2,3\}\)、\(N(0,1)\) 幅值、单一 contrast），因此二者都
+**没有**检验外推能力。`evaluate` 现在额外沿三个轴各做一次扫描，
+结果写入 `ood_sweeps.csv`，并同时给出相同步数的 Richardson 作为对照：
+
+| 扫描 | 取值 | 说明 |
+|---|---|---|
+| `frequency` | \(p=q=1,2,3,4,5,6,8\) | 训练只见过 \(\le 3\) |
+| `amplitude` | \(\lVert f\rVert\times 10^{-2}\dots10^{2}\) | 由等变性保证恒定，作回归护栏 |
+| `contrast` | \(0.2,0.5,0.8,0.95,1.0\) | 越界后 \(a\) 会被下界削平 |
 
 两个命令必须使用相同的 `--test-seed`，这样系数场和 u1–u4 完全一致，
 结果才可以直接比较。
@@ -161,7 +177,7 @@ python -m axy_lgf.train_lgf_cnn \
 
 训练中的固定验证集使用 `seed + 1`，最终评估默认使用独立的
 `--test-seed 123`，避免验证集和测试集复用。`--eval-only` 会载入指定
-checkpoint，并通过唯一的 `plots.py` 自动生成 training curve、
+checkpoint，并通过唯一的 `plot_lgf_cnn.py` 自动生成 training curve、
 u1–u4 panel 和 centerline；使用 `--no-plot` 可以只保存数据。
 
 ## 数学与实现要点
@@ -190,40 +206,53 @@ A_hu=-\operatorname{div}_h(a\nabla_hu).
 \]
 
 LGF-CNN 使用同样的 \(a_0/a\) 缩放，并学习逐点混合权重
-\(\alpha_j(x)\) 与阻尼 \(\eta(x)\)。该写法保证系数 \(a\) 整体乘以常数
-时的缩放关系正确。
+\(\alpha_j(x)\) 与阻尼 \(\eta(x)\)。
+
+### 精确的缩放等变性
+
+方程是线性的：\(f\to cf\) 应给出 \(u\to cu\)，\(a\to ca\) 应给出
+\(u\to u/c\)。softmax/sigmoid 是非线性的，若直接把原始幅值的 \(r\)、
+\(z_j\) 喂给 mixer，\(\alpha\)、\(\eta\) 就会随问题的量级漂移。因此
+每个 block 先用**逐样本**的尺度把 mixer 的输入无量纲化：
+
+- \(r/\lVert r\rVert\)、\(z_j/\max_j\lVert z_j\rVert\)；
+- 系数通道用 \(a/a_0\) 与 \(a_0/a\)，其中 \(a_0=\mathrm{mean}(a)\) 逐样本取值；
+- LGF bank 的分母整体提出 \(a_0\)，即 \(a_0\bigl((-\Delta_h)+\lambda_j I\bigr)\)。
+
+这样 \(\alpha\)、\(\eta\) 对上述两种缩放都是零次齐次，而 \(z\) 是 \(r\)
+的线性函数，于是整个网络映射对 \(f\) 精确一次齐次、对 \(a\) 精确
+\(-1\) 次齐次——线性方程本就该有的性质被写进结构，而不是指望网络
+学出来。该性质与权重无关，对未训练的模型同样成立，实测在
+\(10^{-6}\sim10^{6}\) 范围内偏差约 \(10^{-16}\)（机器精度）。
 
 随机系数场要求 `contrast` 位于 `[0, 1]`，并保证 \(a\ge 0.05\)。
 所有带空间频率的函数都按区域长度 \(L\) 缩放。
 
 ## 检查点安全
 
-新检查点为格式版本 3，可通过
-`torch.load(..., weights_only=True)` 加载，不再保存重复算子或稠密 DST
-矩阵。包内示例检查点已经迁移。
-普通训练、评估、预测和绘图路径始终使用安全加载；旧版 checkpoint
-缺少纯 loss 元数据时会明确标记为 `legacy_mixed`。
+新检查点为格式版本 4，通过 `torch.load(..., weights_only=True)` 加载。
+**版本 4 重写了 block 的缩放方式**（mixer 输入按逐样本尺度归一化、
+LGF bank 使用逐样本 \(a_0\)），旧 checkpoint 的权重在新 block 下含义
+不同，因此 `load_model` 会直接拒绝而不是给出错误的结果——需要用当前
+代码重新训练。
 训练先写入独立的临时实验目录，只有 `best.pt`、`last.pt` 和
 `history.csv` 全部完成并通过哈希记录后才写入 `completed.json` 并提交。
 同一参数的并发训练由文件锁串行化；中断训练不会被下一次普通运行误当作
 完整实验。
 
-## 测试
+## 快速自检
+
+本包目前没有自动化测试。改动之后建议至少跑一次 1-epoch 的完整流水线：
 
 ```bash
-python -m unittest discover -s tests -v
-python -m compileall -q axy_lgf tests tools
+python -m axy_lgf.train_lgf_cnn \
+  --n 16 --J 3 --K 2 --hidden 8 --epochs 1 --eval-every 1 \
+  --samples-per-epoch 8 --batch-size 4 --val-samples 4
 ```
 
-回归测试覆盖：
-
-- MMS 和 solver 标签的一致性；
-- 固定 MMS u1–u4 的跨模型预测约定；
-- NumPy/Torch 离散算子与 LGF bank 一致性；
-- FFT-DST 数值正确性和自动微分；
-- LGF 系数缩放不变性和真实残差历史；
-- 非默认区域边界下的收敛；
-- `J=1` 绘图和安全检查点往返加载。
+绘图模块只在整个训练结束后才被导入使用，所以那里的导入错误不会在
+任何早期检查中暴露，只有跑完一次完整训练才会出现
+（`plots.py` 改名为 `plot_lgf_cnn.py` 时正是如此）。
 
 ## 主要文件
 
@@ -239,4 +268,5 @@ python -m compileall -q axy_lgf tests tools
 | `lgf_cnn.py` | 展开的 LGF-CNN |
 | `data.py` | MMS/solver 随机训练数据 |
 | `train_lgf_cnn.py` | 训练、评估和固定 u1–u4 预测 |
-| `plots.py` | training curve、panel 和 centerline 绘图 |
+| `plot_lgf_cnn.py` | training curve、panel 和 centerline 绘图 |
+| `evaluation.py` | 共享评估指标、求解器对比与 OOD 扫描 |

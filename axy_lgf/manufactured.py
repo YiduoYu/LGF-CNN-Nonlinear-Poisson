@@ -117,6 +117,27 @@ PROBLEMS = {
     "smooth_sine2": (_a_smooth, _u_sine2, "discrete"),
 }
 
+FIXED_CASES = ("u1", "u2", "u3", "u4")
+
+
+def fixed_case_solutions(grid: SquareGrid) -> tuple[list[str], np.ndarray]:
+    """The four fixed u1-u4 test solutions, stacked as (4, n, n).
+
+    Every case vanishes on the configured square boundary, which keeps them
+    consistent with the zero Dirichlet halo used by the discrete operator.
+    Single definition shared by evaluation and plotting.
+    """
+    x, y = grid.mesh()
+    xi, yi, _ = _normalized(x, y, grid.x_min, grid.x_max)
+    fields = {
+        "u1": np.sin(np.pi * xi) * np.sin(np.pi * yi),
+        "u2": np.sin(2.0 * np.pi * xi) * np.sin(np.pi * yi),
+        "u3": np.sin(np.pi * xi) * np.sin(2.0 * np.pi * yi)
+        - 0.5 * np.sin(2.0 * np.pi * xi) * np.sin(2.0 * np.pi * yi),
+        "u4": np.sin(3.0 * np.pi * xi) * np.sin(3.0 * np.pi * yi),
+    }
+    return list(fields), np.stack(list(fields.values()), axis=0)
+
 
 def make_problem(
     name: str = "smooth_sine",

@@ -16,6 +16,11 @@ import torch.nn as nn
 from .grid import DEFAULT_DOMAIN_MAX, DEFAULT_DOMAIN_MIN, SquareGrid
 from .torch_ops import ScreenedLGFBankTorch, TorchSquareOps
 
+# Positivity floor for a; never binding for the sampled coefficients.
+_MIN_COEFFICIENT = 1e-8
+# Guards the per-sample scales when a field is identically zero.
+_TINY = 1e-300
+
 
 class PointwiseMixer(nn.Module):
     """1x1 MLP producing mixing weights (J) and damping (1).
@@ -66,7 +71,6 @@ class LGFCNN(nn.Module):
         J: int = 6,
         K: int = 6,
         hidden: int = 32,
-        a0: float = 1.0,
         eta_max: float = 1.0,
         share_weights: bool = True,
         include_poisson: bool = True,
@@ -87,7 +91,6 @@ class LGFCNN(nn.Module):
         self.bank = ScreenedLGFBankTorch(
             grid,
             J=J,
-            a0=a0,
             include_poisson=include_poisson,
             dtype=dtype,
             device=device,
@@ -122,13 +125,28 @@ class LGFCNN(nn.Module):
         f: torch.Tensor,
         k: int,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """One correction step plus tensors needed for diagnostics."""
-        r = f - self.ops.apply_div_a_grad(u, a)
-        z = self.bank.apply(r)  # (B, J, n, n)
+        """One correction step plus tensors needed for diagnostics.
 
-        inv_a = 1.0 / a.clamp_min(1e-8)
-        feats = torch.stack([a, inv_a, r], dim=1)  # (B, 3, n, n)
-        feats = torch.cat([feats, z], dim=1)
+        Every field handed to the mixer is made dimensionless by a per-sample
+        scale, so the softmax/sigmoid see the same input whenever the problem
+        is rescaled.  With alpha and eta thus 0-homogeneous, and z linear in r,
+        the block is *exactly* 1-homogeneous in f and (-1)-homogeneous in a --
+        the linearity of -div(a grad u) = f is built into the architecture
+        instead of being left for the network to approximate.
+        """
+        r = f - self.ops.apply_div_a_grad(u, a)
+        a0 = a.mean(dim=(1, 2))  # (B,) per-sample reference coefficient
+        z = self.bank.apply(r, a0)  # (B, J, n, n)
+
+        a0c = a0[:, None, None]
+        # a0/a is both the diagonal rescaling used below and a dimensionless
+        # coefficient channel.
+        inv_a = a0c / a.clamp_min(_MIN_COEFFICIENT)
+        scale_r = self.ops.l2_norm(r).clamp_min(_TINY)[:, None, None]
+        scale_z = self.ops.l2_norm(z).amax(dim=1).clamp_min(_TINY)[:, None, None]
+
+        feats = torch.stack([a / a0c, inv_a, r / scale_r], dim=1)  # (B, 3, n, n)
+        feats = torch.cat([feats, z / scale_z[:, None]], dim=1)
 
         mixer = self._mixer(k)
         # Cast features to mixer dtype (float32 or float64).
@@ -139,7 +157,7 @@ class LGFCNN(nn.Module):
 
         mixed = torch.sum(alpha * z, dim=1)  # (B, n, n)
         if self.use_inv_a_scale:
-            mixed = self.bank.a0 * inv_a * mixed
+            mixed = inv_a * mixed
         u_next = u + self.eta_max * eta.squeeze(1) * mixed
         diagnostics = {
             "residual": r,
@@ -225,8 +243,4 @@ class LGFCNNTrainConfig:
     domain_min: float = DEFAULT_DOMAIN_MIN
     domain_max: float = DEFAULT_DOMAIN_MAX
     loss_mode: str = "supervised"  # "supervised" or "physics"
-    # Retained only so older checkpoints/configs can still be loaded.
-    # Training no longer uses a weighted combination of these values.
-    lambda_u: float = 1.0
-    lambda_r: float = 1.0
     data_kind: str = "mms"  # "mms" or "solver", see data.make_batch

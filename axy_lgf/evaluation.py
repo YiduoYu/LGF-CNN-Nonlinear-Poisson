@@ -71,6 +71,7 @@ def summarize_rows(rows: list[dict], metric_keys: Sequence[str]) -> dict:
 
 
 def _synchronize(device: torch.device) -> None:
+    """Wait for queued accelerator work so elapsed-time measurements are valid."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elif device.type == "mps":
@@ -86,6 +87,7 @@ def _centered_gradient(u: np.ndarray, h: float) -> np.ndarray:
 
 
 def _relative_l2(error: np.ndarray, reference: np.ndarray, grid: SquareGrid) -> float:
+    """Return a discrete relative L2 error with a safe zero denominator."""
     denominator = max(l2_norm(reference, grid), np.finfo(np.float64).tiny)
     return l2_norm(error, grid) / denominator
 
@@ -97,6 +99,7 @@ def _solution_metrics(
     f: np.ndarray,
     grid: SquareGrid,
 ) -> dict[str, float]:
+    """Compute solution-error and PDE-residual metrics for one method."""
     error = u - u_exact
     residual = f - apply_div_a_grad(u, a, grid)
     f_norm = max(l2_norm(f, grid), np.finfo(np.float64).tiny)
@@ -118,6 +121,7 @@ def _full_metrics(
     linear_baseline: np.ndarray,
     grid: SquareGrid,
 ) -> dict[str, float]:
+    """Compute the complete CNN metric set, including gradient baselines."""
     metrics = _solution_metrics(u_pred, u_exact, a, f, grid)
     ref_residual = f - apply_div_a_grad(u_exact, a, grid)
     grad_pred = _centered_gradient(u_pred, grid.h)
@@ -176,9 +180,11 @@ def run_ood_sweeps(
     yi = (y - grid.x_min) / grid.L
 
     def as_batch(field: np.ndarray) -> torch.Tensor:
+        """Convert one NumPy field to a one-sample tensor on the model device."""
         return torch.as_tensor(field[None], dtype=torch.float64, device=device)
 
     def probe(sweep: str, setting: str, in_distribution: bool, a_np, u_np) -> dict:
+        """Evaluate one OOD setting against the same-budget Richardson solver."""
         a_t = as_batch(a_np)
         f_t = model.ops.apply_div_a_grad(as_batch(u_np), a_t)
         f_np = f_t.cpu().numpy()[0]

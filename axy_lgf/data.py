@@ -19,11 +19,13 @@ MIN_COEFFICIENT = 0.05
 
 
 def _validate_batch_size(batch_size: int) -> None:
+    """Raise ``ValueError`` unless ``batch_size`` is positive."""
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
 
 
 def _validate_contrast(contrast: float) -> None:
+    """Raise ``ValueError`` unless ``contrast`` is finite and in [0, 1]."""
     if not np.isfinite(contrast) or not 0.0 <= contrast <= 1.0:
         raise ValueError("contrast must be finite and lie in [0, 1]")
 
@@ -38,12 +40,12 @@ def sample_coefficient(
     _validate_batch_size(batch_size)
     _validate_contrast(contrast)
     rng = np.random.default_rng() if rng is None else rng
-    X, Y = grid.mesh()
-    xi = (X - grid.x_min) / grid.L
-    yi = (Y - grid.x_min) / grid.L
+    x, y = grid.mesh()
+    xi = (x - grid.x_min) / grid.L
+    yi = (y - grid.x_min) / grid.L
     a = np.empty((batch_size, grid.n, grid.n), dtype=np.float64)
     for b in range(batch_size):
-        field = np.zeros_like(X)
+        field = np.zeros_like(x)
         nmodes = int(rng.integers(1, 4))
         for _ in range(nmodes):
             px = int(rng.integers(1, 4))
@@ -68,9 +70,9 @@ def sample_solution(
     """Sample homogeneous-Dirichlet solutions as sine combinations."""
     _validate_batch_size(batch_size)
     rng = np.random.default_rng() if rng is None else rng
-    X, Y = grid.mesh()
-    xi = (X - grid.x_min) / grid.L
-    yi = (Y - grid.x_min) / grid.L
+    x, y = grid.mesh()
+    xi = (x - grid.x_min) / grid.L
+    yi = (y - grid.x_min) / grid.L
     u = np.zeros((batch_size, grid.n, grid.n), dtype=np.float64)
     for b in range(batch_size):
         nmodes = int(rng.integers(1, 4))

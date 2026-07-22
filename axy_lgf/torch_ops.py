@@ -47,6 +47,7 @@ class TorchSquareOps(nn.Module):
     """Grid operators for batches of fields shaped (B, n, n)."""
 
     def __init__(self, grid: SquareGrid, dtype=torch.float64, device=None):
+        """Store grid spacing and cache Laplacian eigenvalues as a buffer."""
         super().__init__()
         self.n = grid.n
         self.L = grid.L
@@ -67,8 +68,7 @@ class TorchSquareOps(nn.Module):
         if u.ndim != 3 or a.shape != u.shape or u.shape[-2:] != expected:
             raise ValueError("u and a must have shape (B, n, n)")
         h = self.h
-        # Pad Dirichlet halo: (B, n+2, n+2)
-        U = F.pad(u, (1, 1, 1, 1), mode="constant", value=0.0)
+        padded_u = F.pad(u, (1, 1, 1, 1), mode="constant", value=0.0)
 
         # Face diffusivities (arithmetic mean), shapes (B, n, n+1) and (B, n+1, n)
         ax_inner = 0.5 * (a[:, :, :-1] + a[:, :, 1:])
@@ -77,10 +77,10 @@ class TorchSquareOps(nn.Module):
         ay_inner = 0.5 * (a[:, :-1, :] + a[:, 1:, :])
         ay = torch.cat([a[:, :1, :], ay_inner, a[:, -1:, :]], dim=1)
 
-        ux_left = (U[:, 1:-1, 1:-1] - U[:, 1:-1, :-2]) / h
-        ux_right = (U[:, 1:-1, 2:] - U[:, 1:-1, 1:-1]) / h
-        uy_down = (U[:, 1:-1, 1:-1] - U[:, :-2, 1:-1]) / h
-        uy_up = (U[:, 2:, 1:-1] - U[:, 1:-1, 1:-1]) / h
+        ux_left = (padded_u[:, 1:-1, 1:-1] - padded_u[:, 1:-1, :-2]) / h
+        ux_right = (padded_u[:, 1:-1, 2:] - padded_u[:, 1:-1, 1:-1]) / h
+        uy_down = (padded_u[:, 1:-1, 1:-1] - padded_u[:, :-2, 1:-1]) / h
+        uy_up = (padded_u[:, 2:, 1:-1] - padded_u[:, 1:-1, 1:-1]) / h
 
         flux_left = ax[:, :, :-1] * ux_left
         flux_right = ax[:, :, 1:] * ux_right
@@ -136,6 +136,7 @@ class ScreenedLGFBankTorch(nn.Module):
         dtype=torch.float64,
         device=None,
     ):
+        """Create a fixed bank from explicit or default screening values."""
         super().__init__()
         self.ops = TorchSquareOps(grid, dtype=dtype, device=device)
         if lambdas is None:
@@ -151,18 +152,18 @@ class ScreenedLGFBankTorch(nn.Module):
 
     @property
     def J(self) -> int:
+        """Number of screened LGF filters."""
         return int(self.lambdas.numel())
 
     def apply(self, r: torch.Tensor, a0: torch.Tensor) -> torch.Tensor:
         """Apply the bank with a per-sample reference coefficient.
 
-        z[b, j] = (a0[b] ((-Delta_h) + lambda_j I))^{-1} r[b]
+        z[b, j] = (a0[b] (-Delta_h) + lambda_j I)^{-1} r[b]
 
-        Factoring a0 out of the whole operator (rather than screening with a
-        bare lambda_j) keeps every filter shape fixed and makes z exactly
-        (-1)-homogeneous in a0, which is what makes the surrounding block
-        exactly equivariant under a -> c a.  At a0 = 1 this is identical to
-        the unscaled bank.
+        The screening term lambda_j is an absolute length scale (1/ell^2) and
+        does not scale with a0.  The lambda_j = 0 Poisson filter is therefore
+        exactly (-1)-homogeneous in a0 while the screened filters are only
+        approximately so; see the scaling note in the README.
 
         r: (B, n, n), a0: (B,) positive -> z: (B, J, n, n)
         """
@@ -171,7 +172,9 @@ class ScreenedLGFBankTorch(nn.Module):
         if a0.ndim != 1 or a0.shape[0] != r.shape[0]:
             raise ValueError("a0 must have shape (B,)")
         r_hat = dst2_ortho(r)
-        screened = self.ops.mu[None, :, :] + self.lambdas[:, None, None]
-        denominators = a0[:, None, None, None] * screened[None, :, :, :]
+        denominators = (
+            a0[:, None, None, None] * self.ops.mu[None, None, :, :]
+            + self.lambdas[None, :, None, None]
+        )
         z_hat = r_hat[:, None, :, :] / denominators
         return dst2_ortho(z_hat)

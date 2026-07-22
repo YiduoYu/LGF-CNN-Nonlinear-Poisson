@@ -45,17 +45,18 @@ from .data import make_batch, sample_coefficient
 from .evaluation import evaluate_batch, run_ood_sweeps
 from .grid import DEFAULT_DOMAIN_MAX, DEFAULT_DOMAIN_MIN, SquareGrid
 from .lgf_cnn import LGFCNN, LGFCNNTrainConfig
-from .operators import apply_div_a_grad, l2_norm
 from .manufactured import fixed_case_solutions, make_problem
+from .operators import apply_div_a_grad, l2_norm
 from .plot_lgf_cnn import generate_pinn_style_figures
 from .solvers import solve_axy_richardson
 
 MODEL_TYPE = "lgf_cnn_axy"
-# Version 4 rescaled the mixer inputs and the LGF bank by per-sample scales.
-# The weights of an older checkpoint mean something different under the new
+# Version 4 rescaled the mixer inputs and gave the LGF bank a per-sample a0.
+# Version 5 restored the (a0 (-Delta) + lambda I) bank denominator.
+# The weights of an older checkpoint mean something different under the current
 # block, so those checkpoints are rejected rather than silently mis-evaluated.
-CHECKPOINT_FORMAT_VERSION = 4
-EXPERIMENT_VERSION = 4
+CHECKPOINT_FORMAT_VERSION = 5
+EXPERIMENT_VERSION = 5
 PROJECT_DIR = Path(__file__).resolve().parent
 RUN_ARTIFACTS = ("best.pt", "last.pt", "history.csv")
 RUN_MANIFEST = "completed.json"
@@ -64,6 +65,7 @@ DEFAULT_PREDICT_OUTPUT_DIR = None
 
 
 def make_model(cfg: LGFCNNTrainConfig) -> LGFCNN:
+    """Construct an LGF-CNN from a validated training configuration."""
     device = torch.device(cfg.device)
     model = LGFCNN(
         SquareGrid(n=cfg.n, x_min=cfg.domain_min, x_max=cfg.domain_max),
@@ -151,6 +153,7 @@ def _training_config_payload(cfg: LGFCNNTrainConfig) -> dict:
 
 
 def _payload_sha256(payload: dict) -> str:
+    """Return a stable SHA-256 digest for a JSON-serializable mapping."""
     serialized = json.dumps(
         payload,
         sort_keys=True,
@@ -171,6 +174,22 @@ def experiment_key(cfg: LGFCNNTrainConfig) -> str:
     return f"{visible}_{digest}"
 
 
+@contextmanager
+def _atomic_write(path: Path):
+    """Yield a temporary path that replaces `path` only after a clean exit.
+
+    Every artifact this script writes goes through here, so a run killed
+    mid-write leaves the previous file intact rather than a truncated one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        yield temporary
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def save_checkpoint(
     path: Path,
     model: LGFCNN,
@@ -178,9 +197,8 @@ def save_checkpoint(
     epoch: int,
     best_metric: float,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
+    """Atomically save model state and run identity metadata."""
+    with _atomic_write(path) as temporary:
         torch.save(
             {
                 "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -193,12 +211,10 @@ def save_checkpoint(
             },
             temporary,
         )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def load_model(ckpt_path: Path, device: str) -> tuple[LGFCNN, dict]:
+    """Validate a checkpoint, rebuild its model, and load it for inference."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     for field, expected in (
         ("format_version", CHECKPOINT_FORMAT_VERSION),
@@ -221,6 +237,7 @@ def load_model(ckpt_path: Path, device: str) -> tuple[LGFCNN, dict]:
 
 
 def _validate_train_config(cfg: LGFCNNTrainConfig) -> None:
+    """Validate every user-controlled field in a training configuration."""
     positive_ints = {
         "n": cfg.n,
         "J": cfg.J,
@@ -284,29 +301,22 @@ def _batch_sizes(total: int, batch_size: int) -> list[int]:
 
 
 def _write_csv(rows: list[dict], path: Path) -> None:
+    """Atomically write homogeneous dictionaries to CSV, if any exist."""
     if not rows:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("w", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(
-                [
-                    {
-                        key: ("" if value is None else value)
-                        for key, value in row.items()
-                    }
-                    for row in rows
-                ]
-            )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with _atomic_write(path) as temporary, temporary.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(
+            [
+                {key: ("" if value is None else value) for key, value in row.items()}
+                for row in rows
+            ]
+        )
 
 
 def _file_sha256(path: Path) -> str:
+    """Return the SHA-256 digest of a file without loading it all at once."""
     digest = hashlib.sha256()
     with path.open("rb") as file:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
@@ -315,20 +325,14 @@ def _file_sha256(path: Path) -> str:
 
 
 def _write_json_atomic(payload: dict, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("w") as file:
-            json.dump(payload, file, indent=2, sort_keys=True, ensure_ascii=False)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    """Serialize a mapping as indented JSON using an atomic replacement."""
+    with _atomic_write(path) as temporary, temporary.open("w") as file:
+        json.dump(payload, file, indent=2, sort_keys=True, ensure_ascii=False)
 
 
 def _save_prediction_tensor(bundle: dict, path: Path, metadata: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
+    """Save evaluation arrays, row metrics, and metadata as a tensor archive."""
+    with _atomic_write(path) as temporary:
         torch.save(
             {
                 "names": bundle["names"],
@@ -346,9 +350,6 @@ def _save_prediction_tensor(bundle: dict, path: Path, metadata: dict) -> None:
             },
             temporary,
         )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _save_evaluation_outputs(
@@ -382,19 +383,15 @@ def _save_evaluation_outputs(
 
 
 def _copy_training_history(history_path: Path, data_dir: Path) -> None:
+    """Copy training history into result data when the source exists."""
     if not history_path.is_file():
         return
-    data_dir.mkdir(parents=True, exist_ok=True)
-    target = data_dir / "training_history.csv"
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    try:
+    with _atomic_write(data_dir / "training_history.csv") as temporary:
         shutil.copy2(history_path, temporary)
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _completion_payload(cfg: LGFCNNTrainConfig, run_dir: Path) -> dict:
+    """Build the manifest that identifies a complete, reusable training run."""
     return {
         "experiment_version": EXPERIMENT_VERSION,
         "config_sha256": _payload_sha256(_training_config_payload(cfg)),
@@ -405,6 +402,7 @@ def _completion_payload(cfg: LGFCNNTrainConfig, run_dir: Path) -> dict:
 
 
 def _run_completion_issue(run_dir: Path, cfg: LGFCNNTrainConfig) -> str | None:
+    """Return why a run is incomplete or incompatible, otherwise ``None``."""
     manifest_path = run_dir / RUN_MANIFEST
     if not manifest_path.is_file():
         return f"{RUN_MANIFEST} is missing"
@@ -436,6 +434,7 @@ def _promote_attempt(
     run_dir: Path,
     cfg: LGFCNNTrainConfig,
 ) -> None:
+    """Atomically promote a complete attempt and write its manifest last."""
     missing = [name for name in RUN_ARTIFACTS if not (attempt_dir / name).is_file()]
     if missing:
         raise RuntimeError(f"training attempt is missing: {', '.join(missing)}")
@@ -475,6 +474,7 @@ def _validate(
     val_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     loss_mode: str,
 ) -> tuple[float, float, float, float]:
+    """Evaluate validation loss, relative errors, and residual RMSE."""
     model.eval()
     a, f, u_exact = val_batch
     u_pred = model(a, f)
@@ -494,6 +494,7 @@ def train(
     cfg: LGFCNNTrainConfig,
     run_dir: Path,
 ) -> LGFCNN:
+    """Train one model, save run artifacts, and return the best checkpoint."""
     _validate_train_config(cfg)
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
@@ -526,7 +527,8 @@ def train(
         f"epochs={cfg.epochs}  batch={cfg.batch_size}  device={cfg.device}"
     )
     print(
-        f"        trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
+        "        trainable params: "
+        f"{sum(p.numel() for p in model.parameters() if p.requires_grad)}"
     )
     print(f"        run dir: {run_dir}")
 
@@ -737,11 +739,13 @@ def evaluate(
     r_rich = prob.f - apply_div_a_grad(rich.u, prob.a, grid)
     print("[eval] manufactured smooth_sine (discrete f)")
     print(
-        f"  LGF-CNN:     rel_res={float(rel_r_t.mean()):.3e}  rel_u={float(rel_u_t.mean()):.3e}"
+        f"  LGF-CNN:     rel_res={float(rel_r_t.mean()):.3e}  "
+        f"rel_u={float(rel_u_t.mean()):.3e}"
     )
     print(
         f"  Richardson:  rel_res={l2_norm(r_rich, grid) / l2_norm(prob.f, grid):.3e}  "
-        f"rel_u={l2_norm(rich.u - prob.u_exact, grid) / l2_norm(prob.u_exact, grid):.3e}"
+        "rel_u="
+        f"{l2_norm(rich.u - prob.u_exact, grid) / l2_norm(prob.u_exact, grid):.3e}"
     )
     return bundle
 
@@ -752,6 +756,7 @@ def _result_dir(result_root: Path, run_name: str, test_seed: int) -> Path:
 
 
 def _checkpoint_run_name(checkpoint_path: Path) -> str:
+    """Derive the experiment directory name from a checkpoint path."""
     parent = checkpoint_path.parent
     return parent.parent.name if parent.name == "checkpoints" else parent.name
 
@@ -762,6 +767,7 @@ def _evaluate_u1_u4(
     contrast: float,
     seed: int,
 ) -> dict:
+    """Evaluate the four fixed manufactured solutions with one coefficient."""
     grid = model.grid
     device = model.bank.lambdas.device
     names, u_exact_np = fixed_case_solutions(grid)
@@ -778,6 +784,61 @@ def _evaluate_u1_u4(
     return evaluate_batch(model, names, a, f, u_exact)
 
 
+def _save_fixed_evaluation(
+    model: LGFCNN,
+    bundle: dict,
+    *,
+    checkpoint_path: Path,
+    history_path: Path,
+    output_dir: Path,
+    experiment_name: str,
+    contrast: float,
+    data_kind: str,
+    loss_mode: str,
+    test_seed: int,
+    plot_case: str,
+    no_plot: bool,
+) -> tuple[Path, Path, Path, dict]:
+    """Save fixed-case data and optionally generate its standard figures.
+
+    Returns the data directory, figure directory, prediction path, and metadata.
+    """
+    data_dir = output_dir / "data"
+    figure_dir = output_dir / "figures"
+    metadata = {
+        "model_type": MODEL_TYPE,
+        "evaluation": "fixed_u1_u4",
+        "train_data_kind": data_kind,
+        "prediction_data_kind": "mms",
+        "coefficient_policy": "same_field_for_all_cases",
+        "n": model.grid.n,
+        "domain": [model.grid.x_min, model.grid.x_max],
+        "h": model.grid.h,
+        "contrast": contrast,
+        "test_seed": test_seed,
+        "checkpoint_sha256": _file_sha256(checkpoint_path),
+    }
+    predictions_path = _save_evaluation_outputs(
+        bundle,
+        data_dir,
+        "u1_u4",
+        metadata,
+    )
+    _copy_training_history(history_path, data_dir)
+    if not no_plot:
+        generate_pinn_style_figures(
+            model=model,
+            history_path=history_path,
+            figure_dir=figure_dir,
+            experiment_name=experiment_name,
+            case=plot_case,
+            contrast=contrast,
+            loss_mode=loss_mode,
+            evaluation=bundle,
+        )
+    return data_dir, figure_dir, predictions_path, metadata
+
+
 @torch.no_grad()
 def run_prediction(args: argparse.Namespace) -> None:
     """Predict fixed MMS u1-u4 and save complete data plus matching figures.
@@ -789,7 +850,6 @@ def run_prediction(args: argparse.Namespace) -> None:
         raise ValueError("--predict requires --predict-from")
     print("[predict] using fixed MMS u1-u4 cases for cross-model comparison")
     model, saved = load_model(args.predict_from, args.device)
-    grid = model.grid
     contrast = saved.get("contrast", 0.5)
     bundle = _evaluate_u1_u4(model, contrast, args.test_seed)
     for row in bundle["metrics"]:
@@ -805,66 +865,44 @@ def run_prediction(args: argparse.Namespace) -> None:
         if args.output_dir is not None
         else _result_dir(args.result_root, run_name, args.test_seed)
     )
-    data_dir = output_dir / "data"
-    figure_dir = output_dir / "figures"
-    metadata = {
-        "model_type": MODEL_TYPE,
-        "evaluation": "fixed_u1_u4",
-        "train_data_kind": saved.get("data_kind", "mms"),
-        "prediction_data_kind": "mms",
-        "coefficient_policy": "same_field_for_all_cases",
-        "n": grid.n,
-        "domain": [grid.x_min, grid.x_max],
-        "h": grid.h,
-        "contrast": contrast,
-        "test_seed": args.test_seed,
-        "checkpoint_sha256": _file_sha256(Path(args.predict_from)),
-    }
-    predictions_path = _save_evaluation_outputs(
+    data_dir, figure_dir, predictions_path, metadata = _save_fixed_evaluation(
+        model,
         bundle,
-        data_dir,
-        "u1_u4",
-        metadata,
-    )
-    _copy_training_history(
-        args.predict_from.parent / "history.csv",
-        data_dir,
+        checkpoint_path=args.predict_from,
+        history_path=args.predict_from.parent / "history.csv",
+        output_dir=output_dir,
+        experiment_name=run_name,
+        contrast=contrast,
+        data_kind=saved.get("data_kind", "mms"),
+        loss_mode=saved.get("loss_mode", "supervised"),
+        test_seed=args.test_seed,
+        plot_case=args.plot_case,
+        no_plot=args.no_plot,
     )
 
     if args.predict_save:
         _save_prediction_tensor(bundle, Path(args.predict_save), metadata)
-
-    if not args.no_plot:
-        generate_pinn_style_figures(
-            model=model,
-            history_path=args.predict_from.parent / "history.csv",
-            figure_dir=figure_dir,
-            experiment_name=run_name,
-            case=args.plot_case,
-            contrast=contrast,
-            loss_mode=saved.get("loss_mode", "supervised"),
-            evaluation=bundle,
-        )
     print(f"[predict] data: {data_dir}")
     if not args.no_plot:
         print(f"[predict] figures: {figure_dir}")
     print(f"[predict] predictions: {predictions_path}")
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--n", type=int, default=31)
-    p.add_argument("--J", type=int, default=6)
-    p.add_argument("--K", type=int, default=6)
-    p.add_argument("--hidden", type=int, default=32)
-    p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--samples-per-epoch", type=int, default=64)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--contrast", type=float, default=0.8)
-    p.add_argument("--domain-min", type=float, default=DEFAULT_DOMAIN_MIN)
-    p.add_argument("--domain-max", type=float, default=DEFAULT_DOMAIN_MAX)
-    p.add_argument(
+def _parse_args() -> argparse.Namespace:
+    """Define, parse, and validate command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--n", type=int, default=31)
+    parser.add_argument("--J", type=int, default=6)
+    parser.add_argument("--K", type=int, default=6)
+    parser.add_argument("--hidden", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--samples-per-epoch", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--contrast", type=float, default=0.8)
+    parser.add_argument("--domain-min", type=float, default=DEFAULT_DOMAIN_MIN)
+    parser.add_argument("--domain-max", type=float, default=DEFAULT_DOMAIN_MAX)
+    parser.add_argument(
         "--data-kind",
         choices=("mms", "solver"),
         default="mms",
@@ -873,7 +911,7 @@ def main() -> None:
             "solver PCG-solves u_exact from f. Prediction always uses MMS u1-u4"
         ),
     )
-    p.add_argument(
+    parser.add_argument(
         "--loss-mode",
         choices=("supervised", "physics"),
         default="supervised",
@@ -882,31 +920,31 @@ def main() -> None:
             "physics uses squared PDE-residual L2 error"
         ),
     )
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--device", default="cpu")
-    p.add_argument("--eval-every", type=int, default=10)
-    p.add_argument("--val-samples", type=int, default=16)
-    p.add_argument(
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--eval-every", type=int, default=10)
+    parser.add_argument("--val-samples", type=int, default=16)
+    parser.add_argument(
         "--checkpoint-root",
         type=Path,
         default=PROJECT_DIR / "checkpoints" / "lgf_cnn_axy",
         help="run directories are created under this root",
     )
-    p.add_argument("--retrain", action="store_true")
-    run_mode = p.add_mutually_exclusive_group()
+    parser.add_argument("--retrain", action="store_true")
+    run_mode = parser.add_mutually_exclusive_group()
     run_mode.add_argument(
         "--eval-only", type=Path, default=None, help="load checkpoint and eval"
     )
     run_mode.add_argument("--predict", action="store_true")
-    p.add_argument("--predict-from", type=Path, default=None)
-    p.add_argument(
+    parser.add_argument("--predict-from", type=Path, default=None)
+    parser.add_argument(
         "--test-seed",
         type=int,
         default=123,
         help="independent test/prediction seed (validation always uses seed+1)",
     )
-    p.add_argument("--predict-save", default="")
-    p.add_argument(
+    parser.add_argument("--predict-save", default="")
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_PREDICT_OUTPUT_DIR,
@@ -915,31 +953,37 @@ def main() -> None:
             "directory below --result-root"
         ),
     )
-    p.add_argument(
+    parser.add_argument(
         "--result-root",
         type=Path,
         default=PROJECT_DIR / "result",
         help="PINN-style figures are saved below this directory",
     )
-    p.add_argument(
+    parser.add_argument(
         "--plot-case",
         choices=("all", "u1", "u2", "u3", "u4"),
         default="all",
         help="MMS case(s) used for figures; default generates u1-u4",
     )
-    p.add_argument("--no-plot", action="store_true")
-    args = p.parse_args()
+    parser.add_argument("--no-plot", action="store_true")
+    args = parser.parse_args()
 
     if args.predict and args.predict_from is None:
-        p.error("--predict requires --predict-from")
+        parser.error("--predict requires --predict-from")
     if not args.predict and args.predict_from is not None:
-        p.error("--predict-from requires --predict")
+        parser.error("--predict-from requires --predict")
     if not args.predict and (args.predict_save or args.output_dir is not None):
-        p.error("--predict-save and --output-dir require --predict")
+        parser.error("--predict-save and --output-dir require --predict")
     if args.retrain and (args.predict or args.eval_only is not None):
-        p.error("--retrain cannot be combined with --predict or --eval-only")
+        parser.error("--retrain cannot be combined with --predict or --eval-only")
     if args.test_seed < 0:
-        p.error("--test-seed must be nonnegative")
+        parser.error("--test-seed must be nonnegative")
+    return args
+
+
+def main() -> None:
+    """Run prediction, evaluation-only, or train-and-evaluate mode."""
+    args = _parse_args()
 
     if args.predict:
         return run_prediction(args)
@@ -952,44 +996,26 @@ def main() -> None:
             checkpoint_name,
             args.test_seed,
         )
-        data_dir = result_dir / "data"
-        figure_dir = result_dir / "figures"
         fixed_bundle = _evaluate_u1_u4(
             model,
             saved.get("contrast", 0.5),
             args.test_seed,
         )
-        fixed_metadata = {
-            "model_type": MODEL_TYPE,
-            "evaluation": "fixed_u1_u4",
-            "train_data_kind": saved.get("data_kind", "mms"),
-            "prediction_data_kind": "mms",
-            "coefficient_policy": "same_field_for_all_cases",
-            "n": model.grid.n,
-            "domain": [model.grid.x_min, model.grid.x_max],
-            "h": model.grid.h,
-            "contrast": saved.get("contrast", 0.5),
-            "test_seed": args.test_seed,
-            "checkpoint_sha256": _file_sha256(args.eval_only),
-        }
-        _save_evaluation_outputs(
+        data_dir, figure_dir, _, _ = _save_fixed_evaluation(
+            model,
             fixed_bundle,
-            data_dir,
-            "u1_u4",
-            fixed_metadata,
+            checkpoint_path=args.eval_only,
+            history_path=args.eval_only.parent / "history.csv",
+            output_dir=result_dir,
+            experiment_name=checkpoint_name,
+            contrast=saved.get("contrast", 0.5),
+            data_kind=saved.get("data_kind", "mms"),
+            loss_mode=saved.get("loss_mode", "supervised"),
+            test_seed=args.test_seed,
+            plot_case=args.plot_case,
+            no_plot=args.no_plot,
         )
-        _copy_training_history(args.eval_only.parent / "history.csv", data_dir)
         if not args.no_plot:
-            generate_pinn_style_figures(
-                model=model,
-                history_path=args.eval_only.parent / "history.csv",
-                figure_dir=figure_dir,
-                experiment_name=checkpoint_name,
-                case=args.plot_case,
-                contrast=saved.get("contrast", 0.5),
-                loss_mode=saved.get("loss_mode", "supervised"),
-                evaluation=fixed_bundle,
-            )
             print(f"[plot] PINN-style figures saved to {figure_dir}")
         evaluate(
             model,
@@ -1065,39 +1091,22 @@ def main() -> None:
         # Keep the run lock while reading history so a concurrent --retrain
         # cannot pair an older in-memory model with a newly promoted curve.
         result_dir = _result_dir(args.result_root, run_key, args.test_seed)
-        data_dir = result_dir / "data"
-        figure_dir = result_dir / "figures"
         fixed_bundle = _evaluate_u1_u4(model, cfg.contrast, args.test_seed)
-        _save_evaluation_outputs(
+        data_dir, figure_dir, _, _ = _save_fixed_evaluation(
+            model,
             fixed_bundle,
-            data_dir,
-            "u1_u4",
-            {
-                "model_type": MODEL_TYPE,
-                "evaluation": "fixed_u1_u4",
-                "train_data_kind": cfg.data_kind,
-                "prediction_data_kind": "mms",
-                "coefficient_policy": "same_field_for_all_cases",
-                "n": model.grid.n,
-                "domain": [model.grid.x_min, model.grid.x_max],
-                "h": model.grid.h,
-                "contrast": cfg.contrast,
-                "test_seed": args.test_seed,
-                "checkpoint_sha256": _file_sha256(best_path),
-            },
+            checkpoint_path=best_path,
+            history_path=run_dir / "history.csv",
+            output_dir=result_dir,
+            experiment_name=run_key,
+            contrast=cfg.contrast,
+            data_kind=cfg.data_kind,
+            loss_mode=cfg.loss_mode,
+            test_seed=args.test_seed,
+            plot_case=args.plot_case,
+            no_plot=args.no_plot,
         )
-        _copy_training_history(run_dir / "history.csv", data_dir)
         if not args.no_plot:
-            generate_pinn_style_figures(
-                model=model,
-                history_path=run_dir / "history.csv",
-                figure_dir=figure_dir,
-                experiment_name=run_key,
-                case=args.plot_case,
-                contrast=cfg.contrast,
-                loss_mode=cfg.loss_mode,
-                evaluation=fixed_bundle,
-            )
             print(f"[plot] PINN-style figures saved to {figure_dir}")
     evaluate(
         model,

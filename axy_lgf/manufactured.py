@@ -17,6 +17,8 @@ ArrayFn = Callable[[np.ndarray, np.ndarray], np.ndarray]
 
 @dataclass
 class ManufacturedProblem:
+    """Coefficient, exact solution, and forcing sampled on one grid."""
+
     name: str
     grid: SquareGrid
     a: np.ndarray
@@ -32,6 +34,7 @@ def _normalized(
     x_min: float,
     x_max: float,
 ) -> tuple[np.ndarray, np.ndarray, float]:
+    """Map physical coordinates to [0, 1] and return the domain length."""
     length = x_max - x_min
     return (x - x_min) / length, (y - x_min) / length, length
 
@@ -75,6 +78,7 @@ def _u_sine2(
     x_min: float = DEFAULT_DOMAIN_MIN,
     x_max: float = DEFAULT_DOMAIN_MAX,
 ) -> np.ndarray:
+    """Second manufactured sine mode with homogeneous boundary values."""
     xi, yi, _ = _normalized(x, y, x_min, x_max)
     return np.sin(2.0 * np.pi * xi) * np.sin(np.pi * yi)
 
@@ -160,18 +164,18 @@ def make_problem(
     mode = default_forcing if forcing is None else forcing
 
     grid = SquareGrid(n=n, x_min=x_min, x_max=x_max)
-    X, Y = grid.mesh()
+    x, y = grid.mesh()
     a_fn: ArrayFn = partial(a_base, x_min=x_min, x_max=x_max)
     u_fn: ArrayFn = partial(u_base, x_min=x_min, x_max=x_max)
-    a = a_fn(X, Y)
-    u_exact = u_fn(X, Y)
+    a = a_fn(x, y)
+    u_exact = u_fn(x, y)
 
     if mode == "analytic":
         if name != "smooth_sine":
             raise ValueError(f"No analytic forcing for problem {name!r}")
         f = _forcing_analytic_smooth_sine(
-            X,
-            Y,
+            x,
+            y,
             x_min=x_min,
             x_max=x_max,
         )

@@ -17,6 +17,22 @@ from scipy.fft import dstn, idstn
 from .grid import SquareGrid
 
 
+def _validate_inverse_parameters(a0: float, sigma: float) -> None:
+    """Validate the diffusivity and screening parameters of an LGF inverse."""
+    if not np.isfinite(a0) or a0 <= 0.0:
+        raise ValueError("a0 must be finite and positive")
+    if not np.isfinite(sigma) or sigma < 0.0:
+        raise ValueError("sigma must be finite and nonnegative")
+
+
+def _validate_rhs(rhs: np.ndarray, grid: SquareGrid) -> None:
+    """Validate the shape and finiteness of an inverse right-hand side."""
+    if rhs.shape != (grid.n, grid.n):
+        raise ValueError("rhs shape mismatch")
+    if not np.all(np.isfinite(rhs)):
+        raise ValueError("rhs must contain only finite values")
+
+
 def _laplacian_eigenvalues(grid: SquareGrid) -> np.ndarray:
     """Eigenvalues of -Delta_h on the interior grid (positive).
 
@@ -26,14 +42,9 @@ def _laplacian_eigenvalues(grid: SquareGrid) -> np.ndarray:
     with h = L/(n+1). Equivalent standard form:
         mu = (2/h^2)*(2 - cos(p*pi/(n+1)) - cos(q*pi/(n+1))).
     """
-    n = grid.n
-    h = grid.h
-    p = np.arange(1, n + 1, dtype=np.float64)
-    # cos(p * pi / (n+1))
-    c = np.cos(p * np.pi / (n + 1))
-    # eigenvalues along one axis for 1D -Delta: (2/h^2)*(1 - cos(...))
-    lam1d = (2.0 / h**2) * (1.0 - c)
-    # 2D: lam_p + lam_q
+    modes = np.arange(1, grid.n + 1, dtype=np.float64)
+    cosines = np.cos(modes * np.pi / (grid.n + 1))
+    lam1d = (2.0 / grid.h**2) * (1.0 - cosines)
     return lam1d[:, None] + lam1d[None, :]
 
 
@@ -56,33 +67,20 @@ def apply_dirichlet_lgf(
     -------
     u : (n, n) solution
     """
-    if not np.isfinite(a0) or a0 <= 0:
-        raise ValueError("a0 must be finite and positive")
-    if not np.isfinite(sigma) or sigma < 0:
-        raise ValueError("sigma must be finite and nonnegative")
-    if rhs.shape != (grid.n, grid.n):
-        raise ValueError("rhs shape mismatch")
-    if not np.all(np.isfinite(rhs)):
-        raise ValueError("rhs must contain only finite values")
+    _validate_inverse_parameters(a0, sigma)
+    _validate_rhs(rhs, grid)
 
-    mu = _laplacian_eigenvalues(grid)
-    denom = a0 * mu + sigma
-    # scipy dstn type=1 is DST-I; orthonormal=False matches unnormalized sine basis.
-    # For DST-I, the inverse is idstn with the same type. Eigenvectors of the
-    # discrete Dirichlet Laplacian are exactly the DST-I modes.
+    denominator = a0 * _laplacian_eigenvalues(grid) + sigma
     rhs_hat = dstn(rhs, type=1, norm="ortho")
-    u_hat = rhs_hat / denom
-    return idstn(u_hat, type=1, norm="ortho")
+    return idstn(rhs_hat / denominator, type=1, norm="ortho")
 
 
 class DirichletLGF:
     """Callable preconditioner / LGF inverse for -a0 Delta (+ optional sigma)."""
 
     def __init__(self, grid: SquareGrid, a0: float = 1.0, sigma: float = 0.0):
-        if not np.isfinite(a0) or a0 <= 0.0:
-            raise ValueError("a0 must be finite and positive")
-        if not np.isfinite(sigma) or sigma < 0.0:
-            raise ValueError("sigma must be finite and nonnegative")
+        """Validate parameters and cache the spectral denominator."""
+        _validate_inverse_parameters(a0, sigma)
         self.grid = grid
         self.a0 = float(a0)
         self.sigma = float(sigma)
@@ -90,9 +88,7 @@ class DirichletLGF:
         self._denom = self.a0 * self._mu + self.sigma
 
     def __call__(self, rhs: np.ndarray) -> np.ndarray:
-        if rhs.shape != (self.grid.n, self.grid.n):
-            raise ValueError("rhs shape mismatch")
-        if not np.all(np.isfinite(rhs)):
-            raise ValueError("rhs must contain only finite values")
+        """Apply the cached inverse to one interior-grid right-hand side."""
+        _validate_rhs(rhs, self.grid)
         rhs_hat = dstn(rhs, type=1, norm="ortho")
         return idstn(rhs_hat / self._denom, type=1, norm="ortho")

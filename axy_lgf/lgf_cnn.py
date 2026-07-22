@@ -31,6 +31,7 @@ class PointwiseMixer(nn.Module):
     """
 
     def __init__(self, in_ch: int, J: int, hidden: int = 32):
+        """Build and initialize the pointwise mixing network."""
         super().__init__()
         if in_ch < 1 or J < 1 or hidden < 1:
             raise ValueError("in_ch, J, and hidden must be positive")
@@ -52,10 +53,7 @@ class PointwiseMixer(nn.Module):
             last.bias[J] = 3.0
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        x: (B, C, n, n)
-        returns alpha (B, J, n, n), eta (B, 1, n, n)
-        """
+        """Return bank weights ``alpha`` and damping ``eta`` at every point."""
         s = self.net(x)
         alpha = torch.softmax(s[:, : self.J], dim=1)
         eta = torch.sigmoid(s[:, self.J : self.J + 1])
@@ -78,6 +76,7 @@ class LGFCNN(nn.Module):
         dtype=torch.float64,
         device=None,
     ):
+        """Build an unrolled solver with shared or block-specific mixers."""
         super().__init__()
         if J < 1 or K < 1 or hidden < 1:
             raise ValueError("J, K, and hidden must be positive")
@@ -112,11 +111,21 @@ class LGFCNN(nn.Module):
         return self.bank.ops
 
     def _mixer(self, k: int) -> PointwiseMixer:
+        """Return the shared mixer or the mixer assigned to block ``k``."""
         if self.share_weights:
             return self.mixers[0]
         if not 0 <= k < len(self.mixers):
             raise ValueError(f"block index {k} is outside [0, {len(self.mixers)})")
         return self.mixers[k]
+
+    def _step_count(self, requested: int | None) -> int:
+        """Resolve and validate the number of unrolled correction steps."""
+        steps = self.K if requested is None else requested
+        if steps < 0:
+            raise ValueError("K must be nonnegative")
+        if not self.share_weights and steps > len(self.mixers):
+            raise ValueError("K cannot exceed the number of unshared mixers")
+        return steps
 
     def _step(
         self,
@@ -184,15 +193,8 @@ class LGFCNN(nn.Module):
         u0: torch.Tensor | None = None,
         K: int | None = None,
     ) -> torch.Tensor:
-        """
-        a, f: (B, n, n)
-        returns u_K: (B, n, n)
-        """
-        steps = self.K if K is None else K
-        if steps < 0:
-            raise ValueError("K must be nonnegative")
-        if not self.share_weights and steps > len(self.mixers):
-            raise ValueError("K cannot exceed the number of unshared mixers")
+        """Run ``K`` correction blocks and return the final batched solution."""
+        steps = self._step_count(K)
         u = torch.zeros_like(f) if u0 is None else u0
         for k in range(steps):
             u = self.block(u, a, f, k)
@@ -206,11 +208,7 @@ class LGFCNN(nn.Module):
         K: int | None = None,
     ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
         """Forward pass that also returns per-block residuals and mixer fields."""
-        steps = self.K if K is None else K
-        if steps < 0:
-            raise ValueError("K must be nonnegative")
-        if not self.share_weights and steps > len(self.mixers):
-            raise ValueError("K cannot exceed the number of unshared mixers")
+        steps = self._step_count(K)
         u = torch.zeros_like(f) if u0 is None else u0
         diagnostics = []
         for k in range(steps):
@@ -221,11 +219,14 @@ class LGFCNN(nn.Module):
     def residual(
         self, u: torch.Tensor, a: torch.Tensor, f: torch.Tensor
     ) -> torch.Tensor:
+        """Return the discrete PDE residual ``f - A(a)u`` for a batch."""
         return f - self.ops.apply_div_a_grad(u, a)
 
 
 @dataclass
 class LGFCNNTrainConfig:
+    """All model, optimization, data, and runtime training settings."""
+
     n: int = 31
     J: int = 6
     K: int = 6

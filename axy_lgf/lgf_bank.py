@@ -39,13 +39,18 @@ def default_screening_values(
 
 @dataclass
 class ScreenedLGFBank:
-    """Bank of preconditioners: apply (-a0 Delta + λ_j I)^{-1} to r for each λ_j."""
+    """Bank of preconditioners: apply (-a0 Delta + λ_j I)^{-1} to r for each λ_j.
+
+    Same denominator convention as ScreenedLGFBankTorch; the two must stay in
+    step for solve_axy_lgf_bank to be a like-for-like baseline for LGF-CNN.
+    """
 
     grid: SquareGrid
     lambdas: np.ndarray
     a0: float = 1.0
 
     def __post_init__(self) -> None:
+        """Validate parameters and cache every spectral denominator."""
         self.lambdas = np.asarray(self.lambdas, dtype=np.float64).ravel()
         if self.lambdas.size == 0:
             raise ValueError("lambdas must not be empty")
@@ -66,6 +71,7 @@ class ScreenedLGFBank:
         a0: float = 1.0,
         include_poisson: bool = True,
     ) -> "ScreenedLGFBank":
+        """Build a bank from the standard geometric screening sequence."""
         return cls(
             grid=grid,
             lambdas=default_screening_values(
@@ -76,6 +82,7 @@ class ScreenedLGFBank:
 
     @property
     def J(self) -> int:
+        """Number of filters in the bank."""
         return len(self.lambdas)
 
     def apply(self, r: np.ndarray) -> np.ndarray:

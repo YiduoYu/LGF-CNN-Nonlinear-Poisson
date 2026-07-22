@@ -26,8 +26,8 @@ from .solvers import solve_axy_pcg, solve_axy_richardson, solve_axy_lgf_bank
 def check_constant_coefficient_lgf(n: int = 63) -> None:
     """Sanity check: LGF inverse recovers the Poisson solve for a ≡ 1."""
     grid = SquareGrid(n=n)
-    X, Y = grid.mesh()
-    u_exact = np.sin(np.pi * X) * np.sin(np.pi * Y)
+    x, y = grid.mesh()
+    u_exact = np.sin(np.pi * x) * np.sin(np.pi * y)
     f = apply_minus_laplacian(u_exact, grid)
     u = apply_dirichlet_lgf(f, grid, a0=1.0)
     err = l2_norm(u - u_exact, grid)
@@ -44,6 +44,7 @@ SOLVERS = {
 
 
 def _solve(prob, solver: str, tol: float):
+    """Dispatch one manufactured problem to the requested solver."""
     if solver not in SOLVERS:
         raise ValueError(f"unknown solver {solver!r}; choose from {list(SOLVERS)}")
     return SOLVERS[solver](prob.a, prob.f, prob.grid, tol=tol)
@@ -52,6 +53,7 @@ def _solve(prob, solver: str, tol: float):
 def run_once(
     problem: str, n: int, solver: str, tol: float, forcing: str | None
 ) -> None:
+    """Solve one manufactured problem and print its accuracy diagnostics."""
     prob = make_problem(name=problem, n=n, forcing=forcing)
     grid = prob.grid
 
@@ -109,10 +111,10 @@ def run_convergence(problem: str, solver: str, tol: float) -> None:
         print(f"{n:6d}  {result.iterations:6d}  {err:12.3e}  {rate_str:>8}")
         prev_err = err
         prev_h = prob.grid.h
-        prev_h = prob.grid.h
 
 
 def main() -> None:
+    """Parse command-line arguments and run a solve or refinement study."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, default=63, help="interior grid size")
     parser.add_argument(

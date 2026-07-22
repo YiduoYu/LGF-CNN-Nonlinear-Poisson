@@ -15,6 +15,7 @@ from .manufactured import FIXED_CASES
 
 
 def _get_plt():
+    """Load headless pyplot with a writable, process-independent cache."""
     cache = Path(tempfile.gettempdir()) / "axy_lgf_matplotlib"
     cache.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(cache))
@@ -27,10 +28,12 @@ def _get_plt():
 
 
 def _with_zero_boundary(field: np.ndarray) -> np.ndarray:
+    """Pad an interior field with its homogeneous Dirichlet boundary."""
     return np.pad(field, 1, mode="constant", constant_values=0.0)
 
 
 def _sym(values: np.ndarray) -> tuple[float, float]:
+    """Return nondegenerate color limits symmetric about zero."""
     limit = max(float(np.max(np.abs(values))), 1e-12)
     return -limit, limit
 
@@ -166,11 +169,13 @@ def save_centerline(
 
 
 def _read_history(path: Path) -> list[dict[str, str]]:
+    """Read a training-history CSV as dictionaries keyed by column name."""
     with path.open(newline="") as file:
         return list(csv.DictReader(file))
 
 
 def _present(value: str | None) -> bool:
+    """Return whether a serialized optional metric contains a real value."""
     return value not in (None, "", "None", "nan")
 
 

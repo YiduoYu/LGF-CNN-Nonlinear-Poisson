@@ -15,6 +15,8 @@ from .operators import apply_div_a_grad, l2_norm
 
 @dataclass
 class SolverResult:
+    """Numerical solution and convergence diagnostics from one solver run."""
+
     u: np.ndarray
     iterations: int
     residual_history: list[float]
@@ -35,6 +37,7 @@ def _validate_problem(
     maxiter: int,
     u0: np.ndarray | None,
 ) -> None:
+    """Validate the coefficient, forcing, optional initial guess, and limit."""
     shape = (grid.n, grid.n)
     if a.shape != shape or f.shape != shape:
         raise ValueError("a and f must have shape (n, n)")
@@ -56,6 +59,7 @@ def _validate_iteration_parameters(
     omega: float,
     tol: float,
 ) -> None:
+    """Validate scalar parameters shared by fixed-point solvers."""
     if not np.isfinite(a0) or a0 <= 0.0:
         raise ValueError("a0 must be finite and positive")
     if not np.isfinite(omega) or omega <= 0.0:
@@ -69,6 +73,7 @@ def _relative_residual(
     f_norm: float,
     grid: SquareGrid,
 ) -> float:
+    """Return ``||r||_2 / ||f||_2`` using a precomputed forcing norm."""
     return l2_norm(r, grid) / f_norm
 
 

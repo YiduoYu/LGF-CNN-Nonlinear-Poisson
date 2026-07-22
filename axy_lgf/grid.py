@@ -22,6 +22,7 @@ class SquareGrid:
     x_max: float = DEFAULT_DOMAIN_MAX
 
     def __post_init__(self) -> None:
+        """Validate the grid size and finite, increasing domain bounds."""
         if not isinstance(self.n, (int, np.integer)) or self.n < 2:
             raise ValueError("n must be an integer >= 2")
         if not np.isfinite(self.x_min) or not np.isfinite(self.x_max):
@@ -36,15 +37,19 @@ class SquareGrid:
 
     @property
     def h(self) -> float:
+        """Spacing between neighboring nodes, including boundary intervals."""
         return self.L / (self.n + 1)
 
     @property
     def x1d(self) -> np.ndarray:
+        """Coordinates of the ``n`` interior nodes along one axis."""
         return self.x_min + np.arange(1, self.n + 1, dtype=np.float64) * self.h
 
     def mesh(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return Cartesian coordinate arrays for all interior nodes."""
         x = self.x1d
         return np.meshgrid(x, x, indexing="xy")
 
     def zeros(self) -> np.ndarray:
+        """Return a zero-valued scalar field on the interior grid."""
         return np.zeros((self.n, self.n), dtype=np.float64)

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Demo: solve -div(a(x,y) grad u) = f on a square with homogeneous Dirichlet BC.
-
-Uses Dirichlet LGF (DST inverse of -a0 Delta) as a preconditioner. No BAE.
+"""Demo: solve -div(a(x,y) grad u) = f on a square (homogeneous Dirichlet BC).
 
 Usage:
-    source ~/myenv/bin/activate
     python -m axy_lgf.run_demo
     python -m axy_lgf.run_demo --n 127 --problem smooth_sine --solver pcg
+    python -m axy_lgf.run_demo --conv --solver lgf_bank
 """
 
 from __future__ import annotations
@@ -44,16 +42,14 @@ SOLVERS = {
 
 
 def _solve(prob, solver: str, tol: float):
-    """Dispatch one manufactured problem to the requested solver."""
     if solver not in SOLVERS:
         raise ValueError(f"unknown solver {solver!r}; choose from {list(SOLVERS)}")
     return SOLVERS[solver](prob.a, prob.f, prob.grid, tol=tol)
 
 
-def run_once(
-    problem: str, n: int, solver: str, tol: float, forcing: str | None
-) -> None:
-    """Solve one manufactured problem and print its accuracy diagnostics."""
+def run_once(problem: str, n: int, solver: str, tol: float,
+             forcing: str | None) -> None:
+    """Solve one manufactured problem and print diagnostics."""
     prob = make_problem(name=problem, n=n, forcing=forcing)
     grid = prob.grid
 
@@ -78,11 +74,9 @@ def run_once(
 def run_convergence(problem: str, solver: str, tol: float) -> None:
     """Grid refinement study.
 
-    Only the analytic-forcing table measures discretization error.  With
-    discrete forcing f = A_h u_exact holds exactly, so the solver reproduces
-    u_exact down to its own tolerance and the resulting "error" is a solver
-    floor, not an O(h^p) quantity -- a convergence rate from that column would
-    be meaningless, so none is printed.
+    With discrete forcing f = A_h u_exact, the solver reproduces u_exact
+    down to its own tolerance, so the error column is a solver floor rather
+    than an O(h^p) quantity.
     """
     print(f"[conv] problem={problem}  solver={solver}")
 
@@ -114,29 +108,23 @@ def run_convergence(problem: str, solver: str, tol: float) -> None:
 
 
 def main() -> None:
-    """Parse command-line arguments and run a solve or refinement study."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, default=63, help="interior grid size")
     parser.add_argument(
-        "--problem",
-        default="smooth_sine",
+        "--problem", default="smooth_sine",
         choices=["smooth_sine", "mild_sine", "smooth_sine2"],
     )
     parser.add_argument(
-        "--solver",
-        default="pcg",
+        "--solver", default="pcg",
         choices=["pcg", "richardson", "lgf_bank"],
     )
     parser.add_argument("--tol", type=float, default=1e-10)
     parser.add_argument(
-        "--forcing",
-        default=None,
-        choices=["analytic", "discrete"],
+        "--forcing", default=None, choices=["analytic", "discrete"],
         help="override manufactured forcing mode (default: problem default)",
     )
     parser.add_argument(
-        "--conv",
-        action="store_true",
+        "--conv", action="store_true",
         help="run a small grid-convergence study",
     )
     args = parser.parse_args()

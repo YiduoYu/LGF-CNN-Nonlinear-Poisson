@@ -1,8 +1,9 @@
 """
 LGF-CNN for -div(a(x,y) grad u) = f on a rectangle (homogeneous Dirichlet).
 
-Fixed screened Dirichlet LGF filters + pointwise 1x1 MLP mixing / damping.
-No BAE. Shared weights across unrolled blocks by default.
+Fixed screened LGF filters + pointwise 1x1 MLP that learns mixing weights
+and a damping factor. Shared weights across unrolled blocks by default.
+No BAE.
 """
 
 from __future__ import annotations
@@ -16,22 +17,19 @@ import torch.nn as nn
 from .grid import DEFAULT_DOMAIN_MAX, DEFAULT_DOMAIN_MIN, SquareGrid
 from .torch_ops import ScreenedLGFBankTorch, TorchSquareOps
 
-# Positivity floor for a; never binding for the sampled coefficients.
 _MIN_COEFFICIENT = 1e-8
-# Guards the per-sample scales when a field is identically zero.
 _TINY = 1e-300
 
 
 class PointwiseMixer(nn.Module):
-    """1x1 MLP producing mixing weights (J) and damping (1).
+    """1x1 MLP that outputs mixing weights (J channels) and damping (1 channel).
 
-    Mixing is a residual refinement of a Poisson-favoring default:
-        alpha = softmax(bias_prior + MLP)
-    so the untrained network behaves like damped (a0/a) G_0.
+    At initialisation the network is biased toward the Poisson filter
+    (lambda=0) with high damping, so the untrained model behaves roughly
+    like damped (1/a) G_0.
     """
 
     def __init__(self, in_ch: int, J: int, hidden: int = 32):
-        """Build and initialize the pointwise mixing network."""
         super().__init__()
         if in_ch < 1 or J < 1 or hidden < 1:
             raise ValueError("in_ch, J, and hidden must be positive")
@@ -47,21 +45,25 @@ class PointwiseMixer(nn.Module):
         nn.init.zeros_(last.weight)
         nn.init.zeros_(last.bias)
         with torch.no_grad():
-            # Softmax ≈ one-hot on λ=0 (Poisson) at init.
-            last.bias[0] = 5.0
-            # sigmoid(3) ≈ 0.95 damping at init.
-            last.bias[J] = 3.0
+            last.bias[0] = 5.0   # softmax ~ one-hot on lambda=0
+            last.bias[J] = 3.0   # sigmoid(3) ~ 0.95 damping
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return bank weights ``alpha`` and damping ``eta`` at every point."""
-        s = self.net(x)
-        alpha = torch.softmax(s[:, : self.J], dim=1)
-        eta = torch.sigmoid(s[:, self.J : self.J + 1])
+        logits = self.net(x)
+        alpha = torch.softmax(logits[:, : self.J], dim=1)
+        eta = torch.sigmoid(logits[:, self.J : self.J + 1])
         return alpha, eta
 
 
 class LGFCNN(nn.Module):
-    """Unrolled LGF-CNN solver."""
+    """Unrolled LGF-CNN solver.
+
+    Each block computes a residual and applies the fixed LGF bank. The
+    pointwise mixer receives dimensionless coefficient channels plus
+    magnitudes of the scale-normalized residual and bank responses. The
+    signed bank responses remain in the correction, making the solver odd
+    in the forcing while the learned mixture is corrected locally by 1/a.
+    """
 
     def __init__(
         self,
@@ -69,6 +71,7 @@ class LGFCNN(nn.Module):
         J: int = 6,
         K: int = 6,
         hidden: int = 32,
+        a0: float = 1.0,
         eta_max: float = 1.0,
         share_weights: bool = True,
         include_poisson: bool = True,
@@ -76,7 +79,6 @@ class LGFCNN(nn.Module):
         dtype=torch.float64,
         device=None,
     ):
-        """Build an unrolled solver with shared or block-specific mixers."""
         super().__init__()
         if J < 1 or K < 1 or hidden < 1:
             raise ValueError("J, K, and hidden must be positive")
@@ -90,37 +92,31 @@ class LGFCNN(nn.Module):
         self.bank = ScreenedLGFBankTorch(
             grid,
             J=J,
+            a0=a0,
             include_poisson=include_poisson,
             dtype=dtype,
             device=device,
         )
 
-        # Channels: a, 1/a, r, z_1..z_J
         in_ch = 3 + self.bank.J
-        # Mixer in float32 by default; call .double() on mixers if needed.
-        if share_weights:
-            self.mixers = nn.ModuleList([PointwiseMixer(in_ch, self.bank.J, hidden)])
-        else:
-            self.mixers = nn.ModuleList(
-                [PointwiseMixer(in_ch, self.bank.J, hidden) for _ in range(K)]
-            )
+        n_mixers = 1 if share_weights else K
+        self.mixers = nn.ModuleList(
+            [PointwiseMixer(in_ch, self.bank.J, hidden) for _ in range(n_mixers)]
+        )
 
     @property
     def ops(self) -> TorchSquareOps:
-        """Grid operations without registering the same module twice."""
         return self.bank.ops
 
     def _mixer(self, k: int) -> PointwiseMixer:
-        """Return the shared mixer or the mixer assigned to block ``k``."""
         if self.share_weights:
             return self.mixers[0]
         if not 0 <= k < len(self.mixers):
             raise ValueError(f"block index {k} is outside [0, {len(self.mixers)})")
         return self.mixers[k]
 
-    def _step_count(self, requested: int | None) -> int:
-        """Resolve and validate the number of unrolled correction steps."""
-        steps = self.K if requested is None else requested
+    def _step_count(self, K: int | None) -> int:
+        steps = self.K if K is None else K
         if steps < 0:
             raise ValueError("K must be nonnegative")
         if not self.share_weights and steps > len(self.mixers):
@@ -134,54 +130,53 @@ class LGFCNN(nn.Module):
         f: torch.Tensor,
         k: int,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """One correction step plus tensors needed for diagnostics.
+        """One correction step with diagnostics."""
+        r = self.residual(u, a, f)
+        z = self.bank.apply(r)  # (B, J, n, n)
 
-        Every field handed to the mixer is made dimensionless by a per-sample
-        scale, so the softmax/sigmoid see the same input whenever the problem
-        is rescaled.  With alpha and eta thus 0-homogeneous, and z linear in r,
-        the block is *exactly* 1-homogeneous in f and (-1)-homogeneous in a --
-        the linearity of -div(a grad u) = f is built into the architecture
-        instead of being left for the network to approximate.
-        """
-        r = f - self.ops.apply_div_a_grad(u, a)
-        a0 = a.mean(dim=(1, 2))  # (B,) per-sample reference coefficient
-        z = self.bank.apply(r, a0)  # (B, J, n, n)
+        reference_coefficient = a.mean(dim=(1, 2))
+        reference_map = reference_coefficient[:, None, None]
+        inverse_coefficient = 1.0 / a.clamp_min(_MIN_COEFFICIENT)
+        relative_inverse_coefficient = reference_map * inverse_coefficient
 
-        a0c = a0[:, None, None]
-        # a0/a is both the diagonal rescaling used below and a dimensionless
-        # coefficient channel.
-        inv_a = a0c / a.clamp_min(_MIN_COEFFICIENT)
-        scale_r = self.ops.l2_norm(r).clamp_min(_TINY)[:, None, None]
-        scale_z = self.ops.l2_norm(z).amax(dim=1).clamp_min(_TINY)[:, None, None]
+        residual_scale = self.ops.l2_norm(r).clamp_min(_TINY)[:, None, None]
+        bank_scale = self.ops.l2_norm(z).amax(dim=1).clamp_min(_TINY)
+        bank_scale = bank_scale[:, None, None, None]
 
-        feats = torch.stack([a / a0c, inv_a, r / scale_r], dim=1)  # (B, 3, n, n)
-        feats = torch.cat([feats, z / scale_z[:, None]], dim=1)
+        coefficient_inputs = torch.stack(
+            [
+                a / reference_map,
+                relative_inverse_coefficient,
+            ],
+            dim=1,
+        )
+        residual_magnitude = (r / residual_scale).abs()[:, None]
+        bank_magnitudes = (z / bank_scale).abs()
+        mixer_inputs = torch.cat(
+            [coefficient_inputs, residual_magnitude, bank_magnitudes],
+            dim=1,
+        )
 
         mixer = self._mixer(k)
-        # Cast features to mixer dtype (float32 or float64).
-        mdtype = next(mixer.parameters()).dtype
-        alpha, eta = mixer(feats.to(dtype=mdtype))
-        alpha = alpha.to(dtype=u.dtype)
-        eta = eta.to(dtype=u.dtype)
+        mixer_dtype = next(mixer.parameters()).dtype
+        alpha, eta = mixer(mixer_inputs.to(mixer_dtype))
+        alpha = alpha.to(u.dtype)
+        eta = eta.to(u.dtype)
 
-        mixed = torch.sum(alpha * z, dim=1)  # (B, n, n)
+        mixed = torch.sum(alpha * z, dim=1)   # (B, n, n)
         if self.use_inv_a_scale:
-            mixed = inv_a * mixed
+            mixed = inverse_coefficient * mixed
         u_next = u + self.eta_max * eta.squeeze(1) * mixed
-        diagnostics = {
+
+        return u_next, {
             "residual": r,
             "alpha": alpha,
             "eta": eta,
             "u": u_next,
         }
-        return u_next, diagnostics
 
     def block(
-        self,
-        u: torch.Tensor,
-        a: torch.Tensor,
-        f: torch.Tensor,
-        k: int,
+        self, u: torch.Tensor, a: torch.Tensor, f: torch.Tensor, k: int
     ) -> torch.Tensor:
         """One LGF-CNN correction block. u, a, f: (B, n, n)."""
         return self._step(u, a, f, k)[0]
@@ -193,11 +188,10 @@ class LGFCNN(nn.Module):
         u0: torch.Tensor | None = None,
         K: int | None = None,
     ) -> torch.Tensor:
-        """Run ``K`` correction blocks and return the final batched solution."""
-        steps = self._step_count(K)
+        """Run K correction blocks, return the final batched solution."""
         u = torch.zeros_like(f) if u0 is None else u0
-        for k in range(steps):
-            u = self.block(u, a, f, k)
+        for k in range(self._step_count(K)):
+            u, _ = self._step(u, a, f, k)
         return u
 
     def forward_with_diagnostics(
@@ -207,11 +201,10 @@ class LGFCNN(nn.Module):
         u0: torch.Tensor | None = None,
         K: int | None = None,
     ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
-        """Forward pass that also returns per-block residuals and mixer fields."""
-        steps = self._step_count(K)
+        """Forward pass returning per-block residuals and mixer fields."""
         u = torch.zeros_like(f) if u0 is None else u0
         diagnostics = []
-        for k in range(steps):
+        for k in range(self._step_count(K)):
             u, step_info = self._step(u, a, f, k)
             diagnostics.append(step_info)
         return u, diagnostics
@@ -219,13 +212,13 @@ class LGFCNN(nn.Module):
     def residual(
         self, u: torch.Tensor, a: torch.Tensor, f: torch.Tensor
     ) -> torch.Tensor:
-        """Return the discrete PDE residual ``f - A(a)u`` for a batch."""
+        """Discrete PDE residual f - A(a) u for a batch."""
         return f - self.ops.apply_div_a_grad(u, a)
 
 
 @dataclass
 class LGFCNNTrainConfig:
-    """All model, optimization, data, and runtime training settings."""
+    """All model, optimisation, data, and runtime training settings."""
 
     n: int = 31
     J: int = 6
@@ -243,5 +236,5 @@ class LGFCNNTrainConfig:
     contrast: float = 0.5
     domain_min: float = DEFAULT_DOMAIN_MIN
     domain_max: float = DEFAULT_DOMAIN_MAX
-    loss_mode: str = "supervised"  # "supervised" or "physics"
-    data_kind: str = "mms"  # "mms" or "solver", see data.make_batch
+    loss_mode: str = "supervised"   # "supervised" or "physics"
+    data_kind: str = "mms"          # "mms" or "solver"

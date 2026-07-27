@@ -1,13 +1,9 @@
-"""
-axy_lgf: variable-coefficient elliptic solver on a rectangle via LGF/DST.
-
-Solves
-    -div(a(x,y) grad u) = f    in Omega = (x_min, x_max)^2
-    u = 0                      on the boundary of Omega
-
-using a discrete Dirichlet Green's function (DST) as the LGF inverse
-of -a0 * Delta, with no BAE. Includes screened LGF banks and LGF-CNN.
-"""
+# axy_lgf — variable-coefficient elliptic solver on a rectangle
+#
+#     -div(a(x,y) grad u) = f    in (x_min, x_max)^2
+#     u = 0                      on boundary
+#
+# Uses DST-based Dirichlet LGF (no BAE), screened LGF banks, and LGF-CNN.
 
 from .solvers import solve_axy_pcg, solve_axy_richardson, solve_axy_lgf_bank
 from .manufactured import fixed_case_solutions, make_problem

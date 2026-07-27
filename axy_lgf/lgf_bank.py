@@ -1,48 +1,40 @@
-"""Screened Dirichlet LGF filter bank on a rectangle (DST-based, no BAE)."""
+"""Screened Dirichlet LGF filter bank on a rectangle (DST, no BAE).
+
+LGF 先给出 J 个不同空间尺度的候选修正，CNN 再决定每个位置用哪几个。
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.fft import dstn, idstn
 
 from .grid import SquareGrid
-from .lgf_inverse import _laplacian_eigenvalues
+from .lgf_inverse import _laplacian_eigenvalues, _solve_in_dst_basis
 
 
 def default_screening_values(
     h: float, J: int = 6, include_poisson: bool = True
 ) -> np.ndarray:
-    """Screening coefficients λ_j with length scales ~ {∞, 2h, 4h, ...}.
+    """Screening coefficients with length scales ~ {inf, 2h, 4h, ...}.
 
-    λ = 0 is the pure Dirichlet Poisson LGF (included by default on a rectangle,
-    where it is exact via DST and does not need truncation).
+    lambda = 0 is the pure Dirichlet Poisson LGF (included by default; on a
+    rectangle it's exact via DST and doesn't need truncation).
     """
     if J < 1:
         raise ValueError("J must be >= 1")
 
-    sigmas: list[float] = []
-    if include_poisson:
-        sigmas.append(0.0)
-        n_screened = J - 1
-    else:
-        n_screened = J
-
-    if n_screened > 0:
-        # length scales in units of h: 2, 4, 8, ...
-        ell = h * (2.0 ** np.arange(1, n_screened + 1))
-        sigmas.extend((1.0 / ell**2).tolist())
-
-    return np.asarray(sigmas[:J], dtype=np.float64)
+    poisson = [0.0] if include_poisson else []
+    ell = h * 2.0 ** np.arange(1, J - len(poisson) + 1)
+    return np.asarray(poisson + (1.0 / ell**2).tolist(), dtype=np.float64)
 
 
 @dataclass
 class ScreenedLGFBank:
-    """Bank of preconditioners: apply (-a0 Delta + λ_j I)^{-1} to r for each λ_j.
+    """Bank of preconditioners: apply (-a0 Delta + lambda_j I)^{-1} to r.
 
-    Same denominator convention as ScreenedLGFBankTorch; the two must stay in
-    step for solve_axy_lgf_bank to be a like-for-like baseline for LGF-CNN.
+    Same denominator convention as ScreenedLGFBankTorch; the two must agree
+    for solve_axy_lgf_bank to be an honest baseline for LGF-CNN.
     """
 
     grid: SquareGrid
@@ -50,7 +42,6 @@ class ScreenedLGFBank:
     a0: float = 1.0
 
     def __post_init__(self) -> None:
-        """Validate parameters and cache every spectral denominator."""
         self.lambdas = np.asarray(self.lambdas, dtype=np.float64).ravel()
         if self.lambdas.size == 0:
             raise ValueError("lambdas must not be empty")
@@ -71,7 +62,6 @@ class ScreenedLGFBank:
         a0: float = 1.0,
         include_poisson: bool = True,
     ) -> "ScreenedLGFBank":
-        """Build a bank from the standard geometric screening sequence."""
         return cls(
             grid=grid,
             lambdas=default_screening_values(
@@ -82,30 +72,25 @@ class ScreenedLGFBank:
 
     @property
     def J(self) -> int:
-        """Number of filters in the bank."""
         return len(self.lambdas)
 
     def apply(self, r: np.ndarray) -> np.ndarray:
-        """Return stack z[j] = G_{λ_j} * r with shape (J, n, n)."""
+        """Return stack z[j] = G_{lambda_j} * r, shape (J, n, n)."""
         if r.shape != (self.grid.n, self.grid.n):
             raise ValueError("r must have shape (n, n)")
         if not np.all(np.isfinite(r)):
             raise ValueError("r must contain only finite values")
-        r_hat = dstn(r, type=1, norm="ortho")
-        z_hat = r_hat[None, :, :] / self._denominators
-        return idstn(z_hat, type=1, norm="ortho", axes=(-2, -1))
+        return _solve_in_dst_basis(r, self._denominators)
 
     def mix(self, r: np.ndarray, alpha: np.ndarray) -> np.ndarray:
-        """Compute sum_j alpha_j * G_{λ_j} r.
+        """Compute sum_j alpha_j * G_{lambda_j} r.
 
-        alpha: (J,) global weights, or (J, n, n) pointwise weights.
+        alpha can be (J,) for global weights or (J, n, n) for pointwise.
         """
         z = self.apply(r)
-        a = np.asarray(alpha, dtype=np.float64)
-        if a.ndim == 1:
-            if a.shape[0] != self.J:
-                raise ValueError("alpha shape mismatch")
-            return np.tensordot(a, z, axes=(0, 0))
-        if a.shape != z.shape:
-            raise ValueError("alpha shape mismatch")
-        return np.sum(a * z, axis=0)
+        weights = np.asarray(alpha, dtype=np.float64)
+        if weights.shape == (self.J,):
+            return np.tensordot(weights, z, axes=(0, 0))
+        if weights.shape == z.shape:
+            return np.sum(weights * z, axis=0)
+        raise ValueError(f"alpha must have shape ({self.J},) or {z.shape}")

@@ -69,14 +69,25 @@ python -m axy_lgf.train_lgf_cnn \
 Checkpoints land in:
 
 ```text
-axy_lgf/checkpoints/lgf_cnn_axy/<experiment_params_and_hash>/best.pt
-axy_lgf/checkpoints/lgf_cnn_axy/<experiment_params_and_hash>/last.pt
-axy_lgf/checkpoints/lgf_cnn_axy/<experiment_params_and_hash>/completed.json
+axy_lgf/checkpoints/lgf_cnn_axy/<experiment_params_and_hash>/
+├── latest.json
+└── runs/
+    ├── <train_id_1>/
+    │   ├── completed.json
+    │   ├── best.pt
+    │   ├── last.pt
+    │   ├── history.csv
+    │   └── figures/training_curve.png
+    └── <train_id_2>/
+        └── ...
 ```
 
 The experiment directory name includes `mms` or `solver`, so the two runs
 don't collide. Each epoch uses exactly `--samples-per-epoch` samples; any
-leftover at the end is handled as a short batch.
+leftover at the end is handled as a short batch. Reusing the same configuration
+loads the newest completed training run. `--retrain` creates a new `train_id`;
+it never overwrites the old checkpoint. Flat checkpoint directories produced
+by earlier versions remain readable and are not moved or deleted.
 
 Every evaluation or prediction creates a new immutable run. The training
 experiment key groups related evaluations; each `eval_id` contains a UTC
@@ -87,10 +98,12 @@ axy_lgf/result/<experiment_params_and_hash>/
 ├── latest.json
 └── evaluations/
     ├── <eval_id_1>/
+    │   ├── manifest.json
+    │   ├── data/
+    │   └── figures/
     └── <eval_id_2>/
         ├── manifest.json
         ├── data/
-        │   ├── training_history.csv
         │   ├── u1_u4_metrics.csv
         │   ├── u1_u4_summary.json
         │   ├── u1_u4_solver_comparison.csv
@@ -103,7 +116,6 @@ axy_lgf/result/<experiment_params_and_hash>/
         │   ├── heldout_predictions.pt
         │   └── generalization_sweeps.csv
         └── figures/
-            ├── training_curve.png
             ├── u1_centerline.png
             ├── u1_panel.png
             ├── ...
@@ -111,10 +123,23 @@ axy_lgf/result/<experiment_params_and_hash>/
             └── u4_panel.png
 ```
 
-`manifest.json` records the evaluation parameters, checkpoint path and
-SHA-256, timestamps, status, and a size/hash inventory of every artifact.
+`manifest.json` records the evaluation parameters, immutable `train_id`,
+relative training-artifact URIs, checkpoint path and SHA-256, code/environment
+provenance, timestamps, status, and a size/hash inventory of every evaluation
+artifact. Training history and its curve belong to the training run and are not
+copied into every evaluation.
 `latest.json` is only a small pointer to the most recently completed run.
-Completed evaluation directories are never reused or supplemented.
+Completed evaluation directories are never reused, supplemented, or copied
+to the experiment root. The first successful evaluation creates
+`<eval_id_1>`; the next creates `<eval_id_2>` and updates `latest.json` to
+point to it while `<eval_id_1>` remains unchanged. A running evaluation
+exists only as a hidden `.attempt-*` directory. A failed attempt is discarded
+and does not change `latest.json`. Attempt locks let a later process remove
+staging directories abandoned by a killed process without touching active
+evaluations. Updates to `latest.json` are locked and monotonic, and a missing
+or stale pointer is rebuilt from completed manifests. Dot-prefixed staging
+directories are made visible after their atomic rename so macOS Finder shows
+every completed run.
 
 By default all four cases u1–u4 are plotted with a shared coefficient
 field. Pick one with `--plot-case u1|u2|u3|u4`, or skip plotting with
@@ -128,11 +153,13 @@ Point both commands at their respective `best.pt`:
 
 ```bash
 python -m axy_lgf.train_lgf_cnn \
-  --predict --predict-from axy_lgf/checkpoints/lgf_cnn_axy/<mms_exp>/best.pt \
+  --predict --predict-from \
+  axy_lgf/checkpoints/lgf_cnn_axy/<mms_exp>/runs/<train_id>/best.pt \
   --test-seed 123 --output-dir results/predict_mms_model
 
 python -m axy_lgf.train_lgf_cnn \
-  --predict --predict-from axy_lgf/checkpoints/lgf_cnn_axy/<solver_exp>/best.pt \
+  --predict --predict-from \
+  axy_lgf/checkpoints/lgf_cnn_axy/<solver_exp>/runs/<train_id>/best.pt \
   --test-seed 123 --output-dir results/predict_solver_model
 ```
 
@@ -292,8 +319,9 @@ semantics change—retrained:
    meaningful.
 8. PCG stopping tolerance and the common reporting target remain separate.
    Fixed-budget LGF-CNN/Richardson rows never claim solver convergence.
-9. Completed evaluation runs remain immutable and `latest.json` remains only
-   a pointer to the newest successfully committed run.
+9. Completed training and evaluation runs remain immutable. Their
+   `latest.json` files remain pointers only; retraining creates a new
+   `train_id` and never replaces an earlier checkpoint.
 10. Evaluation-only CSV/schema changes increment
     `EVALUATION_FORMAT_VERSION`. Model equations or state-layout changes
     require deliberate checkpoint/experiment versioning and retraining.
@@ -312,22 +340,28 @@ Checkpoints use format version 8 and are loaded with
 different architecture are rejected rather than silently interpreted
 under the current equations; retrain with the current code.
 
-The solver-comparison schema is evaluation format version 2. This is an
-output-only change: checkpoint and experiment formats remain at version 8,
-and existing version 8 models do not need retraining.
+The solver-comparison rows retain evaluation schema version 2; the containing
+evaluation-run manifest is format version 3 because it adds immutable training
+lineage and runtime provenance. This is an output/storage-only change:
+checkpoint and mathematical experiment formats remain at version 8, and
+existing version 8 models do not need retraining.
 
-Training writes to a separate temp experiment directory first;
-`completed.json` is written last, after `best.pt`, `last.pt`, and
-`history.csv` are all finished and hashed. Concurrent training runs with
-the same parameters are serialised by a file lock. An interrupted run
-won't be mistaken for a complete one.
+Training writes `best.pt`, `last.pt`, `history.csv`, the training curve, and
+`completed.json` inside `runs/.attempt-<train_id>/`. The entire completed
+directory is then renamed once to `runs/<train_id>/`; files are never promoted
+one by one into an existing run. Concurrent training with the same experiment
+key is serialised by a file lock. An interrupted run cannot replace or mix
+files with an earlier checkpoint.
 
 Evaluation follows the same commit discipline. Files are first generated
 under `evaluations/.attempt-<eval_id>/`. Only after all requested data and
 figures succeed is `manifest.json` written and the directory atomically
 renamed to `evaluations/<eval_id>/`. A failed attempt is removed and never
-becomes a visible completed run. Existing result directories from the old
-layout are left untouched.
+becomes a visible completed run. Each evaluation hashes the exact checkpoint
+byte snapshot loaded into memory and verifies the path again before commit.
+If updating `latest.json` fails after a successful directory commit, the run
+remains valid and the pointer is repaired from manifests next time. Existing
+checkpoint and result directories from the old layout are left untouched.
 
 ## Manual self-check while tests are deferred
 
@@ -345,8 +379,8 @@ python -m axy_lgf.train_lgf_cnn \
 ```
 
 `plot_lgf_cnn.py` is imported when the program starts, so module-level import
-errors fail fast. Matplotlib itself is loaded lazily only when plotting is
-actually requested.
+errors fail fast. Matplotlib itself is loaded lazily when a new training run
+writes its single training curve, or when evaluation figures are requested.
 
 ## Main files
 

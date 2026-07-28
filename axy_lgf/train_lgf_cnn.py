@@ -14,9 +14,9 @@ Data modes (see data.py):
     mms     sample u_exact, derive f = A_h u_exact   (default)
     solver  sample f, solve A_h u = f via PCG
 
-Checkpoints go to <checkpoint-root>/<experiment_key>/ with best.pt (chosen
-on a fixed held-out validation batch), last.pt, and history.csv. Results
-land in result/<experiment_key>/evaluations/<eval_id>/{data,figures}/.
+Training artifacts go to
+<checkpoint-root>/<experiment_key>/runs/<train_id>/, and evaluations land
+in result/<experiment_key>/evaluations/<eval_id>/{data,figures}/.
 """
 
 from __future__ import annotations
@@ -25,16 +25,22 @@ import argparse
 import csv
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
+import platform
 import shutil
+import stat
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from numbers import Integral
 from pathlib import Path
+from typing import IO
 from uuid import uuid4
 
 import numpy as np
@@ -51,16 +57,19 @@ from .grid import DEFAULT_DOMAIN_MAX, DEFAULT_DOMAIN_MIN, SquareGrid
 from .lgf_cnn import LGFCNN, LGFCNNTrainConfig
 from .manufactured import fixed_case_solutions, make_problem
 from .operators import apply_div_a_grad, l2_norm
-from .plot_lgf_cnn import generate_pinn_style_figures
+from .plot_lgf_cnn import generate_pinn_style_figures, save_training_curve
 from .solvers import solve_axy_richardson
 
 MODEL_TYPE = "lgf_cnn_axy"
 CHECKPOINT_FORMAT_VERSION = 8
 EXPERIMENT_VERSION = 8
-EVALUATION_FORMAT_VERSION = 2
+TRAINING_RUN_FORMAT_VERSION = 1
+EVALUATION_FORMAT_VERSION = 3
 PROJECT_DIR = Path(__file__).resolve().parent
-RUN_ARTIFACTS = ("best.pt", "last.pt", "history.csv")
+CORE_RUN_ARTIFACTS = ("best.pt", "last.pt", "history.csv")
+NEW_RUN_ARTIFACTS = (*CORE_RUN_ARTIFACTS, "figures/training_curve.png")
 RUN_MANIFEST = "completed.json"
+ATTEMPT_LOCK = ".attempt.lock"
 MAX_TORCH_SEED = 2**64 - 1
 
 
@@ -148,6 +157,46 @@ def _payload_sha256(payload: dict) -> str:
     return hashlib.sha256(serialized.encode()).hexdigest()
 
 
+def _git_provenance() -> dict:
+    """Best-effort source revision without making Git a runtime dependency."""
+
+    def run_git(*arguments: str) -> str | None:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(PROJECT_DIR), *arguments],
+                check=False, capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        return completed.stdout.strip()
+
+    revision = run_git("rev-parse", "HEAD")
+    if revision is None:
+        return {"available": False}
+    status = run_git("status", "--porcelain")
+    return {
+        "available": True,
+        "revision": revision,
+        "dirty": bool(status),
+    }
+
+
+def _runtime_provenance() -> dict:
+    """Code and environment metadata needed to interpret a saved run."""
+    return {
+        "argv": list(sys.argv),
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "source": _git_provenance(),
+    }
+
+
 def experiment_key(cfg: LGFCNNTrainConfig) -> str:
     """Readable run tag + short config digest."""
     visible = (
@@ -209,16 +258,34 @@ def _file_sha256(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class TrainingReference:
+    experiment_key: str
+    training_run_id: str
+    run_dir: Path
+    checkpoint_path: Path
+    checkpoint_sha256: str
+    history_path: Path
+    training_curve_path: Path | None
+    checkpoint_artifact_uri: str | None
+    completed_at_utc: str
+    legacy_layout: bool = False
+
+
+@dataclass(frozen=True)
 class EvaluationRun:
     evaluation_id: str
     evaluation_kind: str
     training_experiment: str
+    training_run_id: str
     experiment_dir: Path
     attempt_dir: Path
     final_dir: Path
     checkpoint_path: Path
     checkpoint_sha256: str
+    checkpoint_artifact_uri: str | None
+    training_artifacts: dict
     started_at_utc: str
+    attempt_lock: IO[bytes]
 
 
 def _utc_now() -> datetime:
@@ -242,34 +309,49 @@ def _evaluation_id(
 def _begin_evaluation_run(
     experiment_dir: Path,
     training_experiment: str,
+    training_run_id: str,
     checkpoint_path: Path,
+    checkpoint_sha256: str,
+    checkpoint_artifact_uri: str | None,
+    training_artifacts: dict,
     test_seed: int,
     evaluation_kind: str,
 ) -> EvaluationRun:
     """Create a private attempt directory for one unique evaluation."""
-    checkpoint_sha256 = _file_sha256(checkpoint_path)
     started = _utc_now()
     evaluation_id = _evaluation_id(started, test_seed, checkpoint_sha256)
     evaluations_dir = experiment_dir / "evaluations"
+    evaluations_dir.mkdir(parents=True, exist_ok=True)
+    _cleanup_abandoned_evaluation_attempts(evaluations_dir)
+    _repair_evaluation_latest(experiment_dir)
     attempt_dir = evaluations_dir / f".attempt-{evaluation_id}"
     final_dir = evaluations_dir / evaluation_id
-    attempt_dir.mkdir(parents=True, exist_ok=False)
+    attempt_dir.mkdir(exist_ok=False)
+    lock_file = (attempt_dir / ATTEMPT_LOCK).open("a+b")
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
     return EvaluationRun(
         evaluation_id=evaluation_id,
         evaluation_kind=evaluation_kind,
         training_experiment=training_experiment,
+        training_run_id=training_run_id,
         experiment_dir=experiment_dir,
         attempt_dir=attempt_dir,
         final_dir=final_dir,
         checkpoint_path=checkpoint_path,
         checkpoint_sha256=checkpoint_sha256,
+        checkpoint_artifact_uri=checkpoint_artifact_uri,
+        training_artifacts=training_artifacts,
         started_at_utc=_iso_utc(started),
+        attempt_lock=lock_file,
     )
 
 
 def _artifact_inventory(root: Path) -> list[dict]:
     artifacts = []
-    files = sorted(path for path in root.rglob("*") if path.is_file())
+    files = sorted(
+        path for path in root.rglob("*")
+        if path.is_file() and path.name not in {ATTEMPT_LOCK, ".DS_Store"}
+    )
     for path in files:
         artifacts.append({
             "path": path.relative_to(root).as_posix(),
@@ -279,12 +361,198 @@ def _artifact_inventory(root: Path) -> list[dict]:
     return artifacts
 
 
+@contextmanager
+def _evaluation_latest_lock(experiment_dir: Path):
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = experiment_dir / ".latest.lock"
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        with path.open() as file:
+            value = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _evaluation_latest_payload(
+    manifest: dict, final_dir: Path, experiment_dir: Path,
+) -> dict:
+    return {
+        "evaluation_id": manifest["evaluation_id"],
+        "evaluation_kind": manifest["evaluation_kind"],
+        "status": "completed",
+        "completed_at_utc": manifest["completed_at_utc"],
+        "checkpoint_sha256": manifest["checkpoint"]["sha256"],
+        "manifest_sha256": _file_sha256(final_dir / "manifest.json"),
+        "path": final_dir.relative_to(experiment_dir).as_posix(),
+    }
+
+
+def _latest_order(payload: dict | None) -> tuple[str, str]:
+    if not payload:
+        return "", ""
+    return (
+        str(payload.get("completed_at_utc", "")),
+        str(payload.get("evaluation_id", "")),
+    )
+
+
+def _newest_completed_evaluation(experiment_dir: Path) -> dict | None:
+    evaluations_dir = experiment_dir / "evaluations"
+    if not evaluations_dir.is_dir():
+        return None
+    candidates = []
+    for final_dir in evaluations_dir.iterdir():
+        if not final_dir.is_dir() or final_dir.name.startswith("."):
+            continue
+        manifest = _read_json(final_dir / "manifest.json")
+        if (
+            manifest is None
+            or manifest.get("status") != "completed"
+            or manifest.get("evaluation_id") != final_dir.name
+            or not isinstance(manifest.get("checkpoint"), dict)
+        ):
+            continue
+        try:
+            candidates.append(
+                _evaluation_latest_payload(manifest, final_dir, experiment_dir)
+            )
+        except (KeyError, OSError, ValueError):
+            continue
+    return max(candidates, key=_latest_order, default=None)
+
+
+def _repair_evaluation_latest(experiment_dir: Path) -> None:
+    """Recover a missing/stale pointer from committed evaluation manifests."""
+    with _evaluation_latest_lock(experiment_dir):
+        newest = _newest_completed_evaluation(experiment_dir)
+        if newest is None:
+            return
+        latest_path = experiment_dir / "latest.json"
+        current = _read_json(latest_path)
+        current_valid = False
+        if current is not None:
+            try:
+                current_target = (
+                    experiment_dir / str(current["path"])
+                ).resolve()
+                current_target.relative_to(
+                    (experiment_dir / "evaluations").resolve()
+                )
+                current_manifest = _read_json(
+                    current_target / "manifest.json"
+                )
+                canonical = (
+                    _evaluation_latest_payload(
+                        current_manifest, current_target,
+                        experiment_dir.resolve(),
+                    )
+                    if current_manifest is not None else None
+                )
+                current_valid = (
+                    canonical is not None
+                    and all(current.get(key) == value
+                            for key, value in canonical.items())
+                )
+            except (KeyError, OSError, ValueError):
+                current_valid = False
+        if not current_valid or _latest_order(newest) > _latest_order(current):
+            _write_json_atomic(newest, latest_path)
+
+
+def _update_evaluation_latest(experiment_dir: Path, payload: dict) -> None:
+    """Advance latest monotonically even when evaluations finish concurrently."""
+    with _evaluation_latest_lock(experiment_dir):
+        latest_path = experiment_dir / "latest.json"
+        current = _read_json(latest_path)
+        if _latest_order(payload) >= _latest_order(current):
+            _write_json_atomic(payload, latest_path)
+
+
+def _cleanup_abandoned_evaluation_attempts(evaluations_dir: Path) -> None:
+    """Remove attempts whose owning process no longer holds its file lock."""
+    for attempt_dir in evaluations_dir.glob(".attempt-*"):
+        if not attempt_dir.is_dir():
+            continue
+        lock_path = attempt_dir / ATTEMPT_LOCK
+        if not lock_path.exists():
+            age = time.time() - attempt_dir.stat().st_mtime
+            if age > 24 * 60 * 60:
+                shutil.rmtree(attempt_dir)
+            continue
+        with lock_path.open("a+b") as lock_file:
+            try:
+                fcntl.flock(
+                    lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                continue
+            try:
+                shutil.rmtree(attempt_dir)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _release_evaluation_attempt_lock(run: EvaluationRun) -> None:
+    if not run.attempt_lock.closed:
+        fcntl.flock(run.attempt_lock.fileno(), fcntl.LOCK_UN)
+        run.attempt_lock.close()
+
+
+def _clear_macos_hidden_flags(path: Path) -> None:
+    """Make atomically renamed artifacts visible in macOS Finder.
+
+    Finder marks dot-prefixed staging directories as hidden at the filesystem
+    level. ``os.replace`` preserves that flag even when the final name has no
+    leading dot. File Provider directories can propagate it to descendants,
+    so the completed tree is repaired recursively. Other platforms do not
+    expose ``chflags``/``UF_HIDDEN`` and simply skip this compatibility step.
+    """
+    change_flags = getattr(os, "chflags", None)
+    hidden_flag = getattr(stat, "UF_HIDDEN", 0)
+    if change_flags is None or hidden_flag == 0:
+        return
+
+    def make_visible(candidate: Path) -> None:
+        try:
+            current_flags = getattr(candidate.stat(), "st_flags", 0)
+            if current_flags & hidden_flag:
+                change_flags(candidate, current_flags & ~hidden_flag)
+        except OSError as exc:
+            print(
+                f"[eval-run] could not make {candidate} visible in Finder: "
+                f"{exc}"
+            )
+
+    make_visible(path)
+    if path.is_dir():
+        for descendant in path.rglob("*"):
+            make_visible(descendant)
+
+
 def _complete_evaluation_run(
     run: EvaluationRun, parameters: dict,
 ) -> Path:
     """Write the manifest last, then atomically expose the completed run."""
     if run.final_dir.exists():
         raise FileExistsError(f"evaluation already exists: {run.final_dir}")
+    if (
+        not run.checkpoint_path.is_file()
+        or _file_sha256(run.checkpoint_path) != run.checkpoint_sha256
+    ):
+        raise RuntimeError(
+            "checkpoint changed while the evaluation was running; "
+            "the incomplete evaluation was not committed"
+        )
+    artifacts = _artifact_inventory(run.attempt_dir)
     completed_at = _iso_utc(_utc_now())
     manifest = {
         "evaluation_format_version": EVALUATION_FORMAT_VERSION,
@@ -292,32 +560,46 @@ def _complete_evaluation_run(
         "evaluation_kind": run.evaluation_kind,
         "status": "completed",
         "training_experiment": run.training_experiment,
+        "training_run": {
+            "experiment_key": run.training_experiment,
+            "training_run_id": run.training_run_id,
+            "artifacts": run.training_artifacts,
+        },
         "started_at_utc": run.started_at_utc,
         "completed_at_utc": completed_at,
         "checkpoint": {
             "path": str(run.checkpoint_path.resolve()),
             "sha256": run.checkpoint_sha256,
+            "artifact_uri": run.checkpoint_artifact_uri,
         },
         "parameters": parameters,
-        "artifacts": _artifact_inventory(run.attempt_dir),
+        "runtime": _runtime_provenance(),
+        "immutability": "append_only_by_application",
+        "artifacts": artifacts,
     }
     _write_json_atomic(manifest, run.attempt_dir / "manifest.json")
     os.replace(run.attempt_dir, run.final_dir)
-    _write_json_atomic(
-        {
-            "evaluation_id": run.evaluation_id,
-            "evaluation_kind": run.evaluation_kind,
-            "status": "completed",
-            "completed_at_utc": completed_at,
-            "checkpoint_sha256": run.checkpoint_sha256,
-            "path": f"evaluations/{run.evaluation_id}",
-        },
-        run.experiment_dir / "latest.json",
+    _release_evaluation_attempt_lock(run)
+    try:
+        (run.final_dir / ATTEMPT_LOCK).unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"[eval-run] could not remove internal attempt lock: {exc}")
+    _clear_macos_hidden_flags(run.final_dir)
+    latest_payload = _evaluation_latest_payload(
+        manifest, run.final_dir, run.experiment_dir,
     )
+    try:
+        _update_evaluation_latest(run.experiment_dir, latest_payload)
+    except OSError as exc:
+        print(
+            "[eval-run] run committed, but latest.json could not be updated; "
+            f"it will be repaired on the next run: {exc}"
+        )
     return run.final_dir
 
 
 def _discard_evaluation_attempt(run: EvaluationRun) -> None:
+    _release_evaluation_attempt_lock(run)
     if run.attempt_dir.exists():
         shutil.rmtree(run.attempt_dir)
 
@@ -342,9 +624,15 @@ def save_checkpoint(
         }, temporary)
 
 
-def load_model(ckpt_path: Path, device: str) -> tuple[LGFCNN, dict]:
-    """Load a checkpoint for inference, validating version compatibility."""
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+def _load_model_snapshot(
+    ckpt_path: Path, device: str,
+) -> tuple[LGFCNN, dict, str]:
+    """Load and hash the same checkpoint byte snapshot."""
+    checkpoint_bytes = ckpt_path.read_bytes()
+    checkpoint_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
+    ckpt = torch.load(
+        io.BytesIO(checkpoint_bytes), map_location=device, weights_only=True,
+    )
     for field, expected in (
         ("format_version", CHECKPOINT_FORMAT_VERSION),
         ("experiment_version", EXPERIMENT_VERSION),
@@ -362,6 +650,12 @@ def load_model(ckpt_path: Path, device: str) -> tuple[LGFCNN, dict]:
     model = make_model(cfg)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
+    return model, saved_config, checkpoint_sha256
+
+
+def load_model(ckpt_path: Path, device: str) -> tuple[LGFCNN, dict]:
+    """Load a checkpoint for inference, validating version compatibility."""
+    model, saved_config, _ = _load_model_snapshot(ckpt_path, device)
     return model, saved_config
 
 
@@ -475,23 +769,33 @@ def _save_evaluation_outputs(
     return predictions_path
 
 
-def _copy_training_history(history_path: Path, data_dir: Path) -> None:
-    if not history_path.is_file():
-        return
-    with _atomic_write(data_dir / "training_history.csv") as temporary:
-        shutil.copy2(history_path, temporary)
-
-
 # ---------------------------------------------------------------------------
 # run completion & promotion
 # ---------------------------------------------------------------------------
 
-def _completion_payload(cfg: LGFCNNTrainConfig, run_dir: Path) -> dict:
+def _training_id(moment: datetime, seed: int) -> str:
+    timestamp = moment.strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{timestamp}_s{seed}_{uuid4().hex[:8]}"
+
+
+def _completion_payload(
+    cfg: LGFCNNTrainConfig, run_dir: Path, *,
+    run_key: str, training_run_id: str,
+    started_at_utc: str, completed_at_utc: str,
+) -> dict:
     return {
+        "training_run_format_version": TRAINING_RUN_FORMAT_VERSION,
         "experiment_version": EXPERIMENT_VERSION,
+        "status": "completed",
+        "experiment_key": run_key,
+        "training_run_id": training_run_id,
+        "started_at_utc": started_at_utc,
+        "completed_at_utc": completed_at_utc,
         "config_sha256": _payload_sha256(_training_config_payload(cfg)),
+        "config": _training_config_payload(cfg),
+        "runtime": _runtime_provenance(),
         "artifacts": {
-            name: _file_sha256(run_dir / name) for name in RUN_ARTIFACTS
+            name: _file_sha256(run_dir / name) for name in NEW_RUN_ARTIFACTS
         },
     }
 
@@ -508,13 +812,26 @@ def _run_completion_issue(run_dir: Path, cfg: LGFCNNTrainConfig) -> str | None:
         return f"{RUN_MANIFEST} cannot be read: {exc}"
     if manifest.get("experiment_version") != EXPERIMENT_VERSION:
         return "identity: experiment version does not match the current code"
+    run_format = manifest.get("training_run_format_version")
+    if run_format not in (None, TRAINING_RUN_FORMAT_VERSION):
+        return "identity: training run format is not supported"
     expected_config = _payload_sha256(_training_config_payload(cfg))
     if manifest.get("config_sha256") != expected_config:
         return "identity: training configuration digest does not match"
+    if (
+        "training_run_format_version" in manifest
+        and manifest.get("status") != "completed"
+    ):
+        return "training run status is not completed"
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
         return "artifact hashes are missing from completed.json"
-    for name in RUN_ARTIFACTS:
+    required = (
+        NEW_RUN_ARTIFACTS
+        if run_format == TRAINING_RUN_FORMAT_VERSION
+        else CORE_RUN_ARTIFACTS
+    )
+    for name in required:
         path = run_dir / name
         expected_hash = artifacts.get(name)
         if not path.is_file():
@@ -525,21 +842,30 @@ def _run_completion_issue(run_dir: Path, cfg: LGFCNNTrainConfig) -> str | None:
 
 
 def _promote_attempt(
-    attempt_dir: Path, run_dir: Path, cfg: LGFCNNTrainConfig,
+    attempt_dir: Path, run_dir: Path, cfg: LGFCNNTrainConfig, *,
+    run_key: str, training_run_id: str, started_at_utc: str,
 ) -> None:
-    """Atomically promote a completed training attempt.
-
-    The manifest is written last. An interruption during promotion leaves
-    the run in a state normal execution will refuse to reuse.
-    """
-    missing = [name for name in RUN_ARTIFACTS if not (attempt_dir / name).is_file()]
+    """Write the manifest inside the attempt, then rename the whole directory."""
+    missing = [
+        name for name in NEW_RUN_ARTIFACTS
+        if not (attempt_dir / name).is_file()
+    ]
     if missing:
         raise RuntimeError(f"training attempt is missing: {', '.join(missing)}")
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / RUN_MANIFEST).unlink(missing_ok=True)
-    for name in RUN_ARTIFACTS:
-        os.replace(attempt_dir / name, run_dir / name)
-    _write_json_atomic(_completion_payload(cfg, run_dir), run_dir / RUN_MANIFEST)
+    if run_dir.exists():
+        raise FileExistsError(f"training run already exists: {run_dir}")
+    completed_at = _iso_utc(_utc_now())
+    _write_json_atomic(
+        _completion_payload(
+            cfg, attempt_dir, run_key=run_key,
+            training_run_id=training_run_id,
+            started_at_utc=started_at_utc,
+            completed_at_utc=completed_at,
+        ),
+        attempt_dir / RUN_MANIFEST,
+    )
+    os.replace(attempt_dir, run_dir)
+    _clear_macos_hidden_flags(run_dir)
 
 
 @contextmanager
@@ -555,11 +881,109 @@ def _run_lock(checkpoint_root: Path, run_key: str):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _cleanup_stale_attempts(checkpoint_root: Path, run_key: str) -> None:
-    prefix = f".{run_key}.attempt-"
-    for path in checkpoint_root.iterdir():
-        if path.name.startswith(prefix) and path.is_dir():
+def _cleanup_stale_training_attempts(runs_dir: Path) -> None:
+    if not runs_dir.is_dir():
+        return
+    for path in runs_dir.glob(".attempt-*"):
+        if path.is_dir():
             shutil.rmtree(path)
+
+
+def _training_reference(
+    run_dir: Path, run_key: str, checkpoint_sha256: str | None = None,
+) -> TrainingReference:
+    checkpoint_path = run_dir / "best.pt"
+    if checkpoint_sha256 is None:
+        checkpoint_sha256 = _file_sha256(checkpoint_path)
+    manifest = _read_json(run_dir / RUN_MANIFEST) or {}
+    is_new_layout = run_dir.parent.name == "runs"
+    training_run_id = str(
+        manifest.get("training_run_id")
+        or f"legacy-{checkpoint_sha256[:12]}"
+    )
+    completed_at = manifest.get("completed_at_utc")
+    if not isinstance(completed_at, str):
+        completed_at = _iso_utc(
+            datetime.fromtimestamp(
+                (run_dir / RUN_MANIFEST).stat().st_mtime, timezone.utc,
+            )
+        )
+    artifact_uri = (
+        f"runs/{run_dir.name}/best.pt" if is_new_layout else "best.pt"
+    )
+    training_curve = run_dir / "figures" / "training_curve.png"
+    return TrainingReference(
+        experiment_key=run_key,
+        training_run_id=training_run_id,
+        run_dir=run_dir,
+        checkpoint_path=checkpoint_path,
+        checkpoint_sha256=checkpoint_sha256,
+        history_path=run_dir / "history.csv",
+        training_curve_path=training_curve if training_curve.is_file() else None,
+        checkpoint_artifact_uri=artifact_uri,
+        completed_at_utc=completed_at,
+        legacy_layout=not is_new_layout,
+    )
+
+
+def _training_latest_payload(
+    reference: TrainingReference, experiment_dir: Path,
+) -> dict:
+    return {
+        "training_run_id": reference.training_run_id,
+        "status": "completed",
+        "completed_at_utc": reference.completed_at_utc,
+        "checkpoint_sha256": reference.checkpoint_sha256,
+        "path": reference.run_dir.relative_to(experiment_dir).as_posix() or ".",
+        "checkpoint_artifact_uri": reference.checkpoint_artifact_uri,
+    }
+
+
+def _resolve_training_run(
+    checkpoint_root: Path, run_key: str, cfg: LGFCNNTrainConfig,
+) -> TrainingReference | None:
+    """Find the newest valid immutable run, including the legacy flat layout."""
+    experiment_dir = checkpoint_root / run_key
+    if not experiment_dir.is_dir():
+        return None
+
+    candidates: list[TrainingReference] = []
+    runs_dir = experiment_dir / "runs"
+    if runs_dir.is_dir():
+        for run_dir in runs_dir.iterdir():
+            if not run_dir.is_dir() or run_dir.name.startswith("."):
+                continue
+            if _run_completion_issue(run_dir, cfg) is None:
+                candidates.append(_training_reference(run_dir, run_key))
+
+    legacy_manifest = experiment_dir / RUN_MANIFEST
+    if legacy_manifest.is_file():
+        issue = _run_completion_issue(experiment_dir, cfg)
+        if issue is None:
+            candidates.append(_training_reference(experiment_dir, run_key))
+        elif issue.startswith("identity: "):
+            raise ValueError(
+                f"refusing to reuse {experiment_dir}: "
+                f"{issue.removeprefix('identity: ')}"
+            )
+
+    if not candidates:
+        return None
+    newest = max(
+        candidates,
+        key=lambda item: (item.completed_at_utc, item.training_run_id),
+    )
+    try:
+        _write_json_atomic(
+            _training_latest_payload(newest, experiment_dir),
+            experiment_dir / "latest.json",
+        )
+    except OSError as exc:
+        print(
+            "[train] latest.json could not be repaired; the immutable run "
+            f"remains usable: {exc}"
+        )
+    return newest
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +1141,7 @@ def evaluate(
     seed: int = 123, richardson_steps: int | None = None,
     data_kind: str = "mms", output_dir: Path | None = None,
     checkpoint_path: Path | None = None,
+    checkpoint_sha256: str | None = None,
     evaluation_id: str | None = None,
     announce_output: bool = True,
 ) -> dict:
@@ -769,7 +1194,9 @@ def evaluate(
             metadata["evaluation_id"] = evaluation_id
         if data_kind != "solver":
             metadata["pcg_solver_tolerance"] = DEFAULT_PCG_SOLVER_TOL
-        if checkpoint_path is not None:
+        if checkpoint_sha256 is not None:
+            metadata["checkpoint_sha256"] = checkpoint_sha256
+        elif checkpoint_path is not None:
             metadata["checkpoint_sha256"] = _file_sha256(checkpoint_path)
         _save_evaluation_outputs(bundle, output_dir, "heldout", metadata)
         if announce_output:
@@ -825,7 +1252,77 @@ def _experiment_result_dir(result_root: Path, run_name: str) -> Path:
 
 def _checkpoint_run_name(checkpoint_path: Path) -> str:
     parent = checkpoint_path.parent
+    if parent.parent.name == "runs":
+        return parent.parent.parent.name
     return parent.parent.name if parent.name == "checkpoints" else parent.name
+
+
+def _checkpoint_reference(
+    checkpoint_path: Path, checkpoint_sha256: str,
+) -> TrainingReference:
+    run_dir = checkpoint_path.parent
+    run_key = _checkpoint_run_name(checkpoint_path)
+    manifest = _read_json(run_dir / RUN_MANIFEST) or {}
+    is_new_layout = run_dir.parent.name == "runs"
+    training_run_id = str(
+        manifest.get("training_run_id")
+        or (
+            run_dir.name if is_new_layout
+            else (
+                f"legacy-{checkpoint_sha256[:12]}"
+                if manifest else f"external-{checkpoint_sha256[:12]}"
+            )
+        )
+    )
+    completed_at = manifest.get("completed_at_utc")
+    if not isinstance(completed_at, str):
+        completed_at = _iso_utc(
+            datetime.fromtimestamp(checkpoint_path.stat().st_mtime, timezone.utc)
+        )
+    if is_new_layout:
+        artifact_uri = f"runs/{run_dir.name}/{checkpoint_path.name}"
+    elif (run_dir / RUN_MANIFEST).is_file():
+        artifact_uri = checkpoint_path.name
+    else:
+        artifact_uri = None
+    training_curve = run_dir / "figures" / "training_curve.png"
+    return TrainingReference(
+        experiment_key=run_key,
+        training_run_id=training_run_id,
+        run_dir=run_dir,
+        checkpoint_path=checkpoint_path,
+        checkpoint_sha256=checkpoint_sha256,
+        history_path=run_dir / "history.csv",
+        training_curve_path=training_curve if training_curve.is_file() else None,
+        checkpoint_artifact_uri=artifact_uri,
+        completed_at_utc=completed_at,
+        legacy_layout=not is_new_layout,
+    )
+
+
+def _training_artifact_links(reference: TrainingReference) -> dict:
+    links = {
+        "checkpoint": {
+            "uri": reference.checkpoint_artifact_uri,
+            "sha256": reference.checkpoint_sha256,
+        },
+    }
+    if (
+        reference.checkpoint_artifact_uri is not None
+        and reference.history_path.is_file()
+    ):
+        artifact_parent = Path(reference.checkpoint_artifact_uri).parent
+        history_uri = (artifact_parent / "history.csv").as_posix()
+        links["history"] = {
+            "uri": history_uri,
+            "sha256": _file_sha256(reference.history_path),
+        }
+        if reference.training_curve_path is not None:
+            links["training_curve"] = {
+                "uri": (artifact_parent / "figures/training_curve.png").as_posix(),
+                "sha256": _file_sha256(reference.training_curve_path),
+            }
+    return links
 
 
 @torch.no_grad()
@@ -849,7 +1346,8 @@ def _evaluate_u1_u4(
 
 def _save_fixed_evaluation(
     model: LGFCNN, bundle: dict, *,
-    checkpoint_path: Path, history_path: Path, output_dir: Path,
+    checkpoint_path: Path, checkpoint_sha256: str,
+    history_path: Path, output_dir: Path,
     experiment_name: str, contrast: float,
     data_kind: str, loss_mode: str, test_seed: int,
     plot_case: str, no_plot: bool, evaluation_id: str | None = None,
@@ -866,33 +1364,35 @@ def _save_fixed_evaluation(
         "contrast": contrast, "test_seed": test_seed,
         "target_relative_residual": DEFAULT_TARGET_REL_RES,
         "pcg_solver_tolerance": DEFAULT_PCG_SOLVER_TOL,
-        "checkpoint_sha256": _file_sha256(checkpoint_path),
+        "checkpoint_sha256": checkpoint_sha256,
     }
     if evaluation_id is not None:
         metadata["evaluation_id"] = evaluation_id
     predictions_path = _save_evaluation_outputs(
         bundle, data_dir, "u1_u4", metadata,
     )
-    _copy_training_history(history_path, data_dir)
     if not no_plot:
         generate_pinn_style_figures(
             model=model, history_path=history_path,
             figure_dir=figure_dir, experiment_name=experiment_name,
             case=plot_case, contrast=contrast,
             loss_mode=loss_mode, evaluation=bundle,
+            include_training_curve=False,
         )
     return data_dir, figure_dir, predictions_path, metadata
 
 
 def _evaluate_and_save_fixed_cases(
     model: LGFCNN, args: argparse.Namespace, *,
-    checkpoint_path: Path, history_path: Path, result_dir: Path,
+    checkpoint_path: Path, checkpoint_sha256: str,
+    history_path: Path, result_dir: Path,
     experiment_name: str, contrast: float,
     data_kind: str, loss_mode: str, evaluation_id: str,
 ) -> tuple[Path, Path]:
     bundle = _evaluate_u1_u4(model, contrast, args.test_seed)
     data_dir, figure_dir, _, _ = _save_fixed_evaluation(
         model, bundle, checkpoint_path=checkpoint_path,
+        checkpoint_sha256=checkpoint_sha256,
         history_path=history_path, output_dir=result_dir,
         experiment_name=experiment_name, contrast=contrast,
         data_kind=data_kind, loss_mode=loss_mode,
@@ -923,32 +1423,37 @@ def _evaluation_parameters(
 
 def _run_full_evaluation(
     model: LGFCNN, args: argparse.Namespace, *,
-    checkpoint_path: Path, history_path: Path,
-    training_experiment: str, contrast: float,
+    training: TrainingReference, contrast: float,
     data_kind: str, loss_mode: str,
 ) -> Path:
     experiment_dir = _experiment_result_dir(
-        args.result_root, training_experiment,
+        args.result_root, training.experiment_key,
     )
     run = _begin_evaluation_run(
         experiment_dir=experiment_dir,
-        training_experiment=training_experiment,
-        checkpoint_path=checkpoint_path,
+        training_experiment=training.experiment_key,
+        training_run_id=training.training_run_id,
+        checkpoint_path=training.checkpoint_path,
+        checkpoint_sha256=training.checkpoint_sha256,
+        checkpoint_artifact_uri=training.checkpoint_artifact_uri,
+        training_artifacts=_training_artifact_links(training),
         test_seed=args.test_seed,
         evaluation_kind="full_evaluation",
     )
     try:
         data_dir, _ = _evaluate_and_save_fixed_cases(
-            model, args, checkpoint_path=checkpoint_path,
-            history_path=history_path, result_dir=run.attempt_dir,
-            experiment_name=training_experiment, contrast=contrast,
+            model, args, checkpoint_path=training.checkpoint_path,
+            checkpoint_sha256=training.checkpoint_sha256,
+            history_path=training.history_path, result_dir=run.attempt_dir,
+            experiment_name=training.experiment_key, contrast=contrast,
             data_kind=data_kind, loss_mode=loss_mode,
             evaluation_id=run.evaluation_id,
         )
         evaluate(
             model, contrast=contrast, seed=args.test_seed,
             data_kind=data_kind, output_dir=data_dir,
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=training.checkpoint_path,
+            checkpoint_sha256=training.checkpoint_sha256,
             evaluation_id=run.evaluation_id,
             announce_output=False,
         )
@@ -984,9 +1489,12 @@ def run_prediction(args: argparse.Namespace) -> None:
     if not args.predict_from:
         raise ValueError("--predict requires --predict-from")
     print("[predict] using fixed MMS u1-u4 cases for cross-model comparison")
-    model, saved = load_model(args.predict_from, args.device)
+    model, saved, checkpoint_sha256 = _load_model_snapshot(
+        args.predict_from, args.device,
+    )
+    training = _checkpoint_reference(args.predict_from, checkpoint_sha256)
     contrast = saved.get("contrast", 0.5)
-    run_name = _checkpoint_run_name(args.predict_from)
+    run_name = training.experiment_key
     experiment_dir = (
         args.output_dir
         if args.output_dir is not None
@@ -995,7 +1503,11 @@ def run_prediction(args: argparse.Namespace) -> None:
     run = _begin_evaluation_run(
         experiment_dir=experiment_dir,
         training_experiment=run_name,
-        checkpoint_path=args.predict_from,
+        training_run_id=training.training_run_id,
+        checkpoint_path=training.checkpoint_path,
+        checkpoint_sha256=training.checkpoint_sha256,
+        checkpoint_artifact_uri=training.checkpoint_artifact_uri,
+        training_artifacts=_training_artifact_links(training),
         test_seed=args.test_seed,
         evaluation_kind="fixed_prediction",
     )
@@ -1012,7 +1524,8 @@ def run_prediction(args: argparse.Namespace) -> None:
 
         _, _, attempt_predictions, metadata = _save_fixed_evaluation(
             model, bundle, checkpoint_path=args.predict_from,
-            history_path=args.predict_from.parent / "history.csv",
+            checkpoint_sha256=training.checkpoint_sha256,
+            history_path=training.history_path,
             output_dir=run.attempt_dir, experiment_name=run_name,
             contrast=contrast, data_kind=data_kind, loss_mode=loss_mode,
             test_seed=args.test_seed, plot_case=args.plot_case,
@@ -1076,9 +1589,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint-root", type=Path,
         default=PROJECT_DIR / "checkpoints" / "lgf_cnn_axy",
-        help="run directories are created under this root",
+        help="immutable training runs are created under this root",
     )
-    parser.add_argument("--retrain", action="store_true")
+    parser.add_argument(
+        "--retrain", action="store_true",
+        help="create a new immutable training run even if the config exists",
+    )
     run_mode = parser.add_mutually_exclusive_group()
     run_mode.add_argument(
         "--eval-only", type=Path, default=None, help="load checkpoint and eval",
@@ -1132,14 +1648,14 @@ def main() -> None:
         return run_prediction(args)
 
     if args.eval_only is not None:
-        model, saved = load_model(args.eval_only, args.device)
+        model, saved, checkpoint_sha256 = _load_model_snapshot(
+            args.eval_only, args.device,
+        )
+        training = _checkpoint_reference(args.eval_only, checkpoint_sha256)
         contrast = saved.get("contrast", 0.5)
         data_kind = saved.get("data_kind", "mms")
-        checkpoint_name = _checkpoint_run_name(args.eval_only)
         _run_full_evaluation(
-            model, args, checkpoint_path=args.eval_only,
-            history_path=args.eval_only.parent / "history.csv",
-            training_experiment=checkpoint_name, contrast=contrast,
+            model, args, training=training, contrast=contrast,
             data_kind=data_kind,
             loss_mode=saved.get("loss_mode", "supervised"),
         )
@@ -1157,53 +1673,83 @@ def main() -> None:
     )
     _validate_train_config(cfg)
     run_key = experiment_key(cfg)
-    run_dir = args.checkpoint_root / run_key
-    best_path = run_dir / "best.pt"
+    experiment_dir = args.checkpoint_root / run_key
+    runs_dir = experiment_dir / "runs"
+    training: TrainingReference
     with _run_lock(args.checkpoint_root, run_key):
-        _cleanup_stale_attempts(args.checkpoint_root, run_key)
-        completion_issue = _run_completion_issue(run_dir, cfg)
-        if (
-            not args.retrain
-            and completion_issue is not None
-            and completion_issue.startswith("identity: ")
-        ):
-            raise ValueError(
-                f"refusing to overwrite {run_dir}: "
-                f"{completion_issue.removeprefix('identity: ')}"
+        _cleanup_stale_training_attempts(runs_dir)
+        existing = _resolve_training_run(args.checkpoint_root, run_key, cfg)
+        if existing is not None and not args.retrain:
+            print(
+                "found complete immutable training run "
+                f"{existing.training_run_id}; loading it without retraining"
             )
-        if completion_issue is None and not args.retrain:
-            print(f"found complete run {best_path}; loading it without retraining")
-            model, saved = load_model(best_path, cfg.device)
+            model, saved, loaded_sha256 = _load_model_snapshot(
+                existing.checkpoint_path, cfg.device,
+            )
+            if loaded_sha256 != existing.checkpoint_sha256:
+                raise RuntimeError(
+                    "checkpoint changed while it was being loaded"
+                )
+            training = existing
             saved_cfg = LGFCNNTrainConfig(**{**saved, "device": cfg.device})
             if _training_config_payload(saved_cfg) != _training_config_payload(cfg):
                 raise ValueError(
                     "existing checkpoint config does not match the requested "
-                    "training config; choose another --checkpoint-root or use "
-                    "--retrain to replace it"
+                    "training config"
                 )
         else:
-            if run_dir.exists() and not args.retrain:
+            if experiment_dir.exists() and existing is None:
                 print(
-                    f"[train] existing run is incomplete ({completion_issue}); "
-                    "starting a clean training attempt"
+                    "[train] no reusable completed run was found; "
+                    "starting a new immutable training run"
                 )
-            attempt_dir = args.checkpoint_root / (
-                f".{run_key}.attempt-{os.getpid()}-{time.time_ns()}"
-            )
+            started = _utc_now()
+            training_run_id = _training_id(started, cfg.seed)
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            attempt_dir = runs_dir / f".attempt-{training_run_id}"
+            final_run_dir = runs_dir / training_run_id
             try:
                 model = train(cfg, attempt_dir)
-                _promote_attempt(attempt_dir, run_dir, cfg)
-                model, _ = load_model(best_path, cfg.device)
-                print(f"[train] committed complete run to {run_dir}")
+                save_training_curve(
+                    attempt_dir / "history.csv",
+                    attempt_dir / "figures" / "training_curve.png",
+                    f"LGF-CNN training — {run_key}",
+                    cfg.loss_mode,
+                )
+                _promote_attempt(
+                    attempt_dir, final_run_dir, cfg,
+                    run_key=run_key,
+                    training_run_id=training_run_id,
+                    started_at_utc=_iso_utc(started),
+                )
+                model, _, checkpoint_sha256 = _load_model_snapshot(
+                    final_run_dir / "best.pt", cfg.device,
+                )
+                training = _training_reference(
+                    final_run_dir, run_key, checkpoint_sha256,
+                )
+                try:
+                    _write_json_atomic(
+                        _training_latest_payload(training, experiment_dir),
+                        experiment_dir / "latest.json",
+                    )
+                except OSError as exc:
+                    print(
+                        "[train] run committed, but latest.json could not be "
+                        f"updated; it will be repaired on the next run: {exc}"
+                    )
+                print(
+                    "[train] committed immutable run to "
+                    f"{final_run_dir}"
+                )
             finally:
                 shutil.rmtree(attempt_dir, ignore_errors=True)
     _run_full_evaluation(
-        model, args, checkpoint_path=best_path,
-        history_path=run_dir / "history.csv",
-        training_experiment=run_key, contrast=cfg.contrast,
+        model, args, training=training, contrast=cfg.contrast,
         data_kind=cfg.data_kind, loss_mode=cfg.loss_mode,
     )
-    print(f"done: {run_dir}")
+    print(f"done: {training.run_dir}")
 
 
 if __name__ == "__main__":

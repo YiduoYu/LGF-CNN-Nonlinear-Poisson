@@ -184,9 +184,9 @@ def save_training_curve(
 def generate_pinn_style_figures(
     model: LGFCNN, history_path: Path, figure_dir: Path,
     experiment_name: str, case: str, contrast: float,
-    loss_mode: str, evaluation: dict,
+    loss_mode: str, evaluation: dict, include_training_curve: bool = True,
 ) -> None:
-    """Training curve + panel/centerline figures for selected cases."""
+    """Panel/centerline figures, optionally with the training curve."""
     selected_cases = FIXED_CASES if case == "all" else (case,)
     invalid = [
         c for c in selected_cases if c not in FIXED_CASES
@@ -207,10 +207,11 @@ def generate_pinn_style_figures(
     ]
     figure_dir.mkdir(parents=True, exist_ok=True)
 
-    save_training_curve(
-        history_path, figure_dir / "training_curve.png",
-        f"LGF-CNN training — {experiment_name}", loss_mode,
-    )
+    if include_training_curve:
+        save_training_curve(
+            history_path, figure_dir / "training_curve.png",
+            f"LGF-CNN training — {experiment_name}", loss_mode,
+        )
 
     for selected_case in selected_cases:
         index = evaluation_names.index(selected_case)

@@ -100,7 +100,8 @@ axy_lgf/result/<experiment_params_and_hash>/
         │   ├── heldout_summary.json
         │   ├── heldout_solver_comparison.csv
         │   ├── heldout_residual_history.csv
-        │   └── heldout_predictions.pt
+        │   ├── heldout_predictions.pt
+        │   └── generalization_sweeps.csv
         └── figures/
             ├── training_curve.png
             ├── u1_centerline.png
@@ -153,12 +154,16 @@ There's no boundary error column because the zero Dirichlet halo enforces
 u=0 exactly — that metric would be identically zero.
 
 For manufactured references, `*_solver_comparison.csv` compares LGF-CNN,
-Richardson (same iteration count), and high-accuracy PCG: error, residual,
-timing, iteration count, and convergence status. When `--data-kind solver`
-is used for the random held-out batch, PCG is intentionally omitted because
-the same high-accuracy PCG generated `u_exact`; rerunning it would compare
-the labels with themselves rather than provide an independent baseline.
-The summary JSON records the reference source and whether PCG is included.
+Richardson (same iteration count), and high-accuracy PCG. `execution_mode`
+is `fixed_budget` for LGF-CNN/Richardson and `tolerance_driven` for PCG.
+`meets_target` applies one reporting threshold to all methods, while
+`solver_converged` is empty for fixed-budget methods and records PCG's actual
+stopping status. The PCG stopping tolerance and reporting target are separate
+metadata fields. When `--data-kind solver` is used for the random held-out
+batch, PCG is intentionally omitted because the same high-accuracy PCG
+generated `u_exact`; rerunning it would compare the labels with themselves
+rather than provide an independent baseline. The summary JSON records the
+reference source and whether PCG is included.
 
 `*_residual_history.csv` stores the available methods' per-step relative
 residuals. `*_predictions.pt` saves the full coefficient field, RHS,
@@ -166,18 +171,20 @@ reference solution, network prediction, residual maps, and valid baseline
 solutions. Timing is per-sample; CNN timing uses a plain forward pass
 without diagnostic tensors so the comparison is fair.
 
-### Out-of-distribution sweeps
+### Generalization sweeps
 
 The fixed u1–u4 and held-out batch both sit inside the training
 distribution (\(p,q \in \{1,2,3\}\), N(0,1) amplitudes, single
 contrast) — neither actually tests extrapolation. The `evaluate` command
-runs three additional sweeps with same-budget Richardson as a reference:
+runs three additional sweeps with same-budget Richardson as a reference.
+Not every non-reference setting is strictly OOD, so each row has an explicit
+`regime` instead of an ambiguous Boolean:
 
-| sweep | values | note |
+| sweep | values | regimes |
 |---|---|---|
-| `frequency` | \(p=q=1,2,3,4,5,6,8\) | trained only on \(\le 3\) |
-| `amplitude` | \(\|f\| \times 10^{-2}\dots 10^{2}\) | exact by equivariance; regression guard |
-| `contrast` | \(0.2,0.5,0.8,0.95,1.0\) | beyond training, \(a\) gets clipped by the floor |
+| `frequency` | \(p=q=1,2,3,4,5,6,8\) | `training_support` or `extrapolation` |
+| `amplitude` | \(\|f\| \times 10^{-2}\dots 10^{2}\) | `reference` or `scale_stress` |
+| `contrast` | \(0.2,0.5,0.8,0.95,1.0\) | `reference` or `coefficient_shift` |
 
 Both commands need the same `--test-seed` so the coefficient field and
 u1–u4 are identical.
@@ -201,6 +208,11 @@ The discrete operator uses a conservative flux-form 5-point stencil:
 A_h u = -\operatorname{div}_h(a\nabla_h u).
 \]
 
+Interior face coefficients are arithmetic averages of their two adjacent
+nodes. A boundary face uses the adjacent interior coefficient, while the
+solution outside the interior grid is the homogeneous Dirichlet value zero.
+The NumPy and PyTorch implementations must represent this same operator.
+
 The inverse of the constant-coefficient reference operator
 
 \[
@@ -210,7 +222,7 @@ The inverse of the constant-coefficient reference operator
 is applied exactly by 2D orthogonal DST-I. Both the NumPy and PyTorch LGF
 banks do one forward transform then batch-process all \(\lambda_j\) to
 avoid redundant work. The PyTorch version uses the same orthonormal
-DST-I sine basis as the ZIP implementation.
+DST-I sine basis as the NumPy implementation.
 
 The classical LGF bank uses the same sample reference coefficient \(a_0\)
 in its filters and local correction:
@@ -237,15 +249,61 @@ The bank itself remains fixed at \(a_0=1\), and the learned correction is
 
 Only the mixer features use magnitudes; the filtered correction keeps its
 sign. Consequently \(u(a,-f)=-u(a,f)\) by construction, while positive
-forcing-scale equivariance is preserved.
+forcing-scale equivariance is preserved for the frozen-coefficient linear
+map.
 
-Random coefficient fields use `contrast` \(c\in[0,1]\) and the ZIP
-clipping rule
+Random coefficient fields use `contrast` \(c\in[0,1]\) and the clipping rule
 \[
 a\in[1-0.95c,\;1+c].
 \]
 All functions with spatial frequencies are scaled by the domain length
 \(L\).
+
+## Mathematical compatibility contract: do not change silently
+
+Until executable tests are added, this section is the manual regression
+contract. Future changes must preserve all items below unless the mathematical
+model is deliberately revised, documented, versioned, and—when model
+semantics change—retrained:
+
+1. The PDE is the homogeneous-Dirichlet flux operator above, using arithmetic
+   interior-face coefficients and the adjacent node value on boundary faces.
+   NumPy and PyTorch paths must remain numerically consistent.
+2. The default domain is \([-1,1]^2\). The approved training domain, data
+   region, coefficient generator, and clipping rule
+   \([1-0.95c,1+c]\) must not be changed as incidental refactoring.
+3. The CNN bank remains fixed at \(a_0=1\), with the existing screened
+   \(\lambda_j\) schedule. A Poisson initialization prior applies only to the
+   actual \(\lambda_j=0\) filter; if no such filter exists, initial mixing
+   logits are uniform.
+4. Mixer inputs remain exactly
+   \(a/\bar a,\bar a/a,|r|/\|r\|\), and
+   \(|z_j|/\max_k\|z_k\|\). The signed correction remains
+   \(\eta_{\max}\eta(1/a)\sum_j\alpha_j z_j\).
+5. For a fixed input coefficient field, the model must preserve positive
+   RHS-scale equivariance and oddness in the forcing.
+6. Supervised training minimizes squared discrete solution \(L^2\) error.
+   Physics training minimizes the squared preconditioned residual norm
+   \(\|G_0(f-A_hu)\|^2\), using \(a_0=\bar a\). These approved objectives must
+   not be replaced by raw residual loss without an explicit experiment and
+   decision.
+7. `LGFCNN.forward(a, f, u0, K)` keeps its current equations, tensor shapes,
+   parameter names, and default behavior so version 8 checkpoints remain
+   meaningful.
+8. PCG stopping tolerance and the common reporting target remain separate.
+   Fixed-budget LGF-CNN/Richardson rows never claim solver convergence.
+9. Completed evaluation runs remain immutable and `latest.json` remains only
+   a pointer to the newest successfully committed run.
+10. Evaluation-only CSV/schema changes increment
+    `EVALUATION_FORMAT_VERSION`. Model equations or state-layout changes
+    require deliberate checkpoint/experiment versioning and retraining.
+
+Before accepting a future change, manually confirm the relevant identities,
+load a version 8 checkpoint, compare the unchanged default-forward output on
+a fixed seed, and run the manual checks below plus a short end-to-end pipeline.
+This documentation makes the intended invariants explicit, but it cannot
+detect a regression automatically; executable tests should be added before
+future mathematical extensions.
 
 ## Checkpoint safety
 
@@ -253,6 +311,10 @@ Checkpoints use format version 8 and are loaded with
 `torch.load(..., weights_only=True)`. Earlier checkpoints that use a
 different architecture are rejected rather than silently interpreted
 under the current equations; retrain with the current code.
+
+The solver-comparison schema is evaluation format version 2. This is an
+output-only change: checkpoint and experiment formats remain at version 8,
+and existing version 8 models do not need retraining.
 
 Training writes to a separate temp experiment directory first;
 `completed.json` is written last, after `best.pt`, `last.pt`, and
@@ -267,18 +329,14 @@ renamed to `evaluations/<eval_id>/`. A failed attempt is removed and never
 becomes a visible completed run. Existing result directories from the old
 layout are left untouched.
 
-## Quick self-check
+## Manual self-check while tests are deferred
 
-The automated tests permanently check that the NumPy and PyTorch flux
-operators, Dirichlet LGF, screened LGF bank, and dense DST agree. They also
-check the evaluation rules for fixed-budget convergence and PCG-generated
-references, as well as immutable evaluation-run promotion:
-
-```bash
-python -m unittest discover -s axy_lgf/tests -t .
-```
-
-After making changes, also run a 1-epoch pipeline:
+This source folder intentionally does not add a `tests/` directory yet.
+Therefore the mathematical compatibility contract above is a review
+checklist, not an executable guarantee. Do not claim automated coverage until
+test source files are actually added. After making changes, load a version 8
+checkpoint, compare default-forward output on a fixed seed, and run a 1-epoch
+pipeline:
 
 ```bash
 python -m axy_lgf.train_lgf_cnn \
@@ -286,8 +344,9 @@ python -m axy_lgf.train_lgf_cnn \
   --samples-per-epoch 8 --batch-size 4 --val-samples 4
 ```
 
-The plotting module is only imported after training finishes, so import
-errors there won't show up until a full run completes.
+`plot_lgf_cnn.py` is imported when the program starts, so module-level import
+errors fail fast. Matplotlib itself is loaded lazily only when plotting is
+actually requested.
 
 ## Main files
 
@@ -305,4 +364,4 @@ errors there won't show up until a full run completes.
 | `data.py` | MMS and solver random training data |
 | `train_lgf_cnn.py` | training, eval, and fixed u1–u4 prediction |
 | `plot_lgf_cnn.py` | training curve, panel, and centerline figures |
-| `evaluation.py` | shared metrics, solver comparison, OOD sweeps |
+| `evaluation.py` | shared metrics, solver comparison, generalization sweeps |

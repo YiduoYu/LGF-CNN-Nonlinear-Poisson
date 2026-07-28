@@ -24,15 +24,26 @@ _TINY = 1e-300
 class PointwiseMixer(nn.Module):
     """1x1 MLP that outputs mixing weights (J channels) and damping (1 channel).
 
-    At initialisation the network is biased toward the Poisson filter
-    (lambda=0) with high damping, so the untrained model behaves roughly
-    like damped (1/a) G_0.
+    At initialisation the network is biased toward the actual Poisson filter
+    (lambda=0), when present, with high damping. Without a Poisson filter,
+    the initial filter weights are uniform.
     """
 
-    def __init__(self, in_ch: int, J: int, hidden: int = 32):
+    def __init__(
+        self,
+        in_ch: int,
+        J: int,
+        hidden: int = 32,
+        poisson_filter_index: int | None = 0,
+    ):
         super().__init__()
         if in_ch < 1 or J < 1 or hidden < 1:
             raise ValueError("in_ch, J, and hidden must be positive")
+        if (
+            poisson_filter_index is not None
+            and not 0 <= poisson_filter_index < J
+        ):
+            raise ValueError("poisson_filter_index must identify a bank filter")
         self.J = J
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, hidden, kernel_size=1),
@@ -45,7 +56,8 @@ class PointwiseMixer(nn.Module):
         nn.init.zeros_(last.weight)
         nn.init.zeros_(last.bias)
         with torch.no_grad():
-            last.bias[0] = 5.0   # softmax ~ one-hot on lambda=0
+            if poisson_filter_index is not None:
+                last.bias[poisson_filter_index] = 5.0
             last.bias[J] = 3.0   # sigmoid(3) ~ 0.95 damping
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -100,8 +112,22 @@ class LGFCNN(nn.Module):
 
         in_ch = 3 + self.bank.J
         n_mixers = 1 if share_weights else K
+        poisson_indices = torch.nonzero(
+            self.bank.lambdas == 0.0, as_tuple=False,
+        ).flatten()
+        poisson_filter_index = (
+            int(poisson_indices[0]) if poisson_indices.numel() else None
+        )
         self.mixers = nn.ModuleList(
-            [PointwiseMixer(in_ch, self.bank.J, hidden) for _ in range(n_mixers)]
+            [
+                PointwiseMixer(
+                    in_ch,
+                    self.bank.J,
+                    hidden,
+                    poisson_filter_index=poisson_filter_index,
+                )
+                for _ in range(n_mixers)
+            ]
         )
 
     @property

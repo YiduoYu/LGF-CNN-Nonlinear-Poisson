@@ -23,17 +23,19 @@ METRIC_KEYS = (
     "f_RMSE",
 )
 
-# training: p, q in {1, 2, 3}; beyond 3 is extrapolation
-OOD_FREQUENCIES = (1, 2, 3, 4, 5, 6, 8)
-# training solutions have N(0, 1) modal amplitudes, so |f| ~ O(1)
-OOD_FORCING_SCALES = (1e-2, 1e-1, 1.0, 1e1, 1e2)
-OOD_CONTRASTS = (0.2, 0.5, 0.8, 0.95, 1.0)
+# Training uses p, q in {1, 2, 3}; larger frequencies are extrapolation.
+GENERALIZATION_FREQUENCIES = (1, 2, 3, 4, 5, 6, 8)
+# Amplitude changes are scale-regression checks, not strict OOD samples.
+GENERALIZATION_FORCING_SCALES = (1e-2, 1e-1, 1.0, 1e1, 1e2)
+GENERALIZATION_CONTRASTS = (0.2, 0.5, 0.8, 0.95, 1.0)
 
 COMPARISON_METRIC_KEYS = (
     "relL2", "RMSE", "MAE", "maxError",
     "relRes", "resRMSE", "time_ms", "iterations",
 )
 REFERENCE_SOURCES = ("manufactured", "pcg")
+DEFAULT_PCG_SOLVER_TOL = 1e-10
+DEFAULT_TARGET_REL_RES = 1e-10
 
 
 def summarize_rows(rows: list[dict], metric_keys: Sequence[str]) -> dict:
@@ -139,16 +141,15 @@ def _full_metrics(
 
 
 @torch.no_grad()
-def run_ood_sweeps(
+def run_generalization_sweeps(
     model: LGFCNN, contrast: float = 0.8, seed: int = 123,
 ) -> list[dict]:
-    """Probe generalisation along one axis of the training distribution.
+    """Probe one generalisation axis at a time.
 
-    The fixed u1-u4 and held-out batch both live inside the training family,
-    so neither actually tests extrapolation. Each sweep here steps outside
-    exactly one axis and reports the same-budget Richardson result alongside,
-    so degradation can be attributed to the network rather than the problem
-    getting harder.
+    Frequency includes both training support and extrapolation. Amplitude
+    checks exact scale equivariance. Contrast compares the reference training
+    value with coefficient shifts. Same-budget Richardson is reported beside
+    every network result.
     """
     model.eval()
     device = model.bank.lambdas.device
@@ -158,7 +159,7 @@ def run_ood_sweeps(
     def as_batch(field: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(field[None], dtype=torch.float64, device=device)
 
-    def probe(sweep: str, setting: str, in_distribution: bool,
+    def probe(sweep: str, setting: str, regime: str,
               a_np: np.ndarray, u_np: np.ndarray) -> dict:
         a_t = as_batch(a_np)
         f_t = model.ops.apply_div_a_grad(as_batch(u_np), a_t)
@@ -170,7 +171,7 @@ def run_ood_sweeps(
         residual = f_np - apply_div_a_grad(pred, a_np, grid)
         return {
             "sweep": sweep, "setting": setting,
-            "in_distribution": in_distribution,
+            "regime": regime,
             "relL2": _relative_l2(pred - u_np, u_np, grid),
             "relRes": l2_norm(residual, grid) / _safe_norm(f_np, grid),
             "richardsonRelL2": _relative_l2(rich.u - u_np, u_np, grid),
@@ -182,25 +183,28 @@ def run_ood_sweeps(
     rows = []
 
     # frequency sweep: LGF filters are global, no fixed receptive field
-    for mode in OOD_FREQUENCIES:
+    for mode in GENERALIZATION_FREQUENCIES:
         u_np = np.sin(mode * np.pi * xi) * np.sin(mode * np.pi * yi)
-        rows.append(probe("frequency", f"p=q={mode}", mode <= 3, a_ref, u_np))
+        regime = "training_support" if mode <= 3 else "extrapolation"
+        rows.append(probe("frequency", f"p=q={mode}", regime, a_ref, u_np))
 
     # amplitude sweep: exact by construction (mixer inputs normalised),
     # so this is a regression guard
     u_unit = np.sin(np.pi * xi) * np.sin(np.pi * yi)
-    for scale in OOD_FORCING_SCALES:
+    for scale in GENERALIZATION_FORCING_SCALES:
+        regime = "reference" if scale == 1.0 else "scale_stress"
         rows.append(probe(
-            "amplitude", f"|f| x {scale:g}", scale == 1.0, a_ref, scale * u_unit,
+            "amplitude", f"|f| x {scale:g}", regime, a_ref, scale * u_unit,
         ))
 
     # contrast sweep: genuinely harder; beyond ~0.95 the coefficient floor
     # starts to flatten a(x, y)
-    for value in OOD_CONTRASTS:
+    for value in GENERALIZATION_CONTRASTS:
         a_np = sample_coefficient(
             grid, 1, contrast=value, rng=np.random.default_rng(seed),
         )[0]
-        rows.append(probe("contrast", f"c={value:g}", value == contrast, a_np, u_unit))
+        regime = "reference" if value == contrast else "coefficient_shift"
+        rows.append(probe("contrast", f"c={value:g}", regime, a_np, u_unit))
 
     return rows
 
@@ -210,7 +214,9 @@ def evaluate_batch(
     model: LGFCNN, names: Sequence[str],
     a: torch.Tensor, f: torch.Tensor, u_exact: torch.Tensor,
     *, richardson_steps: int | None = None,
-    pcg_tol: float = 1e-10, pcg_maxiter: int = 500,
+    pcg_solver_tol: float = DEFAULT_PCG_SOLVER_TOL,
+    target_rel_res: float = DEFAULT_TARGET_REL_RES,
+    pcg_maxiter: int = 500,
     reference_source: str = "manufactured",
 ) -> dict:
     """Evaluate LGF-CNN and valid classical baselines on one shared batch.
@@ -226,8 +232,10 @@ def evaluate_batch(
     if reference_source not in REFERENCE_SOURCES:
         choices = ", ".join(REFERENCE_SOURCES)
         raise ValueError(f"reference_source must be one of: {choices}")
-    if not np.isfinite(pcg_tol) or pcg_tol <= 0.0:
-        raise ValueError("pcg_tol must be finite and positive")
+    if not np.isfinite(pcg_solver_tol) or pcg_solver_tol <= 0.0:
+        raise ValueError("pcg_solver_tol must be finite and positive")
+    if not np.isfinite(target_rel_res) or target_rel_res <= 0.0:
+        raise ValueError("target_rel_res must be finite and positive")
     if pcg_maxiter < 0:
         raise ValueError("pcg_maxiter must be nonnegative")
 
@@ -307,15 +315,21 @@ def evaluate_batch(
             rich.u, ue, aa, ff, grid, residual=rich_residual,
         )
         method_results = [
-            ("LGF-CNN", cnn_solution_metrics, cnn_ms[index], model.K),
-            ("Richardson", rich_solution_metrics, rich_ms, rich.iterations),
+            (
+                "LGF-CNN", cnn_solution_metrics, cnn_ms[index], model.K,
+                "fixed_budget", None,
+            ),
+            (
+                "Richardson", rich_solution_metrics, rich_ms, rich.iterations,
+                "fixed_budget", None,
+            ),
         ]
 
         pcg = None
         if include_pcg:
             pcg_started = time.perf_counter()
             pcg = solve_axy_pcg(
-                aa, ff, grid, tol=pcg_tol, maxiter=pcg_maxiter,
+                aa, ff, grid, tol=pcg_solver_tol, maxiter=pcg_maxiter,
             )
             pcg_ms = 1000.0 * (time.perf_counter() - pcg_started)
             pcg_np[index] = pcg.u
@@ -324,15 +338,23 @@ def evaluate_batch(
                 pcg.u, ue, aa, ff, grid, residual=pcg_residual,
             )
             method_results.append(
-                ("PCG", pcg_solution_metrics, pcg_ms, pcg.iterations),
+                (
+                    "PCG", pcg_solution_metrics, pcg_ms, pcg.iterations,
+                    "tolerance_driven", pcg.converged,
+                ),
             )
 
-        for method, solution_metrics, elapsed_ms, iterations in method_results:
+        for (
+            method, solution_metrics, elapsed_ms, iterations,
+            execution_mode, solver_converged,
+        ) in method_results:
             comparison_rows.append({
                 "sample_id": index, "case": name, "method": method,
                 **solution_metrics,
                 "time_ms": elapsed_ms, "iterations": iterations,
-                "converged": solution_metrics["relRes"] <= pcg_tol,
+                "execution_mode": execution_mode,
+                "meets_target": solution_metrics["relRes"] <= target_rel_res,
+                "solver_converged": solver_converged,
             })
 
         f_norm = _safe_norm(ff, grid)

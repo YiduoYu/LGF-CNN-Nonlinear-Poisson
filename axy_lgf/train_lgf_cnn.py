@@ -41,7 +41,12 @@ import numpy as np
 import torch
 
 from .data import make_batch, sample_coefficient
-from .evaluation import evaluate_batch, run_ood_sweeps
+from .evaluation import (
+    DEFAULT_PCG_SOLVER_TOL,
+    DEFAULT_TARGET_REL_RES,
+    evaluate_batch,
+    run_generalization_sweeps,
+)
 from .grid import DEFAULT_DOMAIN_MAX, DEFAULT_DOMAIN_MIN, SquareGrid
 from .lgf_cnn import LGFCNN, LGFCNNTrainConfig
 from .manufactured import fixed_case_solutions, make_problem
@@ -52,7 +57,7 @@ from .solvers import solve_axy_richardson
 MODEL_TYPE = "lgf_cnn_axy"
 CHECKPOINT_FORMAT_VERSION = 8
 EXPERIMENT_VERSION = 8
-EVALUATION_FORMAT_VERSION = 1
+EVALUATION_FORMAT_VERSION = 2
 PROJECT_DIR = Path(__file__).resolve().parent
 RUN_ARTIFACTS = ("best.pt", "last.pt", "history.csv")
 RUN_MANIFEST = "completed.json"
@@ -703,7 +708,7 @@ def train(cfg: LGFCNNTrainConfig, run_dir: Path) -> LGFCNN:
 
 
 # ---------------------------------------------------------------------------
-# evaluation (held-out + fixed cases + OOD sweeps)
+# evaluation (held-out + fixed cases + generalization sweeps)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -734,6 +739,8 @@ def evaluate(
     names = [f"sample_{index:03d}" for index in range(n_eval)]
     bundle = evaluate_batch(
         model, names, a, f, u_exact, richardson_steps=richardson_steps,
+        pcg_solver_tol=DEFAULT_PCG_SOLVER_TOL,
+        target_rel_res=DEFAULT_TARGET_REL_RES,
         reference_source="pcg" if data_kind == "solver" else "manufactured",
     )
     print(f"[eval] held-out random batch (data={data_kind})")
@@ -756,29 +763,30 @@ def evaluate(
             "domain": [grid.x_min, grid.x_max], "h": grid.h,
             "contrast": contrast, "test_seed": seed, "samples": n_eval,
             "richardson_steps": richardson_steps,
+            "target_relative_residual": DEFAULT_TARGET_REL_RES,
         }
         if evaluation_id is not None:
             metadata["evaluation_id"] = evaluation_id
         if data_kind != "solver":
-            metadata["pcg_tolerance"] = 1e-10
+            metadata["pcg_solver_tolerance"] = DEFAULT_PCG_SOLVER_TOL
         if checkpoint_path is not None:
             metadata["checkpoint_sha256"] = _file_sha256(checkpoint_path)
         _save_evaluation_outputs(bundle, output_dir, "heldout", metadata)
         if announce_output:
             print(f"[eval] data saved to {output_dir}")
 
-    ood_rows = run_ood_sweeps(model, contrast=contrast, seed=seed)
-    print("[eval] out-of-distribution sweeps (relL2, Richardson at the same K)")
+    sweep_rows = run_generalization_sweeps(
+        model, contrast=contrast, seed=seed,
+    )
+    print("[eval] generalization sweeps (relL2, Richardson at the same K)")
     for sweep in ("frequency", "amplitude", "contrast"):
-        for row in (r for r in ood_rows if r["sweep"] == sweep):
-            marker = " " if row["in_distribution"] else "*"
+        for row in (r for r in sweep_rows if r["sweep"] == sweep):
             print(
-                f"  {marker}{sweep:10s} {row['setting']:12s} "
+                f"  [{row['regime']:17s}] {sweep:10s} {row['setting']:12s} "
                 f"relL2={row['relL2']:.3e}  rich={row['richardsonRelL2']:.3e}"
             )
-    print("  (* = outside the training distribution)")
     if output_dir is not None:
-        _write_csv(ood_rows, output_dir / "ood_sweeps.csv")
+        _write_csv(sweep_rows, output_dir / "generalization_sweeps.csv")
 
     # fixed manufactured problem
     prob = make_problem(
@@ -856,6 +864,8 @@ def _save_fixed_evaluation(
         "domain": [model.grid.x_min, model.grid.x_max],
         "h": model.grid.h,
         "contrast": contrast, "test_seed": test_seed,
+        "target_relative_residual": DEFAULT_TARGET_REL_RES,
+        "pcg_solver_tolerance": DEFAULT_PCG_SOLVER_TOL,
         "checkpoint_sha256": _file_sha256(checkpoint_path),
     }
     if evaluation_id is not None:
@@ -906,6 +916,8 @@ def _evaluation_parameters(
         "n": model.grid.n,
         "domain": [model.grid.x_min, model.grid.x_max],
         "device": str(model.bank.lambdas.device),
+        "target_relative_residual": DEFAULT_TARGET_REL_RES,
+        "pcg_solver_tolerance": DEFAULT_PCG_SOLVER_TOL,
     }
 
 
@@ -1054,7 +1066,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--loss-mode", choices=("supervised", "physics"), default="supervised",
         help="training objective: supervised uses L2 solution error; "
-             "physics uses PDE-residual L2 error",
+             "physics minimizes the preconditioned residual "
+             "||G0(f - A_h u)||",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")

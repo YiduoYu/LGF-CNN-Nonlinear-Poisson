@@ -1,7 +1,5 @@
 # LGF-CNN: Learned Iterative Solvers for Elliptic PDEs with Lattice Green's Functions
 
-Undergraduate research project, Wenzhou-Kean University.
-
 This repository studies neural solvers for second-order elliptic equations on $[-1,1]^2$ with Dirichlet boundary conditions:
 
 $$-\nabla\cdot\big(a\,\nabla u\big) = f \quad \text{in } \Omega, \qquad u = g \ \text{on } \partial\Omega,$$

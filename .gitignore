@@ -49,3 +49,6 @@ run_all.log
 
 
 axy_lgf.zip
+
+# Local tool settings
+.claude/

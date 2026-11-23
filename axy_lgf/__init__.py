@@ -8,7 +8,14 @@
 from .solvers import solve_axy_pcg, solve_axy_richardson, solve_axy_lgf_bank
 from .manufactured import fixed_case_solutions, make_problem
 from .lgf_bank import ScreenedLGFBank
-from .lgf_cnn import LGFCNN, LGFCNNTrainConfig
+
+
+def __getattr__(name):
+    # Classical NumPy/SciPy workflows do not require a PyTorch installation.
+    if name in {"LGFCNN", "LGFCNNTrainConfig"}:
+        from .lgf_cnn import LGFCNN, LGFCNNTrainConfig
+        return {"LGFCNN": LGFCNN, "LGFCNNTrainConfig": LGFCNNTrainConfig}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "solve_axy_pcg",

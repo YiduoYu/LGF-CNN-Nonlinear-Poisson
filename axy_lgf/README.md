@@ -288,8 +288,9 @@ All functions with spatial frequencies are scaled by the domain length
 
 ## Mathematical compatibility contract: do not change silently
 
-Until executable tests are added, this section is the manual regression
-contract. Future changes must preserve all items below unless the mathematical
+This section defines the legacy regression contract; the new automated tests
+cover the classical extension and NumPy/PyTorch operator parity. Future changes
+must preserve all items below unless the mathematical
 model is deliberately revised, documented, versioned, and—when model
 semantics change—retrained:
 
@@ -363,14 +364,13 @@ If updating `latest.json` fails after a successful directory commit, the run
 remains valid and the pointer is repaired from manifests next time. Existing
 checkpoint and result directories from the old layout are left untouched.
 
-## Manual self-check while tests are deferred
+## Legacy checkpoint and pipeline self-check
 
-This source folder intentionally does not add a `tests/` directory yet.
-Therefore the mathematical compatibility contract above is a review
-checklist, not an executable guarantee. Do not claim automated coverage until
-test source files are actually added. After making changes, load a version 8
-checkpoint, compare default-forward output on a fixed seed, and run a 1-epoch
-pipeline:
+The reaction–diffusion extension adds executable tests under `tests/` (see
+below). These do not cover the full training/storage pipeline. For future
+training-pipeline changes, load a version 8 checkpoint, compare default-forward
+output on a fixed seed, and run a 1-epoch pipeline. The current classical
+extension checks existing checkpoint inference without running training:
 
 ```bash
 python -m axy_lgf.train_lgf_cnn \
@@ -399,3 +399,198 @@ writes its single training curve, or when evaluation figures are requested.
 | `train_lgf_cnn.py` | training, eval, and fixed u1–u4 prediction |
 | `plot_lgf_cnn.py` | training curve, panel, and centerline figures |
 | `evaluation.py` | shared metrics, solver comparison, generalization sweeps |
+
+## 2D normal-contrast linear reaction–diffusion baseline
+
+The separate `run_reaction_diffusion` workflow solves
+
+\[
+-\nabla\cdot(a\nabla u)+qu=f\quad\text{in }(0,1)^2,
+\qquad u|_{\partial\Omega}=0,
+\]
+
+with float64 NumPy/SciPy and optional PyAMG. It does not train or alter the
+CNN. `run_demo`, the legacy default domain `[-1,1]^2`, existing outputs,
+checkpoint versions, and default training equations remain unchanged.
+Classical package imports no longer require PyTorch; the two public CNN
+classes are imported lazily under their existing names.
+
+### Run commands
+
+From the parent directory containing `axy_lgf/`, in an active Python 3.10+
+environment:
+
+```bash
+python -m pip install -r axy_lgf/requirements-classical.txt
+python -m pip install pyamg                 # optional, required for AMG
+python -m pytest -q axy_lgf/tests
+python -m axy_lgf.run_reaction_diffusion --n 63
+python -m axy_lgf.run_reaction_diffusion --n 63 --forcing discrete
+python -m axy_lgf.run_reaction_diffusion --conv
+```
+
+`--n` counts interior nodes per axis and `h=1/(n+1)`. `--conv` uses
+15, 31, 63, 127 with continuous forcing. Default methods are `lgf gmg amg`;
+use `--solvers lgf gmg` to run without PyAMG. A requested but unavailable AMG
+produces an explicit `unavailable` row and installation message, with exit
+code 2. An unconverged solve also yields exit code 2 and a
+`not_converged` row. It is never reported as successful. Invalid input raises
+an error. `--tol`, `--maxiter`, `--output-dir`, and `--no-plot` are supported.
+Matplotlib is only required when generating figures. PyTorch parity tests
+skip explicitly if PyTorch is absent; AMG tests likewise skip if PyAMG is
+absent. No replacement method is labelled AMG.
+
+Every invocation writes a **new** child directory under
+`axy_lgf/reaction_results/` (or `--output-dir`), with `results.csv`,
+`results.json`, and `convergence.png` unless `--no-plot` is used. Existing
+`result/` and `checkpoints/` directories are never modified by this workflow.
+The CSV contains grid size/spacing, nodal coefficient ranges and contrast,
+method/preconditioner, tolerance and zero initial guess, iteration count,
+status, final relative algebraic residual, absolute/relative discrete L2
+solution error, observed order, setup/solve/total seconds, and diagnostic
+messages. JSON additionally records source hashes and runtime versions.
+
+### Coefficient locations and compatibility
+
+The sampled solution, reaction `q`, and forcing live on interior nodes
+`(x_i,y_j)=(i*h,j*h)`, `i,j=1,...,n`, with zero solution on boundary nodes.
+The new MMS additionally samples the diffusion coefficient at all nodes,
+including the boundary, in `a_nodes` of shape `(n+2,n+2)`. Interior values
+must agree exactly with the `(n,n)` array `a`.
+
+All edge coefficients are arithmetic nodal averages, for example
+
+\[
+a_{i+1/2,j}=\tfrac12(a_{i,j}+a_{i+1,j}),\qquad
+(A_hu)_{i,j}=h^{-2}\sum_{k\sim(i,j)}a_{(i,j),k}(u_{i,j}-u_k)
+              +q_{i,j}u_{i,j}.
+\]
+
+Edges adjacent to the Dirichlet boundary also use both endpoint coefficient
+samples. These are midpoints of **node-to-node edges**; the coefficient on
+an edge to the boundary is located half a grid spacing inside the domain.
+This uniform averaging convention gives second-order consistency for smooth
+coefficients. The solver always applies the conservative flux operator; an
+expanded differential expression is used only to derive continuous forcing.
+
+The old boundary convention copies the nearest interior `a` to a boundary
+edge. It approximates a smooth midpoint coefficient only to first order in
+general, so the new continuous-MMS path supplies boundary samples explicitly.
+Calling the old APIs without `a_nodes` preserves that convention exactly,
+including NumPy/PyTorch training parity. The two conventions represent
+separate, documented discrete systems. Every method within a new comparison
+uses the same `a_nodes`, `q`, RHS, initial guess, tolerance and operator.
+
+`apply_reaction_diffusion(u,a,grid,q=0,a_nodes=None)` reuses
+`apply_div_a_grad`. `assemble_reaction_diffusion` builds the same matrix in
+C-order flattening from the same face coefficients. The added reaction has
+positive sign. For any nonzero interior vector `v`, with boundary entries
+set to zero,
+
+\[
+v^T A_hv=h^{-2}\sum_{\text{edges }e}a_e(v_{e,+}-v_{e,-})^2
+           +\sum_{i,j}q_{i,j}v_{i,j}^2>0.
+\]
+
+Each interior edge is counted once; boundary edges connect to prescribed
+zero. Positive edge coefficients, nonnegative reaction, and the connected
+Dirichlet grid give a symmetric positive definite matrix, including `q=0`.
+
+### Manufactured solution and forcing
+
+\[
+u_*=\sin(\pi x)\sin(\pi y),\quad
+ a=1+0.2\sin(2\pi x)\sin(2\pi y),\quad
+ q=1+0.2\cos(2\pi x)\cos(2\pi y).
+\]
+
+Both coefficients lie in `[0.8,1.2]`; the theoretical diffusion contrast is
+at most 1.5. Reported extrema and contrast use the actual interior samples.
+Since `Delta(u_*)=-2*pi^2*u_*`,
+
+\[
+f=(2\pi^2a+q)u_*
+ -0.4\pi^2\left[
+ \cos(2\pi x)\sin(2\pi y)\cos(\pi x)\sin(\pi y)
+ +\sin(2\pi x)\cos(2\pi y)\sin(\pi x)\cos(\pi y)\right].
+\]
+
+* **Continuous MMS** (default) samples this analytic expression, independently
+  of `A_h`. Its solution error measures discretization plus algebraic error.
+  The refinement study reports
+  `p=log(E_previous/E_current)/log(h_previous/h_current)`.
+* **Discrete MMS** (`--forcing discrete`) instead sets `f=A_h*u_*` to test
+  algebraic solver consistency. Its solution error should reach the solver
+  tolerance; it provides no evidence of spatial convergence. No observed
+  spatial order is assigned to these rows. `--conv --forcing discrete` is
+  rejected to keep the convergence study unambiguous.
+
+The norm is `||v||_L2h=sqrt(h^2*sum(v^2))`. Relative L2 solution error divides
+`||u-u_*||_L2h` by `||u_*||_L2h`. The relative algebraic residual is
+`||f-A_h*u||_L2h/||f||_L2h`, identical to the Euclidean norm ratio on one
+uniform grid. It is distinct from solution error and from a continuous PDE
+residual; the latter is not measured here. For zero RHS, the solver uses
+`max(||f||_L2h, float64.tiny)` as denominator.
+
+### Preconditioners and stopping rule
+
+All three baseline methods use the same PCG loop and stop at relative
+algebraic residual `<= --tol`, default `1e-10`, starting from zero with
+at most 500 iterations. A recursively updated residual is used during CG;
+a recomputed `f-A_h*u` must pass before success is returned. If recurrence
+drift causes a false stop, CG replaces the residual and restarts. The final
+residual is always recomputed with the matrix-free target operator.
+
+* **LGF-PCG:** the unchanged DST-I implementation exactly inverts the reference
+  `P_h=a0*(-Delta_h)+q0*I`, with `a0=mean(a)` and `q0=mean(q)`. Its sine-basis
+  denominator is `a0*(lambda_p+lambda_q)+q0`, where
+  `lambda_p=4/h^2*sin^2(p*pi/(2*(n+1)))`. This is a constant-coefficient
+  approximation to the variable-coefficient target; it is not the exact
+  target inverse. At `q=0`, it reduces to the original Poisson LGF.
+* **GMG-PCG:** a genuine geometric hierarchy `n -> (n-1)/2 -> ... -> 3`
+  uses bilinear geometric interpolation `P`, restriction `R=P.T`, and
+  Galerkin operators `A_c=P.T*A*P`. Coarse matrices can have nine-point
+  stencils. This transpose restriction uses variational scaling; the
+  usual factor `1/4` of full weighting is absorbed by the coarse system.
+  Two damped-Jacobi sweeps precede and follow every coarse correction.
+  On each level, `omega=1/max_i(sum_j(abs(A_ij))/A_ii)` bounds the scaled
+  maximum eigenvalue by one. Symmetric smoothing, transpose transfers,
+  and an exact Cholesky solve on the 3-by-3 interior grid make a fixed,
+  linear SPD-compatible V-cycle. GMG accepts `n=2^k-1`, `k>=2`.
+* **AMG-PCG:** optional PyAMG Ruge–Stuben with Galerkin coarse systems,
+  transpose restriction, forward pre-Gauss–Seidel and backward
+  post-Gauss–Seidel, one V-cycle, and Cholesky on at most nine coarse
+  unknowns. These adjoint sweeps preserve symmetry and positivity for
+  the SPD target. Small-grid tests explicitly construct both V-cycle
+  preconditioner matrices and check linearity, symmetry, and eigenvalues.
+
+Setup time includes validation, fine-grid sparse assembly where needed,
+preconditioner construction, and coarse factorization. AMG's first call
+includes importing PyAMG. Solve time includes PCG and residual checks;
+`total=setup+solve`. MMS generation, final error reporting, and plotting are
+excluded. These are single-run measurements without warmup or repetitions;
+iteration counts alone do not establish a timing advantage.
+
+### Verification scope and files
+
+`tests/test_reaction_diffusion.py` verifies the frozen legacy stencil,
+reaction sign and linearity, all boundary-face averages, sparse/matrix-free
+agreement, symmetry/SPD and the edge energy identity, reference LGF inverses,
+analytic forcing values, geometric transfers, both V-cycle preconditioners,
+discrete recovery and continuous second-order convergence on all four grids,
+initial guesses/zero RHS, failure status, invalid coefficients, an independent
+sparse direct solution, optional-AMG messaging, and immutable result output.
+It also tests second-order accuracy using a polynomial MMS with nonconstant
+boundary coefficients. `tests/test_torch_compatibility.py` checks the legacy
+NumPy/PyTorch diffusion operator and filter-bank parity, without training.
+
+New implementation files are `reaction_manufactured.py` (analytic/discrete
+MMS), `multigrid.py` (geometric V-cycle and optional AMG), and
+`run_reaction_diffusion.py` (CLI and isolated results). `operators.py` adds
+shared face construction, reaction action and sparse assembly; `solvers.py`
+extends existing solvers with keyword-only `q` and `a_nodes`, retains all old
+positional arguments, and adds common PCG verification and timing. Richardson
+uses screening `mean(q)`; the bank shifts its old screening schedule by
+`mean(q)`. `grid.py`, `manufactured.py`, `lgf_inverse.py`, `lgf_bank.py`,
+`run_demo.py`, and all neural-network/training source files remain unchanged.
+See `VERIFICATION.md` for actual measured outcomes and environment details.

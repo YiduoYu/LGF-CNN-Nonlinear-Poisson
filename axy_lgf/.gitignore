@@ -5,3 +5,4 @@ __pycache__/
 .mplconfig/
 result/
 checkpoints/
+.deps/
